@@ -1,0 +1,50 @@
+[project]
+name = "eva-ai"
+version = "0.1.0"
+description = "A proactive personal AI operator"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "alembic>=1.16",
+    "fastapi>=0.116",
+    "psycopg[binary,pool]>=3.2",
+    "pydantic-settings>=2.10",
+    "sqlalchemy[asyncio]>=2.0",
+    "uvicorn[standard]>=0.35",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28",
+    "mypy>=1.17",
+    "pytest>=8.4",
+    "pytest-asyncio>=1.1",
+    "ruff>=0.12",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = ["integration: requires PostgreSQL"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["ASYNC", "B", "E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+plugins = ["pydantic.mypy"]
+packages = ["eva_ai"]
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = true
