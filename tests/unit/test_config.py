@@ -4,7 +4,16 @@ from pydantic import SecretStr, ValidationError
 from eva_ai.config import AppEnvironment, LogFormat, Settings
 
 
-def test_settings_have_safe_local_defaults() -> None:
+def test_settings_have_safe_local_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    for variable in (
+        "EVA_APP_NAME",
+        "EVA_ENVIRONMENT",
+        "EVA_LOG_LEVEL",
+        "EVA_LOG_FORMAT",
+        "EVA_DATABASE_URL",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
     settings = Settings(_env_file=None)
 
     assert settings.app_name == "Eva"
