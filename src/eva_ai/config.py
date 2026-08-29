@@ -33,9 +33,7 @@ class Settings(BaseSettings):
     environment: AppEnvironment = AppEnvironment.LOCAL
     log_level: LogLevel = "INFO"
     log_format: LogFormat = LogFormat.CONSOLE
-    database_url: SecretStr = SecretStr(
-        "postgresql+psycopg://eva:eva@localhost:5432/eva"
-    )
+    database_url: SecretStr = SecretStr("postgresql+psycopg://eva:eva@localhost:5432/eva")
 
     @field_validator("log_level", mode="before")
     @classmethod

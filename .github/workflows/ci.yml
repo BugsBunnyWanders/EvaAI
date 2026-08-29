@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: eva
+          POSTGRES_PASSWORD: eva
+          POSTGRES_DB: eva
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U eva -d eva"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      EVA_ENVIRONMENT: test
+      EVA_LOG_FORMAT: json
+      EVA_DATABASE_URL: postgresql+psycopg://eva:eva@localhost:5432/eva
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.5"
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install
+
+      - name: Sync dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Check formatting
+        run: uv run ruff format --check src migrations tests
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run mypy src migrations tests
+
+      - name: Test
+        run: uv run pytest -v

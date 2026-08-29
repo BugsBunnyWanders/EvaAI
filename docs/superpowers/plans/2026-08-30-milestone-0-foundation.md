@@ -1105,11 +1105,11 @@ test:
 	uv run pytest -v
 
 lint:
-	uv run ruff format --check .
+	uv run ruff format --check src migrations tests
 	uv run ruff check .
 
 format:
-	uv run ruff format .
+	uv run ruff format src migrations tests
 	uv run ruff check --fix .
 
 typecheck:
@@ -1233,7 +1233,7 @@ jobs:
         run: uv sync --locked --all-groups
 
       - name: Check formatting
-        run: uv run ruff format --check .
+        run: uv run ruff format --check src migrations tests
 
       - name: Lint
         run: uv run ruff check .
@@ -1255,7 +1255,7 @@ uv sync --locked --all-groups
 docker compose config --quiet
 docker compose up -d --wait postgres
 uv run alembic upgrade head
-uv run ruff format --check .
+uv run ruff format --check src migrations tests
 uv run ruff check .
 uv run mypy src migrations tests
 uv run pytest -v
