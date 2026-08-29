@@ -136,7 +136,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28",
+    "httpx2>=2.12",
     "mypy>=1.17",
     "pytest>=8.4",
     "pytest-asyncio>=1.1",
@@ -726,7 +726,7 @@ async def liveness() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.get("/ready")
+@router.get("/ready", response_model=None)
 async def readiness(
     database: Annotated[Database, Depends(get_database)],
 ) -> dict[str, str] | JSONResponse:
@@ -824,6 +824,7 @@ Create `alembic.ini` without a database URL:
 [alembic]
 script_location = migrations
 prepend_sys_path = .
+path_separator = os
 
 [loggers]
 keys = root,sqlalchemy,alembic
