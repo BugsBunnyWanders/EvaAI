@@ -1,4 +1,3 @@
-import re
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, cast
@@ -20,10 +19,13 @@ from eva_ai.db.models import ConnectorAccount, GmailSyncState
 from eva_ai.db.session import Database
 
 _GMAIL_PROVIDER = "gmail"
-_ERROR_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class AmbiguousConnectorIdentity(RuntimeError):
+    pass
+
+
+class ConnectorScopeMismatchError(RuntimeError):
     pass
 
 
@@ -69,6 +71,10 @@ class ConnectorRepository:
                     )
                 if account is None:
                     raise LookupError("reserved connector was not found")
+                if account.user_id != user_id:
+                    raise ConnectorScopeMismatchError(
+                        "connector user does not match persisted owner"
+                    )
                 sync_insert = (
                     insert(GmailSyncState)
                     .values(connector_account_id=account.id, created_at=now, updated_at=now)
@@ -231,14 +237,13 @@ class ConnectorRepository:
         )
         return await self._updated(statement)
 
-    async def mark_reauthorization_required(self, connector_id: UUID, error_type: str) -> None:
-        sanitized_type = _sanitize_error_type(error_type)
+    async def mark_reauthorization_required(self, connector_id: UUID, error: BaseException) -> None:
         connector_update = (
             update(ConnectorAccount)
             .where(ConnectorAccount.id == connector_id)
             .values(
                 status=ConnectorStatus.REAUTHORIZATION_REQUIRED,
-                last_error_type=sanitized_type,
+                last_error_type=type(error).__name__,
                 last_error_summary="operation failed",
             )
         )
@@ -321,8 +326,3 @@ def _sync_record(sync: GmailSyncState) -> GmailSyncRecord:
         claim_id=sync.claim_id,
         lease_expires_at=sync.lease_expires_at,
     )
-
-
-def _sanitize_error_type(error_type: str) -> str:
-    match = _ERROR_CLASS.search(error_type)
-    return match.group(0) if match is not None else "UnknownError"

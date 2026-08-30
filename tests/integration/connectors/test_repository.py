@@ -5,13 +5,21 @@ from uuid import UUID
 import pytest
 from sqlalchemy import select
 
-from eva_ai.connectors.repository import AmbiguousConnectorIdentity, ConnectorRepository
+from eva_ai.connectors.repository import (
+    AmbiguousConnectorIdentity,
+    ConnectorRepository,
+    ConnectorScopeMismatchError,
+)
 from eva_ai.connectors.types import ConnectorStatus
 from eva_ai.db import Database
 from eva_ai.db.models import ConnectorAccount
 from tests.integration.factories import Scope, create_scope, gmail_watch
 
 NOW = datetime(2030, 1, 1, tzinfo=UTC)
+
+
+class AuthorizationFailure(RuntimeError):
+    pass
 
 
 async def reserve_active(
@@ -85,6 +93,38 @@ async def test_reserve_gmail_normalizes_identity_and_is_stable_within_workspace(
 
 
 @pytest.mark.integration
+async def test_reserve_gmail_rejects_conflicting_user_without_returning_secret(
+    database: Database,
+) -> None:
+    repository = ConnectorRepository(database)
+    owner = await create_scope(database)
+    other_user = await create_scope(database)
+    identity = f"owner+{owner.workspace_id}@example.com"
+    connector = await repository.reserve_gmail(
+        owner.user_id,
+        owner.workspace_id,
+        identity,
+        ("scope",),
+        NOW,
+    )
+    await repository.attach_secret(connector.id, "projects/eva/secrets/gmail/versions/secret")
+
+    with pytest.raises(ConnectorScopeMismatchError, match="persisted owner"):
+        await repository.reserve_gmail(
+            other_user.user_id,
+            owner.workspace_id,
+            identity,
+            ("scope",),
+            NOW,
+        )
+
+    stored = await repository.get(connector.id)
+    assert stored is not None
+    assert stored.user_id == owner.user_id
+    assert stored.secret_reference == "projects/eva/secrets/gmail/versions/secret"
+
+
+@pytest.mark.integration
 async def test_find_by_identity_rejects_cross_workspace_ambiguity(database: Database) -> None:
     repository = ConnectorRepository(database)
     first_scope = await create_scope(database)
@@ -141,7 +181,7 @@ async def test_initial_activation_preserves_first_connection_boundary_on_reautho
     assert original is not None
 
     await repository.mark_reauthorization_required(
-        connector_id, "AuthorizationRevoked token=secret"
+        connector_id, AuthorizationFailure("refresh-token=secret account-content")
     )
     await repository.attach_secret(connector_id, "projects/eva/secrets/gmail/versions/2")
     reactivated = await repository.activate_initial_watch(
@@ -288,7 +328,7 @@ async def test_due_maintenance_loads_only_active_connectors_with_due_work(
         NOW,
         NOW + timedelta(days=5),
     )
-    await repository.mark_reauthorization_required(due_id, "AuthorizationRevoked secret")
+    await repository.mark_reauthorization_required(due_id, AuthorizationFailure("token=secret"))
 
     due = await repository.due_for_maintenance(NOW + timedelta(days=2))
 
@@ -340,7 +380,7 @@ async def test_reauthorization_clears_claim_without_resetting_cursor_or_connecti
     assert claim is not None
 
     await repository.mark_reauthorization_required(
-        connector_id, "AuthorizationRevoked token=secret"
+        connector_id, AuthorizationFailure("refresh-token=secret message-content")
     )
     connector = await repository.get(connector_id)
     state = await repository.get_sync_state(connector_id)
@@ -353,6 +393,8 @@ async def test_reauthorization_clears_claim_without_resetting_cursor_or_connecti
     assert connector.connected_at == NOW
     assert state is not None and state.history_id == "123" and state.claim_id is None
     assert row is not None
-    assert row.last_error_type == "AuthorizationRevoked"
+    assert row.last_error_type == "AuthorizationFailure"
     assert row.last_error_summary == "operation failed"
-    assert "secret" not in f"{row.last_error_type}:{row.last_error_summary}"
+    stored_error = f"{row.last_error_type}:{row.last_error_summary}"
+    assert "secret" not in stored_error
+    assert "message-content" not in stored_error
