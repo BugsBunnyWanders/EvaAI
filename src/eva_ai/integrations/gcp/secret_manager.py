@@ -1,5 +1,5 @@
 import asyncio
-from typing import Protocol, cast
+from typing import Protocol
 from uuid import UUID
 
 from google.api_core.exceptions import AlreadyExists, NotFound
@@ -103,5 +103,5 @@ class GoogleSecretManagerCredentialStore:
     async def _get_client(self) -> SecretManagerClient:
         if self._client is None:
             client = await asyncio.to_thread(secretmanager.SecretManagerServiceClient)
-            self._client = cast(SecretManagerClient, client)
+            self._client = client
         return self._client
