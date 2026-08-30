@@ -13,6 +13,7 @@ from eva_ai.connectors.repository import ConnectorRepository
 from eva_ai.connectors.types import GmailSyncRecord, SyncClaim
 
 _WATCH_RENEWAL_INTERVAL = timedelta(hours=24)
+_SAFETY_SYNC_INTERVAL = timedelta(minutes=60)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +67,7 @@ class GmailMaintenanceService:
             if state is None:
                 failed += 1
                 continue
-            if _is_due(state.next_safety_sync_at, now):
+            if _is_safety_due(state, now):
                 try:
                     result = await self._sync_service.sync_connector(connector_id)
                 except asyncio.CancelledError:
@@ -95,6 +96,7 @@ class GmailMaintenanceService:
 
     async def _renew(self, connector_id: UUID, now: datetime) -> bool | None:
         claim: SyncClaim | None = None
+        revoked: AuthorizationRevoked | None = None
         try:
             claim = await self._repository.claim_sync(
                 connector_id,
@@ -131,16 +133,26 @@ class GmailMaintenanceService:
                 await self._release_after_cancellation(claim)
             raise
         except AuthorizationRevoked as error:
-            if claim is None:
-                return False
-            transitioned = await self._mark_reauthorization(claim, error)
-            if not transitioned:
-                await self._release_safely(claim)
-            return False
+            revoked = error
         except Exception:
             if claim is not None:
                 await self._release_safely(claim)
             return False
+
+        if claim is None or revoked is None:
+            return False
+        transition_cancelled: asyncio.CancelledError | None = None
+        try:
+            transitioned = await self._mark_reauthorization(claim, revoked)
+        except asyncio.CancelledError as error:
+            transition_cancelled = error
+            transitioned = False
+        if transition_cancelled is not None:
+            await self._release_after_cancellation(claim)
+            raise transition_cancelled
+        if not transitioned:
+            await self._release_safely(claim)
+        return False
 
     async def _mark_reauthorization(
         self,
@@ -170,3 +182,9 @@ class GmailMaintenanceService:
 
 def _is_due(due_at: datetime | None, now: datetime) -> bool:
     return due_at is not None and due_at <= now
+
+
+def _is_safety_due(state: GmailSyncRecord, now: datetime) -> bool:
+    notification_at = state.last_notification_at
+    silence_elapsed = notification_at is None or notification_at + _SAFETY_SYNC_INTERVAL <= now
+    return _is_due(state.next_safety_sync_at, now) and silence_elapsed

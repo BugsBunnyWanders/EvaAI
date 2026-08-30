@@ -165,9 +165,12 @@ class FakeGmailClient:
     def __init__(self) -> None:
         self.watch_result = WatchResult("999", NOW + timedelta(days=7))
         self.watch_calls: list[str] = []
+        self.watch_failure: BaseException | None = None
 
     async def watch(self, topic_name: str) -> WatchResult:
         self.watch_calls.append(topic_name)
+        if self.watch_failure is not None:
+            raise self.watch_failure
         return self.watch_result
 
     async def get_profile(self) -> str:
@@ -186,9 +189,14 @@ class FakeGmailClient:
 class FakeFactory:
     def __init__(self) -> None:
         self.clients: list[FakeGmailClient] = []
+        self.failure: BaseException | None = None
+        self.watch_failure: BaseException | None = None
 
     async def create(self, authorized_user_json: str) -> GmailClient:
+        if self.failure is not None:
+            raise self.failure
         client = FakeGmailClient()
+        client.watch_failure = self.watch_failure
         self.clients.append(client)
         return cast(GmailClient, client)
 
@@ -278,6 +286,67 @@ async def test_due_renewal_releases_its_claim_before_due_safety_sync() -> None:
     assert claim_index < renewal_index
 
 
+@pytest.mark.parametrize(
+    "last_notification_at",
+    [
+        NOW,
+        NOW - timedelta(minutes=60) + timedelta(microseconds=1),
+    ],
+    ids=["recent", "one-instant-before-boundary"],
+)
+async def test_due_safety_waits_for_sixty_minutes_of_notification_silence(
+    last_notification_at: datetime,
+) -> None:
+    """Fails if a persisted safety due time bypasses the notification-silence boundary."""
+    harness = Harness()
+    original_due_at = NOW - timedelta(minutes=5)
+    harness.repository.states[CONNECTOR_ID] = sync_record(
+        safety_at=original_due_at,
+    ).model_copy(update={"last_notification_at": last_notification_at})
+
+    summary = await harness.service.run_due(NOW)
+
+    assert summary == MaintenanceSummary(renewed=0, safety_synced=0, failed=0)
+    assert harness.sync.calls == []
+    assert harness.repository.states[CONNECTOR_ID].next_safety_sync_at == original_due_at
+
+
+@pytest.mark.parametrize(
+    "last_notification_at",
+    [NOW - timedelta(minutes=60), None],
+    ids=["exact-silence-boundary", "no-notification"],
+)
+async def test_due_safety_runs_at_inclusive_silence_boundary_or_without_notification(
+    last_notification_at: datetime | None,
+) -> None:
+    """Fails if the exact 60-minute boundary or persisted None case is skipped."""
+    harness = Harness()
+    harness.repository.states[CONNECTOR_ID] = sync_record(
+        safety_at=NOW,
+    ).model_copy(update={"last_notification_at": last_notification_at})
+
+    summary = await harness.service.run_due(NOW)
+
+    assert summary == MaintenanceSummary(renewed=0, safety_synced=1, failed=0)
+    assert harness.sync.calls == [CONNECTOR_ID]
+
+
+async def test_recent_notification_skips_safety_but_not_independently_due_renewal() -> None:
+    """Fails if notification silence incorrectly suppresses unrelated renewal work."""
+    harness = Harness()
+    original_safety_due_at = NOW - timedelta(minutes=5)
+    harness.repository.states[CONNECTOR_ID] = sync_record(
+        renewal_at=NOW,
+        safety_at=original_safety_due_at,
+    ).model_copy(update={"last_notification_at": NOW})
+
+    summary = await harness.service.run_due(NOW)
+
+    assert summary == MaintenanceSummary(renewed=1, safety_synced=0, failed=0)
+    assert harness.sync.calls == []
+    assert harness.repository.states[CONNECTOR_ID].next_safety_sync_at == original_safety_due_at
+
+
 async def test_notification_claim_blocks_both_due_actions_without_provider_work() -> None:
     """Fails if maintenance bypasses the synchronization lease held by notification work."""
     harness = Harness()
@@ -342,18 +411,59 @@ async def test_renewal_revocation_alone_transitions_reauthorization() -> None:
     assert CONNECTOR_ID not in harness.repository.busy
 
 
-async def test_renewal_cancellation_best_effort_releases_and_propagates_unchanged() -> None:
-    """Fails if worker shutdown is counted/swallowed or strands maintenance's claim."""
+@pytest.mark.parametrize(
+    "stage",
+    ["credentials", "client", "watch", "renewal", "reauthorization_transition"],
+)
+async def test_renewal_cancellation_best_effort_releases_and_propagates_unchanged(
+    stage: str,
+) -> None:
+    """Fails if any claimed renewal cancellation is counted, replaced, or strands its lease."""
     harness = Harness()
     harness.repository.states[CONNECTOR_ID] = sync_record(renewal_at=NOW)
     reference = harness.repository.records[CONNECTOR_ID].secret_reference
     assert reference is not None
-    cancellation = asyncio.CancelledError("cancelled-renewal")
-    harness.credentials.failure_by_reference[reference] = cancellation
+    cancellation = asyncio.CancelledError(f"cancelled-{stage}")
+    if stage == "credentials":
+        harness.credentials.failure_by_reference[reference] = cancellation
+    elif stage == "client":
+        harness.factory.failure = cancellation
+    elif stage == "watch":
+        harness.factory.watch_failure = cancellation
+    elif stage == "renewal":
+        harness.repository.renewal_failure = cancellation
+    else:
+        harness.credentials.failure_by_reference[reference] = AuthorizationRevoked(
+            "Google authorization has been revoked"
+        )
+        harness.repository.transition_failure = cancellation
 
     with pytest.raises(asyncio.CancelledError) as raised:
         await harness.service.run_due(NOW)
 
     assert raised.value is cancellation
     assert CONNECTOR_ID not in harness.repository.busy
+    assert harness.repository.calls[-1] == f"release:{CONNECTOR_ID}"
+
+
+async def test_release_failure_never_masks_or_chains_renewal_cancellation() -> None:
+    """Fails if transition cleanup replaces cancellation with repository content."""
+    harness = Harness()
+    harness.repository.states[CONNECTOR_ID] = sync_record(renewal_at=NOW)
+    reference = harness.repository.records[CONNECTOR_ID].secret_reference
+    assert reference is not None
+    cancellation = asyncio.CancelledError("cancelled-reauthorization-transition")
+    harness.credentials.failure_by_reference[reference] = AuthorizationRevoked(
+        "Google authorization has been revoked"
+    )
+    harness.repository.transition_failure = cancellation
+    harness.repository.release_failure = RuntimeError("private-database-response")
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await harness.service.run_due(NOW)
+
+    assert raised.value is cancellation
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "private-database-response" not in repr(raised.value)
     assert harness.repository.calls[-1] == f"release:{CONNECTOR_ID}"
