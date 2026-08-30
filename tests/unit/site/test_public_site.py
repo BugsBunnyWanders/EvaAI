@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlparse
+
+import pytest
 
 SITE_ROOT = Path(__file__).parents[3] / "site"
 PRODUCTION_ORIGIN = "https://evaatyourservice.com"
@@ -135,3 +138,119 @@ def test_homepage_references_committed_shared_assets() -> None:
         "assets/favicon.svg",
     ):
         assert (SITE_ROOT / path).is_file(), path
+
+
+@pytest.mark.parametrize(
+    ("path", "title", "canonical", "heading"),
+    [
+        (
+            "privacy/index.html",
+            "Privacy — Eva",
+            f"{PRODUCTION_ORIGIN}/privacy/",
+            "Privacy policy",
+        ),
+        (
+            "terms/index.html",
+            "Terms — Eva",
+            f"{PRODUCTION_ORIGIN}/terms/",
+            "Terms of service",
+        ),
+        (
+            "404.html",
+            "Page not found — Eva",
+            f"{PRODUCTION_ORIGIN}/404.html",
+            "This page drifted out of context.",
+        ),
+    ],
+)
+def test_secondary_pages_have_release_metadata(
+    path: str,
+    title: str,
+    canonical: str,
+    heading: str,
+) -> None:
+    page = parse_page(path)
+
+    assert page.title == title
+    assert page.descriptions
+    assert page.canonicals == [canonical]
+    assert [text for level, text in page.headings if level == 1] == [heading]
+
+
+def test_privacy_policy_discloses_actual_google_data_handling() -> None:
+    text = " ".join(parse_page("privacy/index.html").text).lower()
+
+    for phrase in (
+        "effective 30 august 2026",
+        "read-only gmail",
+        "message metadata",
+        "message content",
+        "attachment metadata",
+        "oauth",
+        "managed secret infrastructure",
+        "retention",
+        "deletion",
+        "google api services user data policy",
+        "limited use",
+        "do not sell",
+    ):
+        assert phrase in text
+
+
+def test_terms_set_private_beta_and_safety_boundaries() -> None:
+    text = " ".join(parse_page("terms/index.html").text).lower()
+
+    for phrase in (
+        "effective 30 august 2026",
+        "experimental private beta",
+        "review eva's suggestions",
+        "not legal, medical, financial, or emergency advice",
+        "prohibited",
+        "third-party services",
+        "no guarantee",
+        "applicable law",
+    ):
+        assert phrase in text
+
+
+def test_every_internal_link_resolves_to_a_committed_page_or_asset() -> None:
+    for html_path in SITE_ROOT.rglob("*.html"):
+        page = parse_page(str(html_path.relative_to(SITE_ROOT)))
+        for href in page.links:
+            parsed = urlparse(href)
+            if parsed.scheme or parsed.netloc or href.startswith(("#", "mailto:")):
+                continue
+            assert resolve_internal_path(parsed.path).exists(), (html_path, href)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["index.html", "privacy/index.html", "terms/index.html", "404.html"],
+)
+def test_every_page_keeps_navigation_and_assets_local(path: str) -> None:
+    page = parse_page(path)
+    source = (SITE_ROOT / path).read_text(encoding="utf-8").lower()
+
+    assert "/" in page.links
+    assert "/privacy/" in page.links
+    assert "/terms/" in page.links
+    assert "https://github.com/BugsBunnyWanders/EvaAI" in page.links
+    for forbidden in (
+        "google-analytics",
+        "gtag(",
+        "segment.com",
+        "facebook.net",
+        "http://",
+    ):
+        assert forbidden not in source
+
+
+def test_domain_metadata_uses_only_production_origin() -> None:
+    assert (SITE_ROOT / "CNAME").read_text(encoding="utf-8") == ("evaatyourservice.com\n")
+    assert f"Sitemap: {PRODUCTION_ORIGIN}/sitemap.xml" in (SITE_ROOT / "robots.txt").read_text(
+        encoding="utf-8"
+    )
+    sitemap = (SITE_ROOT / "sitemap.xml").read_text(encoding="utf-8")
+    assert sitemap.count("<url>") == 3
+    for route in ("/", "/privacy/", "/terms/"):
+        assert f"<loc>{PRODUCTION_ORIGIN}{route}</loc>" in sitemap

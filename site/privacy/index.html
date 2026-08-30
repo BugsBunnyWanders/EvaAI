@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Privacy — Eva</title>
+    <meta
+      name="description"
+      content="How Eva handles connected account data, Gmail information, credentials, retention, and user control during private beta."
+    >
+    <meta name="theme-color" content="#0c0b12">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="Privacy — Eva">
+    <meta property="og:description" content="Eva's private-beta privacy policy.">
+    <meta property="og:url" content="https://evaatyourservice.com/privacy/">
+    <link rel="canonical" href="https://evaatyourservice.com/privacy/">
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/assets/styles.css">
+    <script defer src="/assets/site.js"></script>
+  </head>
+  <body class="policy-page">
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+
+    <header class="site-header shell">
+      <a class="brand" href="/" aria-label="Eva home">
+        <img src="/assets/mark.svg" alt="" width="34" height="34">
+        <span>Eva</span>
+      </a>
+      <nav class="site-nav" aria-label="Primary navigation">
+        <a href="/">Home</a>
+        <a aria-current="page" href="/privacy/">Privacy</a>
+        <a href="/terms/">Terms</a>
+        <a
+          class="nav-source"
+          href="https://github.com/BugsBunnyWanders/EvaAI"
+          aria-label="Eva source code on GitHub"
+        >Source <span aria-hidden="true">↗</span></a>
+      </nav>
+    </header>
+
+    <main id="main-content" class="policy-main shell">
+      <header class="policy-hero" data-reveal>
+        <p class="eyebrow"><span class="status-dot"></span> Plain-language policy</p>
+        <h1>Privacy policy</h1>
+        <p class="policy-summary">
+          Eva is built around a simple promise: access should be purposeful, data handling
+          should be explainable, and control should remain with the person Eva serves.
+        </p>
+        <p class="effective-date">Effective 30 August 2026</p>
+      </header>
+
+      <div class="policy-layout">
+        <aside class="policy-index" aria-label="Privacy policy sections">
+          <p>On this page</p>
+          <ol>
+            <li><a href="#scope">Scope</a></li>
+            <li><a href="#data">Data Eva handles</a></li>
+            <li><a href="#use">How data is used</a></li>
+            <li><a href="#gmail">Gmail access</a></li>
+            <li><a href="#credentials">Credentials and security</a></li>
+            <li><a href="#sharing">Sharing</a></li>
+            <li><a href="#retention">Retention and deletion</a></li>
+            <li><a href="#google">Google Limited Use</a></li>
+            <li><a href="#other">Other information</a></li>
+            <li><a href="#contact">Contact</a></li>
+          </ol>
+        </aside>
+
+        <article class="policy-content">
+          <section id="scope" data-reveal>
+            <span class="policy-number">01</span>
+            <h2>Scope and current status</h2>
+            <p>
+              This policy describes the Eva private-beta project and the information it
+              processes when an authorized person connects an account. Eva is currently
+              an experimental personal assistant operated in private development. It is
+              not accepting public account connections.
+            </p>
+            <p>
+              This policy applies to this website and Eva's connected services. A service
+              provider such as Google may also process information under its own terms and
+              privacy policy.
+            </p>
+          </section>
+
+          <section id="data" data-reveal>
+            <span class="policy-number">02</span>
+            <h2>Data Eva handles</h2>
+            <p>Depending on the features explicitly connected, Eva may process:</p>
+            <ul>
+              <li>
+                <strong>Account identity:</strong> the Google account email address used to
+                verify the connected mailbox and associate it with the correct Eva workspace.
+              </li>
+              <li>
+                <strong>Gmail message metadata:</strong> provider identifiers, thread
+                identifiers, timestamps, labels, sender and recipient fields, and subject lines.
+              </li>
+              <li>
+                <strong>Gmail message content:</strong> readable plain-text or HTML-derived
+                message bodies needed to understand a newly received email.
+              </li>
+              <li>
+                <strong>Attachment metadata:</strong> filenames, media types, provider
+                identifiers, and sizes. The current ingestion flow does not store attachment binary.
+              </li>
+              <li>
+                <strong>Authorization material:</strong> OAuth refresh information needed to
+                maintain the connection. Short-lived access tokens and their expiry are removed
+                before credentials are persisted.
+              </li>
+              <li>
+                <strong>Operational records:</strong> connection status, synchronization
+                cursors, processing state, audit identifiers, errors stripped of message
+                content, and records needed for reliability and deduplication.
+              </li>
+              <li>
+                <strong>Interaction data:</strong> messages, approvals, and preferences that an
+                authorized person provides when conversational channels are enabled later.
+              </li>
+            </ul>
+          </section>
+
+          <section id="use" data-reveal>
+            <span class="policy-number">03</span>
+            <h2>How data is used</h2>
+            <p>Eva processes connected information only to:</p>
+            <ul>
+              <li>establish and maintain an account connection requested by the user;</li>
+              <li>detect and normalize relevant new events from connected sources;</li>
+              <li>relate those events to user-defined goals and ongoing situations;</li>
+              <li>provide explanations, notifications, and user-requested assistance;</li>
+              <li>protect account boundaries, prevent duplicates, and recover from failures;</li>
+              <li>debug, secure, and improve the private-beta service.</li>
+            </ul>
+            <p>
+              Eva does not use connected Google data for advertising. We do not sell
+              personal data or connected account data.
+            </p>
+          </section>
+
+          <section id="gmail" data-reveal>
+            <span class="policy-number">04</span>
+            <h2>Read-only Gmail access</h2>
+            <p>
+              Eva requests the read-only Gmail permission. This allows Eva to read mailbox
+              information needed for the assistant workflow. It does not allow Eva to send,
+              delete, modify, label, archive, or otherwise change email in the connected account.
+            </p>
+            <div class="policy-callout">
+              <strong>Current boundary</strong>
+              <p>
+                New-email ingestion begins from the connection boundary. Historical backfill and
+                public account onboarding are not part of the current private beta.
+              </p>
+            </div>
+          </section>
+
+          <section id="credentials" data-reveal>
+            <span class="policy-number">05</span>
+            <h2>Credentials and security</h2>
+            <p>
+              OAuth authorization material is stored separately from application records using
+              managed secret infrastructure. Access is restricted to the service components that
+              need it. Current access tokens and expiry values are stripped before credential
+              material is persisted.
+            </p>
+            <p>
+              Eva also uses workspace ownership checks, least-privilege cloud permissions,
+              transaction boundaries, idempotency, and content-free operational errors. No
+              security measure eliminates every risk, and Eva does not promise absolute security.
+            </p>
+          </section>
+
+          <section id="sharing" data-reveal>
+            <span class="policy-number">06</span>
+            <h2>Sharing and service providers</h2>
+            <p>
+              Eva does not sell or rent personal information. Data may be processed by
+              infrastructure providers required to operate the service, including Google Cloud
+              services used for Gmail notifications, secret storage, messaging, and hosting.
+              Those providers process information under their own contracts and policies.
+            </p>
+            <p>
+              Information may also be disclosed when required by applicable law, to protect
+              rights or safety, or with the connected user's direction. Eva does not share Google
+              user data with data brokers, advertising platforms, or unrelated third parties.
+            </p>
+          </section>
+
+          <section id="retention" data-reveal>
+            <span class="policy-number">07</span>
+            <h2>Retention and deletion</h2>
+            <p>
+              During private beta, Eva retains connected data and operational records only as
+              needed to provide, secure, debug, and evaluate the service. The project does not yet
+              promise a fixed automatic retention period. Backups and provider logs may persist
+              for a limited period according to infrastructure-provider lifecycle controls.
+            </p>
+            <p>
+              An authorized user may revoke Google's access at any time through their Google
+              Account permissions. Because the current beta is limited to its operator, account
+              disconnection and deletion requests are handled directly. A private support channel
+              will be published before any external users are invited; do not post sensitive data
+              in a public repository issue.
+            </p>
+          </section>
+
+          <section id="google" data-reveal>
+            <span class="policy-number">08</span>
+            <h2>Google API Services User Data Policy</h2>
+            <p>
+              Eva's use and transfer of information received from Google APIs adheres to the
+              <a href="https://developers.google.com/terms/api-services-user-data-policy"
+                >Google API Services User Data Policy</a
+              >, including its Limited Use requirements.
+            </p>
+            <p>
+              Google user data is used only to provide or improve the user-facing assistant
+              features described here. It is not transferred for advertising, creditworthiness,
+              surveillance, or sale.
+            </p>
+          </section>
+
+          <section id="other" data-reveal>
+            <span class="policy-number">09</span>
+            <h2>Other information</h2>
+            <h3>International processing</h3>
+            <p>
+              Infrastructure providers may process data in locations different from the user's
+              location. Their safeguards and regional controls apply to that processing.
+            </p>
+            <h3>Children's privacy</h3>
+            <p>
+              Eva is not directed to children and is not offered for use by anyone under 18. The
+              project does not knowingly collect children's personal information.
+            </p>
+            <h3>Policy changes</h3>
+            <p>
+              This policy may change as Eva's capabilities and operating model evolve. Material
+              revisions will appear on this page with an updated effective date before broader
+              access is offered.
+            </p>
+          </section>
+
+          <section id="contact" data-reveal>
+            <span class="policy-number">10</span>
+            <h2>Contact</h2>
+            <p>
+              General questions about this policy may be raised through the
+              <a href="https://github.com/BugsBunnyWanders/EvaAI">Eva source repository</a>.
+              Do not include mailbox content, credentials, or other sensitive information in a
+              public issue. The current private-beta operator handles account-specific requests
+              directly.
+            </p>
+          </section>
+        </article>
+      </div>
+    </main>
+
+    <footer class="site-footer shell">
+      <div class="footer-brand">
+        <span class="footer-mark" aria-hidden="true">E</span>
+        <div><strong>Eva</strong><span>Proactive personal AI</span></div>
+      </div>
+      <nav aria-label="Footer navigation">
+        <a href="/privacy/">Privacy</a>
+        <a href="/terms/">Terms</a>
+        <a href="https://github.com/BugsBunnyWanders/EvaAI">GitHub</a>
+      </nav>
+      <p>© 2026 Eva. Built thoughtfully, in public.</p>
+    </footer>
+  </body>
+</html>
