@@ -168,7 +168,15 @@ class OutboxRelay:
                     extra={**log_context, "outcome": "published"},
                 )
             except Exception as error:
-                await self.release_claim(item.id, item.claim_id, error)
+                try:
+                    await self.release_claim(item.id, item.claim_id, error)
+                except StaleClaimError:
+                    failed += 1
+                    _LOGGER.info(
+                        "outbox publication finished",
+                        extra={**log_context, "outcome": "stale"},
+                    )
+                    continue
                 failed += 1
                 _LOGGER.info(
                     "outbox publication finished",

@@ -10,6 +10,7 @@ from sqlalchemy import delete, select
 from eva_ai.db import Database
 from eva_ai.db.models import OutboxMessage
 from eva_ai.events import (
+    ClaimedOutboxMessage,
     EventService,
     OutboxRelay,
     PublishBatchResult,
@@ -83,6 +84,19 @@ class SelectiveFailingPublisher:
         if message.outbox_message_id == self._failing_message_id:
             raise RuntimeError("provider-token")
         return f"selective:{message.outbox_message_id}"
+
+
+class ReclaimingFailFirstPublisher:
+    def __init__(self, reclaiming_relay: OutboxRelay, reclaim_at: datetime) -> None:
+        self._reclaiming_relay = reclaiming_relay
+        self._reclaim_at = reclaim_at
+        self.reclaimed: ClaimedOutboxMessage | None = None
+
+    async def publish(self, message: OutboundMessage) -> str:
+        if self.reclaimed is None:
+            self.reclaimed = (await self._reclaiming_relay.claim_batch(1, self._reclaim_at))[0]
+            raise RuntimeError(f"provider-token for {message.outbox_message_id}")
+        return f"after-stale:{message.outbox_message_id}"
 
 
 @pytest.mark.integration
@@ -176,6 +190,51 @@ async def test_publish_batch_continues_after_one_message_fails(database: Databas
     assert failed_row.state == OutboxState.PENDING
     assert published_row.state == OutboxState.PUBLISHED
     assert published_row.provider_message_id == f"selective:{published_id}"
+
+
+@pytest.mark.integration
+async def test_publish_batch_continues_when_failed_publish_loses_lease(
+    database: Database,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    relay_logger = logging.getLogger("eva_ai.events.outbox")
+    relay_logger.disabled = False
+    caplog.set_level(logging.INFO, logger=relay_logger.name)
+    available_at = datetime.now(UTC) - timedelta(seconds=2)
+    first_id = (await create_pending_messages(database, count=1, received_at=available_at))[0]
+    second_id = (
+        await create_pending_messages(
+            database,
+            count=1,
+            received_at=available_at + timedelta(seconds=1),
+        )
+    )[0]
+    reclaiming_relay = OutboxRelay(database, InMemoryPublisher(), lease_seconds=60)
+    publisher = ReclaimingFailFirstPublisher(
+        reclaiming_relay,
+        reclaim_at=datetime.now(UTC) + timedelta(seconds=61),
+    )
+
+    result = await OutboxRelay(database, publisher, lease_seconds=60).publish_batch(2)
+
+    first_row = await load_outbox(database, first_id)
+    second_row = await load_outbox(database, second_id)
+    assert result == PublishBatchResult(claimed=2, published=1, failed=1)
+    assert publisher.reclaimed is not None
+    assert publisher.reclaimed.id == first_id
+    assert first_row.state == OutboxState.PUBLISHING
+    assert first_row.claim_id == publisher.reclaimed.claim_id
+    assert first_row.attempt_count == 2
+    assert first_row.last_error_type is None and first_row.last_error_summary is None
+    assert second_row.state == OutboxState.PUBLISHED
+    assert second_row.provider_message_id == f"after-stale:{second_id}"
+    outcomes = {
+        record.__dict__["outbox_message_id"]: record.__dict__["outcome"]
+        for record in caplog.records
+        if "outcome" in record.__dict__
+    }
+    assert outcomes == {str(first_id): "stale", str(second_id): "published"}
+    assert "provider-token" not in caplog.text
 
 
 @pytest.mark.integration
