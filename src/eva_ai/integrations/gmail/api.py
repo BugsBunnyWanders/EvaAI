@@ -140,7 +140,7 @@ class GoogleGmailClientFactory:
                 )
             except HttpError:
                 return _ClientCreationFailure.PROVIDER
-            return GoogleGmailClient(service)
+            return GoogleGmailClient(service, self._release)
 
         result = await asyncio.to_thread(create_sync)
         if result is _ClientCreationFailure.INVALID_CREDENTIALS:
@@ -151,21 +151,48 @@ class GoogleGmailClientFactory:
         return result
 
     async def close(self) -> None:
-        clients, self._clients = self._clients, []
-        for client in clients:
-            await client.close()
+        interruption: BaseException | None = None
+        ordinary_failure = False
+        for client in tuple(self._clients):
+            try:
+                await client.close()
+            except asyncio.CancelledError as error:
+                if interruption is None:
+                    interruption = error
+            except Exception:
+                ordinary_failure = True
+            except BaseException as error:
+                if interruption is None:
+                    interruption = error
+        if interruption is not None:
+            raise interruption
+        if ordinary_failure:
+            raise GmailProviderError("Gmail client cleanup failed")
+
+    def _release(self, client: GoogleGmailClient) -> None:
+        try:
+            self._clients.remove(client)
+        except ValueError:
+            pass
 
 
 class GoogleGmailClient:
-    def __init__(self, service: object) -> None:
+    def __init__(
+        self,
+        service: object,
+        on_closed: Callable[[GoogleGmailClient], None] | None = None,
+    ) -> None:
         self._service = cast(GmailService, service)
+        self._on_closed = on_closed
         self._closed = False
 
     async def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         await asyncio.to_thread(self._service.close)
+        self._closed = True
+        if self._on_closed is not None:
+            self._on_closed(self)
 
     async def get_profile(self) -> str:
         response = await self._execute(

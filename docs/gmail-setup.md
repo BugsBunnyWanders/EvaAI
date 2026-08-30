@@ -59,10 +59,12 @@ During `eva gmail connect`, Google opens a localhost loopback consent flow. Sele
 
 ## Local configuration and migration
 
-Copy the example environment and retain the approved identifiers:
+Create the local environment only when it does not already exist, then retain the approved
+identifiers. If `.env` already exists, merge the missing keys from `.env.example` instead of
+overwriting it:
 
 ```bash
-cp .env.example .env
+test -e .env || cp .env.example .env
 make setup
 make db-up
 make migrate
@@ -100,8 +102,11 @@ export EVA_WORKSPACE_ID=WORKSPACE_UUID_FROM_LINE_2
 After the manual OAuth client checkpoint:
 
 ```bash
-uv run eva gmail connect --user-id "$EVA_USER_ID" --workspace-id "$EVA_WORKSPACE_ID"
+make gmail-connect
 ```
+
+The Make target receives the exported UUIDs as quoted shell data. The equivalent direct command is
+`uv run eva gmail connect --user-id "$EVA_USER_ID" --workspace-id "$EVA_WORKSPACE_ID"`.
 
 The command verifies the explicit persisted ownership pair before constructing Google clients or opening a browser. It verifies the authorized Gmail profile against `EVA_GMAIL_ACCOUNT`, stores credentials in Secret Manager, creates the inbox watch with topic `projects/evaai-507018/topics/eva-gmail-notifications`, and prints only the ConnectorAccount UUID.
 
@@ -116,7 +121,7 @@ Re-running connect for the same Workspace and Gmail identity refreshes authoriza
 Start the continuous pull worker in a dedicated terminal:
 
 ```bash
-uv run eva gmail pull
+make gmail-pull
 ```
 
 The Pub/Sub pull timeout gives the worker a bounded maintenance wake-up. Stop with Ctrl-C and allow cleanup to finish.
@@ -124,13 +129,13 @@ The Pub/Sub pull timeout gives the worker a bounded maintenance wake-up. Stop wi
 Run one deterministic stored-cursor synchronization attempt when replay verification or recovery diagnosis requires it:
 
 ```bash
-uv run eva gmail sync --connector-id "$EVA_GMAIL_CONNECTOR_ID"
+make gmail-sync
 ```
 
 Run one persisted due-maintenance pass and exit:
 
 ```bash
-uv run eva gmail maintain
+make gmail-maintain
 ```
 
 `gmail maintain` renews due watches without replacing the durable cursor and performs safety synchronization only after the configured notification-silence interval.
@@ -154,8 +159,8 @@ For the Task 11 smoke test, send messages only after connection: one plain-text 
 
 ## Recovery procedures
 
-- **Worker restart:** restart `uv run eva gmail pull`. The cursor and all due timestamps are persisted; no in-process sleep owns correctness.
-- **Suspected missed notification:** run `uv run eva gmail maintain`, then one `gmail sync` attempt. Event idempotency makes replay safe.
+- **Worker restart:** restart `make gmail-pull`. The cursor and all due timestamps are persisted; no in-process sleep owns correctness.
+- **Suspected missed notification:** run `make gmail-maintain`, then `make gmail-sync`. Event idempotency makes replay safe.
 - **Expired Gmail history cursor:** a stored-cursor sync automatically performs the bounded inbox recovery from `connected_at`, ingests Events first, then publishes the replacement watch cursor.
 - **`REAUTHORIZATION_REQUIRED`:** confirm the Desktop client file is still a regular ignored file, then rerun `gmail connect` with the same User and Workspace IDs and complete consent for the configured account.
 - **Retryable `ERROR`:** check ADC, API enablement, topic IAM, network access, and Secret Manager access; then rerun connect or the failed one-pass command. Do not create another ownership scope to bypass an error.

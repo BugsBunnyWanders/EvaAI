@@ -1,8 +1,9 @@
-from collections.abc import Mapping
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import UUID
 
 
@@ -55,6 +56,10 @@ class AuthorizationRevoked(RuntimeError):
     pass
 
 
+class GmailClientCleanupError(RuntimeError):
+    """Content-free failure to close one per-attempt Gmail client."""
+
+
 class GmailClient(Protocol):
     async def get_profile(self) -> str: ...
 
@@ -65,6 +70,8 @@ class GmailClient(Protocol):
     async def get_message(self, message_id: str) -> Mapping[str, object]: ...
 
     async def list_message_ids(self, query: str, page_token: str | None) -> MessageListPage: ...
+
+    async def close(self) -> None: ...
 
 
 class GmailClientFactory(Protocol):
@@ -91,3 +98,35 @@ class PullSubscriber(Protocol):
     async def negative_acknowledge(self, ack_ids: tuple[str, ...]) -> None: ...
 
     async def close(self) -> None: ...
+
+
+async def use_gmail_client[ResultT](
+    client: GmailClient,
+    operation: Callable[[], Awaitable[ResultT]],
+) -> ResultT:
+    """Run one Gmail attempt and close its client with primary-error precedence."""
+    primary_failure: BaseException | None = None
+    result: ResultT | None = None
+    try:
+        result = await operation()
+    except BaseException as error:
+        primary_failure = error
+
+    cleanup_interruption: BaseException | None = None
+    cleanup_failed = False
+    try:
+        await client.close()
+    except asyncio.CancelledError as error:
+        cleanup_interruption = error
+    except Exception:
+        cleanup_failed = True
+    except BaseException as error:
+        cleanup_interruption = error
+
+    if primary_failure is not None:
+        raise primary_failure
+    if cleanup_interruption is not None:
+        raise cleanup_interruption
+    if cleanup_failed:
+        raise GmailClientCleanupError("Gmail client cleanup failed")
+    return cast(ResultT, result)

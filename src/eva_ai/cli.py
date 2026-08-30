@@ -48,6 +48,12 @@ class CliResourceError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class CleanupOutcome:
+    interruption: BaseException | None = None
+    ordinary_failure: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class CommandFunctions:
     scope_create: ScopeCreateCommand
     gmail_connect: GmailConnectCommand
@@ -67,8 +73,9 @@ class GmailDependencies:
     maintenance: GmailMaintenanceService
     worker: GmailPullWorker
 
-    async def close(self) -> bool:
-        failed = False
+    async def close(self) -> CleanupOutcome:
+        interruption: BaseException | None = None
+        ordinary_failure = False
         # Each close is independently attempted so one provider cannot strand later resources.
         for close in (
             self.subscriber.close,
@@ -78,9 +85,15 @@ class GmailDependencies:
         ):
             try:
                 await close()
-            except BaseException:
-                failed = True
-        return failed
+            except asyncio.CancelledError as error:
+                if interruption is None:
+                    interruption = error
+            except Exception:
+                ordinary_failure = True
+            except BaseException as error:
+                if interruption is None:
+                    interruption = error
+        return CleanupOutcome(interruption, ordinary_failure)
 
 
 def build_gmail_dependencies(settings: Settings) -> GmailDependencies:
@@ -403,18 +416,27 @@ def _qualified_topic(project_id: str, topic_id: str) -> str:
     return f"projects/{project_id}/topics/{topic_id.strip()}"
 
 
-async def _close_database(database: Database) -> bool:
+async def _close_database(database: Database) -> CleanupOutcome:
     try:
         await database.close()
-    except BaseException:
-        return True
-    return False
+    except asyncio.CancelledError as error:
+        return CleanupOutcome(interruption=error)
+    except Exception:
+        return CleanupOutcome(ordinary_failure=True)
+    except BaseException as error:
+        return CleanupOutcome(interruption=error)
+    return CleanupOutcome()
 
 
-def _raise_after_cleanup(primary_failure: BaseException | None, cleanup_failed: bool) -> None:
+def _raise_after_cleanup(
+    primary_failure: BaseException | None,
+    cleanup: CleanupOutcome,
+) -> None:
     if primary_failure is not None:
         raise primary_failure
-    if cleanup_failed:
+    if cleanup.interruption is not None:
+        raise cleanup.interruption
+    if cleanup.ordinary_failure:
         raise CliResourceError("Command resource cleanup failed")
 
 

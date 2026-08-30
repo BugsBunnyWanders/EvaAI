@@ -10,6 +10,7 @@ from eva_ai.connectors.gmail.contracts import (
     GmailClientFactory,
     OAuthAuthorizer,
     WatchResult,
+    use_gmail_client,
 )
 from eva_ai.connectors.repository import ConnectorRepository
 from eva_ai.connectors.types import ConnectorRecord, ConnectorStatus
@@ -55,36 +56,42 @@ class GmailBootstrapService:
     async def connect(self, command: ConnectGmail) -> ConnectorRecord:
         grant = await self._authorizer.authorize(command.client_file, _GMAIL_SCOPES)
         gmail = await self._client_factory.create(grant.authorized_user_json)
-        actual_identity = (await gmail.get_profile()).lower()
-        if actual_identity != command.expected_identity.lower():
-            raise AccountIdentityMismatch("authorized Gmail account does not match configuration")
 
-        now = self._clock()
-        connector = await self._repository.reserve_gmail(
-            command.user_id,
-            command.workspace_id,
-            actual_identity,
-            _GMAIL_SCOPES,
-            now,
-        )
-        if connector.status == ConnectorStatus.DISABLED:
-            return connector
-        try:
-            secret_reference = await self._credential_store.put(
-                connector.id, grant.authorized_user_json
-            )
-            await self._repository.attach_secret(connector.id, secret_reference)
-            watch = await gmail.watch(command.topic_name)
-            return await self._repository.activate_initial_watch(
-                connector.id,
-                watch,
+        async def bootstrap() -> ConnectorRecord:
+            actual_identity = (await gmail.get_profile()).lower()
+            if actual_identity != command.expected_identity.lower():
+                raise AccountIdentityMismatch(
+                    "authorized Gmail account does not match configuration"
+                )
+
+            now = self._clock()
+            connector = await self._repository.reserve_gmail(
+                command.user_id,
+                command.workspace_id,
+                actual_identity,
+                _GMAIL_SCOPES,
                 now,
-                _renewal_due_at(watch, now, self._watch_renewal_interval),
-                now + self._safety_sync_interval,
             )
-        except Exception as error:
-            await self._persist_failure_state(connector.id, error)
-            raise
+            if connector.status == ConnectorStatus.DISABLED:
+                return connector
+            try:
+                secret_reference = await self._credential_store.put(
+                    connector.id, grant.authorized_user_json
+                )
+                await self._repository.attach_secret(connector.id, secret_reference)
+                watch = await gmail.watch(command.topic_name)
+                return await self._repository.activate_initial_watch(
+                    connector.id,
+                    watch,
+                    now,
+                    _renewal_due_at(watch, now, self._watch_renewal_interval),
+                    now + self._safety_sync_interval,
+                )
+            except Exception as error:
+                await self._persist_failure_state(connector.id, error)
+                raise
+
+        return await use_gmail_client(gmail, bootstrap)
 
     async def _persist_failure_state(self, connector_id: UUID, error: Exception) -> None:
         # State persistence is best effort; the original sanitized provider error must win.

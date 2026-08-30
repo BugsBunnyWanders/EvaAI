@@ -166,6 +166,8 @@ class FakeGmailClient:
         self.watch_result = WatchResult("999", NOW + timedelta(days=7))
         self.watch_calls: list[str] = []
         self.watch_failure: BaseException | None = None
+        self.close_failure: BaseException | None = None
+        self.close_calls = 0
 
     async def watch(self, topic_name: str) -> WatchResult:
         self.watch_calls.append(topic_name)
@@ -185,18 +187,25 @@ class FakeGmailClient:
     async def list_message_ids(self, query: str, page_token: str | None) -> MessageListPage:
         raise AssertionError("renewal must not recover history")
 
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_failure is not None:
+            raise self.close_failure
+
 
 class FakeFactory:
     def __init__(self) -> None:
         self.clients: list[FakeGmailClient] = []
         self.failure: BaseException | None = None
         self.watch_failure: BaseException | None = None
+        self.close_failure: BaseException | None = None
 
     async def create(self, authorized_user_json: str) -> GmailClient:
         if self.failure is not None:
             raise self.failure
         client = FakeGmailClient()
         client.watch_failure = self.watch_failure
+        client.close_failure = self.close_failure
         self.clients.append(client)
         return cast(GmailClient, client)
 
@@ -253,6 +262,36 @@ async def test_startup_run_renews_due_watch_without_replacing_durable_cursor() -
     assert state.next_watch_renewal_at == NOW + timedelta(hours=24)
     assert state.claim_id is None and state.lease_expires_at is None
     assert harness.factory.clients[0].watch_calls == [TOPIC_NAME]
+    assert harness.factory.clients[0].close_calls == 1
+
+
+async def test_renewal_cleanup_cancellation_propagates_identically_after_success() -> None:
+    harness = Harness()
+    harness.repository.states[CONNECTOR_ID] = sync_record(renewal_at=NOW)
+    cancellation = asyncio.CancelledError("private-close-marker")
+    harness.factory.close_failure = cancellation
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await harness.service.run_due(NOW)
+
+    assert raised.value is cancellation
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert harness.factory.clients[0].close_calls == 1
+    assert CONNECTOR_ID not in harness.repository.busy
+
+
+async def test_renewal_primary_failure_wins_over_cleanup_cancellation() -> None:
+    harness = Harness()
+    harness.repository.states[CONNECTOR_ID] = sync_record(renewal_at=NOW)
+    harness.factory.watch_failure = RuntimeError("private-provider-response")
+    harness.factory.close_failure = asyncio.CancelledError("private-close-marker")
+
+    summary = await harness.service.run_due(NOW)
+
+    assert summary == MaintenanceSummary(renewed=0, safety_synced=0, failed=1)
+    assert harness.factory.clients[0].close_calls == 1
+    assert CONNECTOR_ID not in harness.repository.busy
 
 
 async def test_maintenance_uses_injected_renewal_and_silence_intervals() -> None:
@@ -468,6 +507,10 @@ async def test_renewal_cancellation_best_effort_releases_and_propagates_unchange
     assert raised.value is cancellation
     assert CONNECTOR_ID not in harness.repository.busy
     assert harness.repository.calls[-1] == f"release:{CONNECTOR_ID}"
+    if stage in {"watch", "renewal"}:
+        assert harness.factory.clients[0].close_calls == 1
+    else:
+        assert harness.factory.clients == []
 
 
 async def test_release_failure_never_masks_or_chains_renewal_cancellation() -> None:

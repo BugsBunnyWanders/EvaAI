@@ -266,6 +266,8 @@ class FakeGmailClient:
         self.watch_result = WatchResult("200", NOW + timedelta(days=7))
         self.watch_calls: list[str] = []
         self.operations: list[str] = []
+        self.close_calls = 0
+        self.close_failures: list[BaseException] = []
 
     async def list_history(self, start_history_id: str, page_token: str | None) -> HistoryPage:
         self.history_calls.append((start_history_id, page_token))
@@ -295,6 +297,11 @@ class FakeGmailClient:
         if self.message_list_failure is not None:
             raise self.message_list_failure
         return self.message_list_pages[page_token]
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_failures:
+            raise self.close_failures.pop(0)
 
 
 class FakeGmailClientFactory:
@@ -647,6 +654,70 @@ async def test_expired_history_recovers_exact_connected_range_before_fresh_watch
     assert harness.repository.state is not None
     assert harness.repository.state.history_id == "250"
     assert harness.repository.state.next_safety_sync_at == NOW + timedelta(minutes=60)
+    assert harness.gmail.close_calls == 1
+
+
+async def test_repeated_sync_attempts_close_each_attempt_client() -> None:
+    """Fails if a healthy pull loop accumulates open per-attempt Gmail clients."""
+    harness = Harness()
+    harness.gmail.pages = {
+        None: HistoryPage(message_ids=(), history_id="101", next_page_token=None)
+    }
+
+    first = await harness.service.sync_connector(CONNECTOR_ID)
+    harness.gmail.pages = {
+        None: HistoryPage(message_ids=(), history_id="102", next_page_token=None)
+    }
+    second = await harness.service.sync_connector(CONNECTOR_ID)
+
+    assert first.final_history_id == "101"
+    assert second.final_history_id == "102"
+    assert harness.gmail.history_calls == [("100", None), ("101", None)]
+    assert harness.gmail.close_calls == 2
+    assert len(harness.factory.credentials) == 2
+
+
+async def test_sync_cleanup_cancellation_propagates_identically_after_success() -> None:
+    harness = Harness()
+    cancellation = asyncio.CancelledError("private-close-marker")
+    harness.gmail.close_failures = [cancellation]
+    harness.gmail.pages = {
+        None: HistoryPage(message_ids=(), history_id="101", next_page_token=None)
+    }
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await harness.service.sync_connector(CONNECTOR_ID)
+
+    assert raised.value is cancellation
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert harness.gmail.close_calls == 1
+    assert harness.repository.state is not None
+    assert harness.repository.state.history_id == "101"
+    assert harness.repository.busy is False
+
+
+@pytest.mark.parametrize(
+    "cleanup_failure",
+    [RuntimeError("private-close-response"), asyncio.CancelledError("private-close-cancel")],
+    ids=["ordinary", "cancellation"],
+)
+async def test_sync_primary_failure_wins_over_client_cleanup(
+    cleanup_failure: BaseException,
+) -> None:
+    harness = Harness()
+    primary = GmailProviderError("Gmail API request failed")
+    harness.gmail.history_failure = primary
+    harness.gmail.close_failures = [cleanup_failure]
+
+    with pytest.raises(GmailProviderError) as raised:
+        await harness.service.sync_connector(CONNECTOR_ID)
+
+    assert raised.value is primary
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert harness.gmail.close_calls == 1
+    assert harness.repository.busy is False
 
 
 async def test_recovery_replay_is_idempotent_and_cursor_completion_remains_last() -> None:
@@ -806,6 +877,7 @@ async def test_cancellation_during_claimed_await_releases_claim_and_propagates_u
     assert harness.repository.calls[-1] == "release"
     assert harness.repository.state is not None
     assert harness.repository.state.history_id == "100"
+    assert harness.gmail.close_calls == int(stage not in {"credentials", "factory"})
 
 
 async def test_cancellation_during_reauthorization_transition_releases_claim() -> None:

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import threading
@@ -44,6 +45,7 @@ class GmailResources:
         self.results: dict[str, Mapping[str, object]] = {}
         self.errors: dict[str, Exception] = {}
         self.close_calls = 0
+        self.close_failures: list[BaseException] = []
 
     def users(self) -> GmailResources:
         return self
@@ -77,6 +79,8 @@ class GmailResources:
     def close(self) -> None:
         assert threading.get_ident() != self.main_thread_id
         self.close_calls += 1
+        if self.close_failures:
+            raise self.close_failures.pop(0)
 
 
 @pytest.mark.asyncio
@@ -231,6 +235,83 @@ async def test_gmail_factory_closes_every_created_client_once_off_event_loop() -
     assert isinstance(first, GoogleGmailClient)
     assert isinstance(second, GoogleGmailClient)
     assert [service.close_calls for service in services] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_gmail_client_retries_close_after_underlying_failure() -> None:
+    """Fails if a failed close permanently marks the client closed."""
+    service = GmailResources(threading.get_ident())
+    service.close_failures = [RuntimeError("private-provider-close-marker")]
+    client = GoogleGmailClient(service)
+
+    with pytest.raises(RuntimeError, match="private-provider-close-marker"):
+        await client.close()
+    await client.close()
+
+    assert service.close_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_factory_close_attempts_all_clients_and_retries_only_failed_ones() -> None:
+    """Fails if one close failure skips later clients or loses retry ownership."""
+    services = [
+        GmailResources(threading.get_ident()),
+        GmailResources(threading.get_ident()),
+        GmailResources(threading.get_ident()),
+    ]
+    services[0].close_failures = [RuntimeError("private-first-close-marker")]
+    remaining = list(services)
+    factory = GoogleGmailClientFactory(
+        credentials_factory=lambda *_: object(),
+        build_service=lambda *_args, **_kwargs: remaining.pop(0),
+    )
+    for _ in services:
+        await factory.create("{}")
+
+    with pytest.raises(GmailProviderError) as raised:
+        await factory.close()
+
+    assert str(raised.value) == "Gmail client cleanup failed"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "private-first-close-marker" not in repr(raised.value)
+    assert [service.close_calls for service in services] == [1, 1, 1]
+
+    await factory.close()
+
+    assert [service.close_calls for service in services] == [2, 1, 1]
+
+
+@pytest.mark.asyncio
+async def test_factory_close_cancellation_wins_after_every_client_is_attempted() -> None:
+    """Fails if aggregate cleanup masks cancellation or skips ordinary/healthy clients."""
+    services = [
+        GmailResources(threading.get_ident()),
+        GmailResources(threading.get_ident()),
+        GmailResources(threading.get_ident()),
+    ]
+    cancellation = asyncio.CancelledError("private-cancelled-close-marker")
+    services[0].close_failures = [cancellation]
+    services[1].close_failures = [RuntimeError("private-ordinary-close-marker")]
+    remaining = list(services)
+    factory = GoogleGmailClientFactory(
+        credentials_factory=lambda *_: object(),
+        build_service=lambda *_args, **_kwargs: remaining.pop(0),
+    )
+    for _ in services:
+        await factory.create("{}")
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await factory.close()
+
+    assert raised.value is cancellation
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert [service.close_calls for service in services] == [1, 1, 1]
+
+    await factory.close()
+
+    assert [service.close_calls for service in services] == [2, 2, 1]
 
 
 @pytest.mark.asyncio

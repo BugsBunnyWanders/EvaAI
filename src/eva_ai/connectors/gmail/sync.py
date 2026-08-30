@@ -12,6 +12,7 @@ from eva_ai.connectors.gmail.contracts import (
     GmailClientFactory,
     GmailNotification,
     HistoryCursorExpired,
+    use_gmail_client,
 )
 from eva_ai.connectors.gmail.normalizer import normalize_message
 from eva_ai.connectors.repository import AmbiguousConnectorIdentity, ConnectorRepository
@@ -203,60 +204,64 @@ class GmailSyncService:
             failure_boundary = "client"
             gmail = await self._client_factory.create(authorized_user_json)
 
-            # Claim acquisition is already committed; no SQL transaction spans provider I/O.
-            message_ids: dict[str, None] = {}
-            page_token: str | None = None
-            final_history_id = start_history_id
-            try:
-                while True:
-                    failure_boundary = "history"
-                    page = await gmail.list_history(start_history_id, page_token)
-                    final_history_id = page.history_id
-                    for message_id in page.message_ids:
-                        message_ids.setdefault(message_id, None)
-                    page_token = page.next_page_token
-                    if page_token is None:
-                        break
-            except HistoryCursorExpired:
-                # The recovery scan reuses this claim so no worker can advance the old cursor.
-                failure_boundary = "recovery"
+            async def synchronize() -> SyncResult:
+                nonlocal failure_boundary
+                # Claim acquisition is committed; no SQL transaction spans provider I/O.
+                message_ids: dict[str, None] = {}
+                page_token: str | None = None
+                final_history_id = start_history_id
                 try:
-                    return await self._recovery_service.recover(claim, gmail, self._clock())
-                except ValueError:
+                    while True:
+                        failure_boundary = "history"
+                        page = await gmail.list_history(start_history_id, page_token)
+                        final_history_id = page.history_id
+                        for message_id in page.message_ids:
+                            message_ids.setdefault(message_id, None)
+                        page_token = page.next_page_token
+                        if page_token is None:
+                            break
+                except HistoryCursorExpired:
+                    # Recovery reuses this claim so no worker can advance the old cursor.
+                    failure_boundary = "recovery"
+                    try:
+                        return await self._recovery_service.recover(claim, gmail, self._clock())
+                    except ValueError:
+                        failure_boundary = "normalization"
+                        raise
+
+                events_created = 0
+                for message_id in message_ids:
+                    failure_boundary = "message"
+                    raw = await gmail.get_message(message_id)
+                    if not _has_inbox_label(raw):
+                        continue
                     failure_boundary = "normalization"
-                    raise
+                    event = normalize_message(raw, claim.connector, final_history_id)
+                    if event.occurred_at < connected_at:
+                        continue
+                    # Every Event commits before the cursor completion transaction.
+                    failure_boundary = "event"
+                    result = await self._event_service.ingest(event)
+                    events_created += int(result.created)
 
-            events_created = 0
-            for message_id in message_ids:
-                failure_boundary = "message"
-                raw = await gmail.get_message(message_id)
-                if not _has_inbox_label(raw):
-                    continue
-                failure_boundary = "normalization"
-                event = normalize_message(raw, claim.connector, final_history_id)
-                if event.occurred_at < connected_at:
-                    continue
-                # Every Event commits independently before the cursor completion transaction.
-                failure_boundary = "event"
-                result = await self._event_service.ingest(event)
-                events_created += int(result.created)
+                completed_at = self._clock()
+                failure_boundary = "completion"
+                completed = await self._repository.complete_sync(
+                    claim,
+                    final_history_id,
+                    completed_at,
+                    completed_at + self._safety_sync_interval,
+                )
+                if not completed:
+                    raise GmailSyncError("Gmail synchronization claim is no longer current")
+                return SyncResult(
+                    SyncStatus.SYNCED,
+                    claim.connector.id,
+                    events_created,
+                    final_history_id,
+                )
 
-            completed_at = self._clock()
-            failure_boundary = "completion"
-            completed = await self._repository.complete_sync(
-                claim,
-                final_history_id,
-                completed_at,
-                completed_at + self._safety_sync_interval,
-            )
-            if not completed:
-                raise GmailSyncError("Gmail synchronization claim is no longer current")
-            return SyncResult(
-                SyncStatus.SYNCED,
-                claim.connector.id,
-                events_created,
-                final_history_id,
-            )
+            return await use_gmail_client(gmail, synchronize)
         except asyncio.CancelledError as error:
             cancelled = error
         except AuthorizationRevoked as error:

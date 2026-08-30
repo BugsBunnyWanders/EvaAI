@@ -7,6 +7,7 @@ from eva_ai.connectors.gmail.contracts import (
     AuthorizationRevoked,
     CredentialStore,
     GmailClientFactory,
+    use_gmail_client,
 )
 from eva_ai.connectors.gmail.sync import GmailSyncService, SyncStatus
 from eva_ai.connectors.repository import ConnectorRepository
@@ -119,19 +120,23 @@ class GmailMaintenanceService:
                 return False
             authorized_user_json = await self._credential_store.get(secret_reference)
             gmail = await self._client_factory.create(authorized_user_json)
-            watch = await gmail.watch(self._topic_name)
-            renewed = await self._repository.record_watch_renewal(
-                claim,
-                watch.expiration,
-                min(
-                    now + self._watch_renewal_interval,
-                    watch.expiration - self._watch_renewal_interval,
-                ),
-            )
-            if not renewed:
-                await self._release_safely(claim)
-                return False
-            return True
+
+            async def renew() -> bool:
+                watch = await gmail.watch(self._topic_name)
+                renewed = await self._repository.record_watch_renewal(
+                    claim,
+                    watch.expiration,
+                    min(
+                        now + self._watch_renewal_interval,
+                        watch.expiration - self._watch_renewal_interval,
+                    ),
+                )
+                if not renewed:
+                    await self._release_safely(claim)
+                    return False
+                return True
+
+            return await use_gmail_client(gmail, renew)
         except asyncio.CancelledError:
             if claim is not None:
                 await self._release_after_cancellation(claim)

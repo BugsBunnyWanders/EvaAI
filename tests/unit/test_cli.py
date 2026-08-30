@@ -1,6 +1,6 @@
 import asyncio
 from contextlib import AbstractAsyncContextManager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import cast
@@ -9,9 +9,12 @@ from uuid import UUID
 import pytest
 
 from eva_ai.cli import (
+    CleanupOutcome,
+    CliResourceError,
     CliValidationError,
     CommandFunctions,
     GmailDependencies,
+    build_gmail_dependencies,
     gmail_connect_command,
     gmail_maintain_command,
     gmail_pull_command,
@@ -20,12 +23,16 @@ from eva_ai.cli import (
     scope_create_command,
 )
 from eva_ai.config import Settings
-from eva_ai.connectors.gmail.bootstrap import ConnectGmail
-from eva_ai.connectors.gmail.maintenance import MaintenanceSummary
-from eva_ai.connectors.gmail.sync import SyncResult, SyncStatus
+from eva_ai.connectors.gmail.bootstrap import ConnectGmail, GmailBootstrapService
+from eva_ai.connectors.gmail.maintenance import GmailMaintenanceService, MaintenanceSummary
+from eva_ai.connectors.gmail.sync import GmailSyncService, SyncResult, SyncStatus
+from eva_ai.connectors.gmail.worker import GmailPullWorker
 from eva_ai.connectors.types import ConnectorRecord, ConnectorStatus
 from eva_ai.db.models import User, Workspace
 from eva_ai.db.session import Database
+from eva_ai.integrations.gcp.secret_manager import GoogleSecretManagerCredentialStore
+from eva_ai.integrations.gcp.subscriber import GooglePullSubscriber
+from eva_ai.integrations.gmail.api import GoogleGmailClientFactory
 from eva_ai.local_scope import LocalScope, create_local_scope
 
 USER_ID = UUID("0191cafe-7b00-7000-8000-000000000001")
@@ -278,9 +285,12 @@ class FakeSync:
 class FakeMaintenance:
     def __init__(self) -> None:
         self.calls: list[datetime] = []
+        self.failure: BaseException | None = None
 
     async def run_due(self, now: datetime) -> MaintenanceSummary:
         self.calls.append(now)
+        if self.failure is not None:
+            raise self.failure
         return MaintenanceSummary(renewed=0, safety_synced=0, failed=0)
 
 
@@ -303,9 +313,9 @@ class FakeDependencies:
         self.worker = FakeWorker()
         self.close_calls = 0
 
-    async def close(self) -> bool:
+    async def close(self) -> CleanupOutcome:
         self.close_calls += 1
-        return False
+        return CleanupOutcome()
 
 
 def configured_settings(client_file: Path) -> Settings:
@@ -318,6 +328,50 @@ def configured_settings(client_file: Path) -> Settings:
         gmail_account="owner@example.com",
         gmail_oauth_client_file=client_file,
     )
+
+
+async def test_builder_wires_every_non_default_runtime_setting() -> None:
+    """Fails if typed settings exist but runtime composition retains a default."""
+    database_url = "postgresql+psycopg://synthetic:password@localhost:5432/eva_settings"
+    dependencies = build_gmail_dependencies(
+        Settings(
+            _env_file=None,
+            database_url=database_url,
+            pubsub_project_id="settings-project",
+            pubsub_topic_id="settings-events",
+            gmail_topic_id="settings-gmail-topic",
+            gmail_subscription_id="settings-subscription",
+            gmail_sync_lease_seconds=47,
+            gmail_pull_timeout_seconds=13,
+            gmail_watch_renewal_hours=7,
+            gmail_safety_sync_minutes=19,
+        )
+    )
+
+    assert dependencies.database.engine.url.render_as_string(hide_password=False) == database_url
+    assert dependencies.credential_store._project_id == "settings-project"
+    assert dependencies.subscriber._project_id == "settings-project"
+    assert dependencies.subscriber._subscription_id == "settings-subscription"
+    assert dependencies.sync_service._lease_seconds == 47
+    assert dependencies.maintenance._lease_seconds == 47
+    assert dependencies.worker._pull_timeout_seconds == 13
+    assert dependencies.bootstrap._watch_renewal_interval == timedelta(hours=7)
+    assert dependencies.maintenance._watch_renewal_interval == timedelta(hours=7)
+    assert dependencies.bootstrap._safety_sync_interval == timedelta(minutes=19)
+    assert dependencies.sync_service._safety_sync_interval == timedelta(minutes=19)
+    assert dependencies.sync_service._recovery_service._safety_sync_interval == timedelta(
+        minutes=19
+    )
+    assert dependencies.maintenance._safety_sync_interval == timedelta(minutes=19)
+    assert dependencies.sync_service._recovery_service._topic_name == (
+        "projects/settings-project/topics/settings-gmail-topic"
+    )
+    assert dependencies.maintenance._topic_name == (
+        "projects/settings-project/topics/settings-gmail-topic"
+    )
+    assert dependencies.sync_service._event_service._destination == "settings-events"
+
+    assert await dependencies.close() == CleanupOutcome()
 
 
 @pytest.mark.parametrize(
@@ -522,3 +576,116 @@ async def test_pull_runs_continuously_and_cleans_up_on_cancellation() -> None:
     assert raised.value is cancellation
     assert dependencies.worker.calls == 1
     assert dependencies.close_calls == 1
+
+
+class RecordingCloseResource:
+    def __init__(self, name: str, calls: list[str]) -> None:
+        self.name = name
+        self.calls = calls
+        self.failure: BaseException | None = None
+
+    async def close(self) -> None:
+        self.calls.append(self.name)
+        if self.failure is not None:
+            raise self.failure
+
+
+def dependencies_with_close_resources(
+    calls: list[str],
+) -> tuple[GmailDependencies, dict[str, RecordingCloseResource]]:
+    resources = {
+        "subscriber": RecordingCloseResource("subscriber", calls),
+        "gmail_factory": RecordingCloseResource("gmail_factory", calls),
+        "secret_manager": RecordingCloseResource("secret_manager", calls),
+        "database": RecordingCloseResource("database", calls),
+    }
+    dependencies = GmailDependencies(
+        database=cast(Database, resources["database"]),
+        credential_store=cast(
+            GoogleSecretManagerCredentialStore,
+            resources["secret_manager"],
+        ),
+        client_factory=cast(GoogleGmailClientFactory, resources["gmail_factory"]),
+        subscriber=cast(GooglePullSubscriber, resources["subscriber"]),
+        bootstrap=cast(GmailBootstrapService, FakeBootstrap()),
+        sync_service=cast(GmailSyncService, FakeSync()),
+        maintenance=cast(GmailMaintenanceService, FakeMaintenance()),
+        worker=cast(GmailPullWorker, FakeWorker()),
+    )
+    return dependencies, resources
+
+
+@pytest.mark.parametrize(
+    "cancelled_stage",
+    ["subscriber", "gmail_factory", "secret_manager", "database"],
+)
+@pytest.mark.parametrize("has_primary_failure", [False, True])
+async def test_cleanup_cancellation_attempts_every_close_with_safe_primary_precedence(
+    cancelled_stage: str,
+    has_primary_failure: bool,
+) -> None:
+    """Fails if close cancellation skips cleanup, loses identity, or masks command failure."""
+    calls: list[str] = []
+    dependencies, resources = dependencies_with_close_resources(calls)
+    cancellation = asyncio.CancelledError(f"private-close-marker-{cancelled_stage}")
+    resources[cancelled_stage].failure = cancellation
+    primary = RuntimeError("fixed primary command failure") if has_primary_failure else None
+    maintenance = cast(FakeMaintenance, dependencies.maintenance)
+    maintenance.failure = primary
+
+    expected = RuntimeError if has_primary_failure else asyncio.CancelledError
+    with pytest.raises(expected) as raised:
+        await gmail_maintain_command(
+            settings=Settings(_env_file=None, pubsub_project_id="eva-project"),
+            dependency_builder=lambda *_: dependencies,
+            clock=lambda: NOW,
+        )
+
+    assert raised.value is (primary if has_primary_failure else cancellation)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert calls == ["subscriber", "gmail_factory", "secret_manager", "database"]
+    if has_primary_failure:
+        assert "private-close-marker" not in repr(raised.value)
+
+
+async def test_cleanup_keyboard_interrupt_is_not_reduced_to_ordinary_failure() -> None:
+    """Fails if a cleanup BaseException becomes CliResourceError or skips later closes."""
+    calls: list[str] = []
+    dependencies, resources = dependencies_with_close_resources(calls)
+    interrupt = KeyboardInterrupt("operator interrupted cleanup")
+    resources["gmail_factory"].failure = interrupt
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        await gmail_maintain_command(
+            settings=Settings(_env_file=None, pubsub_project_id="eva-project"),
+            dependency_builder=lambda *_: dependencies,
+            clock=lambda: NOW,
+        )
+
+    assert raised.value is interrupt
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert calls == ["subscriber", "gmail_factory", "secret_manager", "database"]
+
+
+async def test_ordinary_cleanup_failures_are_fixed_chain_free_after_all_closes() -> None:
+    """Fails if close details escape or one ordinary failure skips later resources."""
+    calls: list[str] = []
+    dependencies, resources = dependencies_with_close_resources(calls)
+    resources["subscriber"].failure = RuntimeError(
+        "private-provider-close OAuth database message marker"
+    )
+
+    with pytest.raises(CliResourceError) as raised:
+        await gmail_maintain_command(
+            settings=Settings(_env_file=None, pubsub_project_id="eva-project"),
+            dependency_builder=lambda *_: dependencies,
+            clock=lambda: NOW,
+        )
+
+    assert str(raised.value) == "Command resource cleanup failed"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "private-provider-close" not in repr(raised.value)
+    assert calls == ["subscriber", "gmail_factory", "secret_manager", "database"]

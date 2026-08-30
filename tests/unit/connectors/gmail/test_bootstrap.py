@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -187,11 +188,14 @@ class FakeGmailClient:
         *,
         identity: str = "Owner@Example.COM",
         watch_failure: Exception | None = None,
+        close_failure: BaseException | None = None,
         on_watch: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.calls = calls
         self.identity = identity
         self.watch_failure = watch_failure
+        self.close_failure = close_failure
+        self.close_calls = 0
         self.on_watch = on_watch
         self.watch_topic: str | None = None
 
@@ -217,6 +221,11 @@ class FakeGmailClient:
     async def list_message_ids(self, query: str, page_token: str | None) -> object:
         raise AssertionError("bootstrap must not list messages")
 
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_failure is not None:
+            raise self.close_failure
+
 
 class FakeGmailClientFactory:
     def __init__(self, calls: list[str], gmail: FakeGmailClient) -> None:
@@ -237,6 +246,7 @@ class Harness:
         identity: str = "Owner@Example.COM",
         secret_failure: SecretManagerProviderError | None = None,
         watch_failure: Exception | None = None,
+        close_failure: BaseException | None = None,
         transition_failure: Exception | None = None,
         on_watch: Callable[[], Awaitable[None]] | None = None,
         now: datetime = NOW,
@@ -249,6 +259,7 @@ class Harness:
             self.calls,
             identity=identity,
             watch_failure=watch_failure,
+            close_failure=close_failure,
             on_watch=on_watch,
         )
         self.client_factory = FakeGmailClientFactory(self.calls, self.gmail)
@@ -309,6 +320,68 @@ async def test_connect_runs_exact_bootstrap_sequence_and_activates_from_watch_cu
     assert connector.status == ConnectorStatus.ACTIVE
     assert connector.connected_at == NOW
     assert harness.repository.history_id == WATCH.history_id
+    assert harness.gmail.close_calls == 1
+
+
+async def test_connect_closes_client_after_pre_reservation_identity_failure() -> None:
+    """Fails if an OAuth profile mismatch leaks its per-attempt Gmail transport."""
+    harness = Harness(identity="unexpected@example.com")
+
+    with pytest.raises(AccountIdentityMismatch):
+        await harness.connect()
+
+    assert harness.gmail.close_calls == 1
+
+
+async def test_connect_cleanup_cancellation_propagates_after_success() -> None:
+    """Fails if client-close cancellation is masked or the client is not attempted."""
+    cancellation = asyncio.CancelledError("private-client-close-cancellation")
+    harness = Harness(close_failure=cancellation)
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await harness.connect()
+
+    assert raised.value is cancellation
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert harness.gmail.close_calls == 1
+    assert harness.repository.record is not None
+    assert harness.repository.record.status == ConnectorStatus.ACTIVE
+
+
+async def test_connect_operation_cancellation_closes_client_and_propagates_identically() -> None:
+    cancellation = asyncio.CancelledError("private-watch-cancellation")
+
+    async def cancel_watch() -> None:
+        raise cancellation
+
+    harness = Harness(on_watch=cancel_watch)
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await harness.connect()
+
+    assert raised.value is cancellation
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert harness.gmail.close_calls == 1
+
+
+async def test_connect_primary_failure_wins_over_client_close_failure() -> None:
+    """Fails if provider cleanup masks or chains the actionable bootstrap failure."""
+    provider_failure = GmailProviderError("Gmail API request failed")
+    harness = Harness(
+        watch_failure=provider_failure,
+        close_failure=RuntimeError("private-client-close-marker"),
+    )
+
+    with pytest.raises(GmailProviderError) as raised:
+        await harness.connect()
+
+    assert raised.value is provider_failure
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "private-client-close-marker" not in repr(raised.value)
+    assert harness.gmail.close_calls == 1
 
 
 async def test_connect_uses_injected_watch_and_safety_intervals() -> None:
@@ -372,6 +445,7 @@ async def test_connect_marks_reserved_connector_when_secret_storage_fails() -> N
     assert harness.repository.last_error_type == "SecretManagerProviderError"
     assert harness.repository.record.secret_reference is None
     assert harness.repository.history_id is None
+    assert harness.gmail.close_calls == 1
 
 
 async def test_connect_marks_reserved_connector_and_keeps_cursor_empty_when_watch_fails() -> None:
@@ -396,6 +470,7 @@ async def test_connect_marks_reserved_connector_and_keeps_cursor_empty_when_watc
     assert harness.repository.last_error_type == "GmailProviderError"
     assert harness.repository.record.secret_reference == SECRET_REFERENCE
     assert harness.repository.history_id is None
+    assert harness.gmail.close_calls == 1
 
 
 async def test_connect_marks_only_authorization_revocation_for_reauthorization() -> None:

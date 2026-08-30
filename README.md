@@ -42,6 +42,19 @@ uv run eva gmail pull
 uv run eva gmail maintain
 ```
 
+The four Gmail Make wrappers consume IDs from exported environment variables as literal shell
+data. Create the scope with the direct CLI command above, export the UUIDs it prints, then use:
+
+```bash
+export EVA_USER_ID=USER_UUID
+export EVA_WORKSPACE_ID=WORKSPACE_UUID
+export EVA_GMAIL_CONNECTOR_ID=CONNECTOR_UUID
+make gmail-connect
+make gmail-sync
+make gmail-pull
+make gmail-maintain
+```
+
 There is no public Gmail webhook or HTTP ingestion endpoint. Gmail notifications are consumed from the configured pull subscription.
 
 ## Verification

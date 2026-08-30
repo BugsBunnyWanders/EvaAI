@@ -107,6 +107,9 @@ class CheckingGmailClient:
     async def list_message_ids(self, query: str, page_token: str | None) -> object:
         raise AssertionError("forward synchronization must not scan mailbox")
 
+    async def close(self) -> None:
+        return None
+
 
 class CheckingFactory:
     def __init__(self, database: Database, connector_id: UUID) -> None:
