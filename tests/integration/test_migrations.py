@@ -61,6 +61,9 @@ async def test_gmail_connector_constraints(database: Database) -> None:
         "ck_connector_accounts_status",
         "ck_connector_accounts_active_secret",
     }
+    assert await constraint_names(database, "gmail_sync_states") >= {
+        "fk_gmail_sync_states_connector_account"
+    }
     assert await primary_key_columns(database, "gmail_sync_states") == ["connector_account_id"]
 
 

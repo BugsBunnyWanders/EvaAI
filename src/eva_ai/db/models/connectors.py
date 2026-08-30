@@ -69,7 +69,12 @@ class GmailSyncState(TimestampMixin, Base):
     )
 
     connector_account_id: Mapped[UUID] = mapped_column(
-        ForeignKey("connector_accounts.id", ondelete="CASCADE"), primary_key=True
+        ForeignKey(
+            "connector_accounts.id",
+            name="fk_gmail_sync_states_connector_account",
+            ondelete="CASCADE",
+        ),
+        primary_key=True,
     )
     history_id: Mapped[str | None] = mapped_column(String(100))
     watch_expiration: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

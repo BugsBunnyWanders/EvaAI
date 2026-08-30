@@ -94,7 +94,10 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.ForeignKeyConstraint(
-            ["connector_account_id"], ["connector_accounts.id"], ondelete="CASCADE"
+            ["connector_account_id"],
+            ["connector_accounts.id"],
+            name="fk_gmail_sync_states_connector_account",
+            ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("connector_account_id"),
     )
