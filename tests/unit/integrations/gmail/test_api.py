@@ -212,6 +212,67 @@ async def test_gmail_factory_constructs_credentials_and_service_off_the_event_lo
     assert "factory-secret" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("close_failure", "expected_final_close_calls"),
+    [
+        pytest.param(None, 1, id="close-success"),
+        pytest.param(
+            RuntimeError("private-construction-close-marker"),
+            2,
+            id="ordinary-close-failure-retried",
+        ),
+        pytest.param(
+            asyncio.CancelledError("private-construction-close-interruption"),
+            2,
+            id="close-interruption-retried",
+        ),
+    ],
+)
+async def test_cancelled_factory_construction_never_orphans_completed_service(
+    close_failure: BaseException | None,
+    expected_final_close_calls: int,
+) -> None:
+    """Fails if cancellation discards an off-thread service before ownership or cleanup."""
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    service = GmailResources(threading.get_ident())
+    if close_failure is not None:
+        service.close_failures = [close_failure]
+
+    def build_service(*_: object, **__: object) -> GmailResources:
+        started.set()
+        try:
+            assert release.wait(timeout=2)
+            return service
+        finally:
+            finished.set()
+
+    factory = GoogleGmailClientFactory(
+        credentials_factory=lambda *_: object(),
+        build_service=build_service,
+    )
+    creation = asyncio.create_task(factory.create("{}"))
+    assert await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=2)
+    cancellation_marker = object()
+    creation.cancel(cancellation_marker)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await creation
+
+    assert await asyncio.wait_for(asyncio.to_thread(finished.wait), timeout=2)
+    assert raised.value.args == (cancellation_marker,)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "private-construction-close" not in repr(raised.value)
+    assert service.close_calls == 1
+
+    await factory.close()
+
+    assert service.close_calls == expected_final_close_calls
+
+
 @pytest.mark.asyncio
 async def test_gmail_factory_closes_every_created_client_once_off_event_loop() -> None:
     """Fails if command cleanup leaks Gmail HTTP clients or closes one twice."""

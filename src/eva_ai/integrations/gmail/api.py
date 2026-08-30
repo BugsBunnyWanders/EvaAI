@@ -142,7 +142,27 @@ class GoogleGmailClientFactory:
                 return _ClientCreationFailure.PROVIDER
             return GoogleGmailClient(service, self._release)
 
-        result = await asyncio.to_thread(create_sync)
+        construction = asyncio.create_task(asyncio.to_thread(create_sync))
+        cancelled: asyncio.CancelledError | None = None
+        try:
+            result = await asyncio.shield(construction)
+        except asyncio.CancelledError as error:
+            cancelled = error
+            try:
+                result = await construction
+            except BaseException:
+                result = None
+
+        if cancelled is not None:
+            if isinstance(result, GoogleGmailClient):
+                self._clients.append(result)
+                try:
+                    await result.close()
+                except BaseException:
+                    # Failed cancellation cleanup stays factory-owned for aggregate retry.
+                    pass
+            raise cancelled
+        assert result is not None
         if result is _ClientCreationFailure.INVALID_CREDENTIALS:
             raise InvalidAuthorizedUserCredentials("authorized-user credentials are invalid")
         if result is _ClientCreationFailure.PROVIDER:
