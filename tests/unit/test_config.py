@@ -39,3 +39,17 @@ def test_settings_read_prefixed_environment(monkeypatch: pytest.MonkeyPatch) -> 
 def test_settings_reject_unknown_log_level() -> None:
     with pytest.raises(ValidationError):
         Settings(log_level="VERBOSE", _env_file=None)
+
+
+def test_event_backbone_settings_have_safe_local_defaults() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.pubsub_project_id is None
+    assert settings.pubsub_topic_id == "eva-events"
+    assert settings.outbox_batch_limit == 100
+    assert settings.outbox_lease_seconds == 60
+    assert settings.processing_lease_seconds == 300
+
+
+def test_event_backbone_settings_reject_non_positive_limits() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, outbox_batch_limit=0)
