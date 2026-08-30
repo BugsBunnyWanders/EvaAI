@@ -74,8 +74,8 @@ class EventProcessing(TimestampMixin, Base):
     event_id: Mapped[UUID] = mapped_column(
         ForeignKey("events.id", ondelete="CASCADE"), primary_key=True
     )
-    stage: Mapped[ProcessingStage] = mapped_column(String(32))
-    attempt_count: Mapped[int] = mapped_column(default=0)
+    stage: Mapped[ProcessingStage] = mapped_column(String(32), server_default="RECEIVED")
+    attempt_count: Mapped[int] = mapped_column(default=0, server_default="0")
     last_error_type: Mapped[str | None] = mapped_column(String(200))
     last_error_summary: Mapped[str | None] = mapped_column(String(500))
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -98,8 +98,8 @@ class OutboxMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     message_type: Mapped[str] = mapped_column(String(200))
     schema_version: Mapped[int]
     payload: Mapped[dict[str, JsonValue]] = mapped_column(JSONB)
-    state: Mapped[OutboxState] = mapped_column(String(32))
-    attempt_count: Mapped[int] = mapped_column(default=0)
+    state: Mapped[OutboxState] = mapped_column(String(32), server_default="PENDING")
+    attempt_count: Mapped[int] = mapped_column(default=0, server_default="0")
     last_error_type: Mapped[str | None] = mapped_column(String(200))
     last_error_summary: Mapped[str | None] = mapped_column(String(500))
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

@@ -5,8 +5,37 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from eva_ai.db import Database
-from eva_ai.db.models import Event, User, Workspace
+from eva_ai.db.base import Base
+from eva_ai.db.models import Event, EventProcessing, OutboxMessage, User, Workspace
 from eva_ai.events.types import PrincipalType
+
+
+@pytest.mark.parametrize(
+    ("model", "column_name", "expected"),
+    [
+        (User, "created_at", "now()"),
+        (User, "updated_at", "now()"),
+        (Workspace, "created_at", "now()"),
+        (Workspace, "updated_at", "now()"),
+        (Event, "created_at", "now()"),
+        (Event, "updated_at", "now()"),
+        (EventProcessing, "created_at", "now()"),
+        (EventProcessing, "updated_at", "now()"),
+        (EventProcessing, "stage", "RECEIVED"),
+        (EventProcessing, "attempt_count", "0"),
+        (OutboxMessage, "created_at", "now()"),
+        (OutboxMessage, "updated_at", "now()"),
+        (OutboxMessage, "state", "PENDING"),
+        (OutboxMessage, "attempt_count", "0"),
+    ],
+)
+def test_orm_metadata_matches_required_database_defaults(
+    model: type[Base], column_name: str, expected: str
+) -> None:
+    server_default = model.__table__.c[column_name].server_default
+
+    assert server_default is not None
+    assert str(server_default.arg) == expected
 
 
 @pytest.mark.integration
