@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import json
 import logging
 import threading
@@ -271,6 +272,126 @@ async def test_cancelled_factory_construction_never_orphans_completed_service(
     await factory.close()
 
     assert service.close_calls == expected_final_close_calls
+
+
+@pytest.mark.parametrize("cancellation_count", [2, 5])
+async def test_repeated_construction_cancellation_keeps_completed_service_recoverable(
+    cancellation_count: int,
+) -> None:
+    """Fails if a later cancellation cancels the construction owner and orphans its service."""
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    service = GmailResources(threading.get_ident())
+
+    def build_service(*_: object, **__: object) -> GmailResources:
+        started.set()
+        try:
+            assert release.wait(timeout=2)
+            return service
+        finally:
+            finished.set()
+
+    factory = GoogleGmailClientFactory(
+        credentials_factory=lambda *_: object(),
+        build_service=build_service,
+    )
+    creation = asyncio.create_task(factory.create("{}"))
+    assert await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=2)
+    cancellation_markers = [object() for _ in range(cancellation_count)]
+    accepted_cancellations: list[bool] = []
+    for marker in cancellation_markers:
+        accepted_cancellations.append(creation.cancel(marker))
+        await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await creation
+
+    assert await asyncio.wait_for(asyncio.to_thread(finished.wait), timeout=2)
+    assert accepted_cancellations == [True] * cancellation_count
+    assert raised.value.args == (cancellation_markers[0],)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert service.close_calls == 1
+
+    await factory.close()
+
+    assert service.close_calls == 1
+
+
+async def test_cancelled_construction_exception_is_consumed_without_loop_disclosure(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Fails if a cancelled shield or owner reports private construction errors to the loop."""
+    started = threading.Event()
+    release = threading.Event()
+    loop_contexts: list[dict[str, object]] = []
+    marker = "private-post-cancellation-construction-marker"
+
+    def build_service(*_: object, **__: object) -> GmailResources:
+        started.set()
+        assert release.wait(timeout=2)
+        raise RuntimeError(marker)
+
+    def collect_loop_error(
+        _: asyncio.AbstractEventLoop,
+        context: dict[str, object],
+    ) -> None:
+        loop_contexts.append(context)
+
+    factory = GoogleGmailClientFactory(
+        credentials_factory=lambda *_: object(),
+        build_service=build_service,
+    )
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(collect_loop_error)
+    cancellation_marker = object()
+    try:
+        creation = asyncio.create_task(factory.create("{}"))
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=2)
+        creation.cancel(cancellation_marker)
+        release.set()
+
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await creation
+
+        for _ in range(3):
+            gc.collect()
+            await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert raised.value.args == (cancellation_marker,)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert loop_contexts == []
+    captured = capsys.readouterr()
+    assert marker not in captured.err
+    assert marker not in caplog.text
+
+
+async def test_unexpected_construction_failure_is_fixed_and_chain_free() -> None:
+    """Fails if an unexpected credential/service error exposes its private marker."""
+    marker = "private-normal-construction-marker"
+
+    def build_service(*_: object, **__: object) -> GmailResources:
+        raise RuntimeError(marker)
+
+    factory = GoogleGmailClientFactory(
+        credentials_factory=lambda *_: object(),
+        build_service=build_service,
+    )
+
+    with pytest.raises(GmailProviderError) as raised:
+        await factory.create("{}")
+
+    assert str(raised.value) == "Gmail client construction failed"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert marker not in repr(raised.value)
 
 
 @pytest.mark.asyncio
