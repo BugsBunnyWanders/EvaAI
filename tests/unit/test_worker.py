@@ -5,6 +5,7 @@ from uuid import uuid7
 import pytest
 
 from eva_ai.config import Settings
+from eva_ai.db.session import Database
 from eva_ai.events.processor import (
     EventHandler,
     EventProcessor,
@@ -12,9 +13,14 @@ from eva_ai.events.processor import (
     ProcessResult,
     StoredEvent,
 )
-from eva_ai.events.publisher import InMemoryPublisher
+from eva_ai.events.publisher import InMemoryPublisher, Publisher
 from eva_ai.events.types import EventAvailableMessage
-from eva_ai.worker import build_publisher, dispatch_event
+from eva_ai.worker import (
+    build_event_processor,
+    build_outbox_relay,
+    build_publisher,
+    dispatch_event,
+)
 
 
 class RecordingProcessor:
@@ -38,6 +44,24 @@ class UnexpectedHandler:
         raise AssertionError(f"worker unexpectedly invoked handler for {event.id}")
 
 
+class RecordingOutboxRelay:
+    def __init__(
+        self,
+        database: Database,
+        publisher: Publisher,
+        lease_seconds: int,
+    ) -> None:
+        self.database = database
+        self.publisher = publisher
+        self.lease_seconds = lease_seconds
+
+
+class RecordingEventProcessor:
+    def __init__(self, database: Database, lease_seconds: int) -> None:
+        self.database = database
+        self.lease_seconds = lease_seconds
+
+
 def test_local_composition_uses_in_memory_publisher() -> None:
     settings = Settings(_env_file=None)
 
@@ -51,6 +75,40 @@ def test_google_composition_requires_project_id() -> None:
 
     with pytest.raises(ValueError, match="EVA_PUBSUB_PROJECT_ID"):
         build_publisher(settings, use_google=True)
+
+
+def test_outbox_relay_composition_passes_collaborators_and_outbox_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(_env_file=None, outbox_lease_seconds=17, processing_lease_seconds=23)
+    database = Database(settings.database_url.get_secret_value())
+    publisher = InMemoryPublisher()
+    monkeypatch.setattr("eva_ai.worker.OutboxRelay", RecordingOutboxRelay)
+
+    relay = cast(
+        RecordingOutboxRelay,
+        build_outbox_relay(database, settings, publisher),
+    )
+
+    assert relay.database is database
+    assert relay.publisher is publisher
+    assert relay.lease_seconds == 17
+
+
+def test_event_processor_composition_passes_database_and_processing_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(_env_file=None, outbox_lease_seconds=17, processing_lease_seconds=23)
+    database = Database(settings.database_url.get_secret_value())
+    monkeypatch.setattr("eva_ai.worker.EventProcessor", RecordingEventProcessor)
+
+    processor = cast(
+        RecordingEventProcessor,
+        build_event_processor(database, settings),
+    )
+
+    assert processor.database is database
+    assert processor.lease_seconds == 23
 
 
 @pytest.mark.parametrize("raw_format", ["mapping", "bytes", "string"])
