@@ -6,6 +6,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from eva_ai.db.models import Event, EventProcessing, OutboxMessage
 from eva_ai.db.session import Database
+from eva_ai.events.errors import ScopeMismatchError
 from eva_ai.events.types import (
     EventAvailableMessage,
     NewEvent,
@@ -56,14 +57,20 @@ class EventService:
                 )
                 event_id = (await session.execute(statement)).scalar_one_or_none()
                 if event_id is None:
-                    existing_id = await session.scalar(
-                        select(Event.id).where(
-                            Event.workspace_id == command.workspace_id,
-                            Event.idempotency_key == command.idempotency_key,
+                    existing = (
+                        await session.execute(
+                            select(Event.id, Event.user_id).where(
+                                Event.workspace_id == command.workspace_id,
+                                Event.idempotency_key == command.idempotency_key,
+                            )
                         )
-                    )
-                    if existing_id is None:
+                    ).one_or_none()
+                    if existing is None:
                         raise RuntimeError("conflicting event was not visible")
+                    existing_id, existing_user_id = existing
+                    # The idempotency conflict can win before PostgreSQL evaluates ownership.
+                    if existing_user_id != command.user_id:
+                        raise ScopeMismatchError("event user does not match persisted owner")
                     return IngestResult(event_id=existing_id, created=False)
 
                 outbox_id = uuid7()

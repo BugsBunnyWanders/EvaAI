@@ -12,7 +12,7 @@ from eva_ai.integrations.gcp.pubsub import GooglePubSubPublisher
 def build_publisher(settings: Settings, *, use_google: bool) -> Publisher:
     if not use_google:
         return InMemoryPublisher()
-    if settings.pubsub_project_id is None:
+    if settings.pubsub_project_id is None or not settings.pubsub_project_id.strip():
         raise ValueError("EVA_PUBSUB_PROJECT_ID is required for Google Pub/Sub")
     return GooglePubSubPublisher(settings.pubsub_project_id)
 

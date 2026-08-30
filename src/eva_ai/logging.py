@@ -1,10 +1,35 @@
+import copy
 import json
 import logging
 import sys
 from datetime import UTC, datetime
 from typing import TextIO
+from uuid import UUID
 
 from eva_ai.config import LogFormat, Settings
+
+_SAFE_CONTEXT_FIELDS = (
+    "event_id",
+    "user_id",
+    "workspace_id",
+    "outbox_message_id",
+    "claim_id",
+    "outcome",
+)
+
+
+def _safe_context(record: logging.LogRecord) -> dict[str, str | None]:
+    context: dict[str, str | None] = {}
+    # LogRecord extras are arbitrary; only known identifiers and outcomes cross this boundary.
+    for field in _SAFE_CONTEXT_FIELDS:
+        value = getattr(record, field, None)
+        if isinstance(value, str):
+            context[field] = value
+        elif isinstance(value, UUID):
+            context[field] = str(value)
+        elif value is None and hasattr(record, field):
+            context[field] = None
+    return context
 
 
 class JsonFormatter(logging.Formatter):
@@ -16,10 +41,25 @@ class JsonFormatter(logging.Formatter):
             "severity": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
+            **_safe_context(record),
         }
-        if record.exc_info is not None:
-            payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False)
+
+
+class ConsoleFormatter(logging.Formatter):
+    def __init__(self) -> None:
+        super().__init__("%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    def format(self, record: logging.LogRecord) -> str:
+        safe_record = copy.copy(record)
+        safe_record.exc_info = None
+        safe_record.exc_text = None
+        safe_record.stack_info = None
+        rendered = super().format(safe_record)
+        context = _safe_context(record)
+        if context:
+            rendered = f"{rendered} " + " ".join(f"{key}={value}" for key, value in context.items())
+        return rendered
 
 
 def configure_logging(settings: Settings, stream: TextIO | None = None) -> None:
@@ -27,7 +67,7 @@ def configure_logging(settings: Settings, stream: TextIO | None = None) -> None:
     if settings.log_format is LogFormat.JSON:
         handler.setFormatter(JsonFormatter())
     else:
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        handler.setFormatter(ConsoleFormatter())
 
     root = logging.getLogger()
     root.handlers.clear()

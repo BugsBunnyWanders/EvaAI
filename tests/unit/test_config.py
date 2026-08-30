@@ -53,3 +53,9 @@ def test_event_backbone_settings_have_safe_local_defaults() -> None:
 def test_event_backbone_settings_reject_non_positive_limits() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, outbox_batch_limit=0)
+
+
+@pytest.mark.parametrize("topic_id", ["", "   "])
+def test_event_backbone_settings_reject_blank_topic_id(topic_id: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, pubsub_topic_id=topic_id)

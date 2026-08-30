@@ -47,6 +47,13 @@ class Settings(BaseSettings):
             return value.upper()
         return value
 
+    @field_validator("pubsub_topic_id")
+    @classmethod
+    def reject_blank_pubsub_topic_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
 
 @lru_cache
 def get_settings() -> Settings:

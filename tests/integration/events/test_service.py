@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from eva_ai.db import Database
 from eva_ai.db.models import Event, EventProcessing, OutboxMessage
 from eva_ai.events import EventService, IngestResult
+from eva_ai.events.errors import ScopeMismatchError
 from eva_ai.events.types import NewEvent, OutboxState, PrincipalType, ProcessingStage
 from tests.integration.factories import Scope, create_scope
 
@@ -88,6 +89,26 @@ async def test_duplicate_ingest_returns_existing_event_without_more_children(
     second_result = await service.ingest(command.model_copy(update={"id": uuid7()}))
 
     assert second_result == IngestResult(event_id=first_result.event_id, created=False)
+    assert await backbone_counts(database, scope.workspace_id) == (1, 1, 1)
+
+
+@pytest.mark.integration
+async def test_duplicate_ingest_rejects_mismatched_user_without_more_rows(
+    database: Database,
+) -> None:
+    scope = await create_scope(database)
+    command = make_event(scope, idempotency_key="same-key-different-user")
+    service = EventService(database, "eva-events")
+
+    first_result = await service.ingest(command)
+    mismatched = command.model_copy(update={"id": uuid7(), "user_id": uuid7()})
+
+    with pytest.raises(ScopeMismatchError):
+        await service.ingest(mismatched)
+
+    async with database.session() as session:
+        event = await session.get(Event, first_result.event_id)
+    assert event is not None and event.user_id == scope.user_id
     assert await backbone_counts(database, scope.workspace_id) == (1, 1, 1)
 
 

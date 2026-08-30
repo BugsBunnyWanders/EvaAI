@@ -1,5 +1,5 @@
 from collections.abc import Mapping
-from typing import cast
+from typing import Never, cast
 from uuid import uuid7
 
 import pytest
@@ -62,6 +62,10 @@ class RecordingEventProcessor:
         self.lease_seconds = lease_seconds
 
 
+def fail_google_publisher_construction(project_id: str) -> Never:
+    raise AssertionError(f"Google publisher must not be constructed for {project_id!r}")
+
+
 def test_local_composition_uses_in_memory_publisher() -> None:
     settings = Settings(_env_file=None)
 
@@ -72,6 +76,21 @@ def test_local_composition_uses_in_memory_publisher() -> None:
 
 def test_google_composition_requires_project_id() -> None:
     settings = Settings(_env_file=None, pubsub_project_id=None)
+
+    with pytest.raises(ValueError, match="EVA_PUBSUB_PROJECT_ID"):
+        build_publisher(settings, use_google=True)
+
+
+@pytest.mark.parametrize("project_id", ["", "   "])
+def test_google_composition_rejects_blank_project_before_adapter_construction(
+    project_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(_env_file=None, pubsub_project_id=project_id)
+    monkeypatch.setattr(
+        "eva_ai.worker.GooglePubSubPublisher",
+        fail_google_publisher_construction,
+    )
 
     with pytest.raises(ValueError, match="EVA_PUBSUB_PROJECT_ID"):
         build_publisher(settings, use_google=True)
