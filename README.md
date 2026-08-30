@@ -28,6 +28,50 @@ curl http://127.0.0.1:8000/health/ready
 
 Both endpoints return HTTP 200 when the application and database are ready.
 
+## Public website
+
+Eva's dependency-free public website lives in `site/`. It provides the product homepage and the stable policy URLs used by Google OAuth:
+
+- `https://evaatyourservice.com/`
+- `https://evaatyourservice.com/privacy/`
+- `https://evaatyourservice.com/terms/`
+
+Preview the site locally without starting Eva's backend:
+
+```bash
+uv run python -m http.server 8080 --directory site
+```
+
+Open `http://127.0.0.1:8080`. The site contains no external scripts, analytics, cookies, or build-time dependencies. Its structural and policy contract tests run as part of `make verify`.
+
+### GitHub Pages deployment
+
+The `Deploy public site` GitHub Actions workflow publishes `site/` after a site-related change reaches `main`. In the repository's **Settings → Pages**, select **GitHub Actions** as the build source if it is not selected automatically. Configure the custom domain as `evaatyourservice.com` before changing DNS; GitHub recommends setting the custom domain first to reduce takeover risk.
+
+After the custom domain is saved in GitHub, add these records in Hostinger's DNS Zone Editor:
+
+| Type | Name | Target |
+| --- | --- | --- |
+| A | `@` | `185.199.108.153` |
+| A | `@` | `185.199.109.153` |
+| A | `@` | `185.199.110.153` |
+| A | `@` | `185.199.111.153` |
+| CNAME | `www` | `bugsbunnywanders.github.io` |
+
+Do not remove or replace existing MX or TXT records used for email, ownership, or other services. Wait for GitHub's DNS check to pass, then enable **Enforce HTTPS**. DNS and certificate issuance can take time to propagate.
+
+### Google OAuth production handoff
+
+Once all three HTTPS URLs resolve publicly:
+
+1. Verify `evaatyourservice.com` in [Google Search Console](https://search.google.com/search-console/about), normally with the DNS TXT method.
+2. In Google Auth Platform → Branding, set the application homepage to `https://evaatyourservice.com/`, the privacy policy to `https://evaatyourservice.com/privacy/`, and the terms link to `https://evaatyourservice.com/terms/`.
+3. Add `evaatyourservice.com` as an authorized domain and save the branding configuration.
+4. In Audience, publish the OAuth app to **In production**. Personal use can remain unverified, but Google may show an unverified-app warning.
+5. Reauthorize the Gmail connector after production publishing so the local Testing refresh token is replaced with a production authorization.
+
+The Pages merge does not itself change Hostinger DNS, verify Search Console, publish the OAuth app, or rotate Gmail authorization. Those remain deliberate operator steps.
+
 ## Gmail ingestion
 
 Milestone 2 adds Desktop OAuth bootstrap, Gmail watch/history synchronization, a Google Pub/Sub pull subscriber, persisted watch maintenance, and expired-cursor recovery. Setup requires manual Google Auth Platform configuration and local GCP resources; follow the [Gmail ingestion operator guide](docs/gmail-setup.md) before running the worker.

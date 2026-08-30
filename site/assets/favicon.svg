@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title>Eva</title>
+  <defs>
+    <linearGradient id="favicon-gradient" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#cabbff"/>
+      <stop offset="1" stop-color="#ff8e7b"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="19" fill="#13111d"/>
+  <path d="M17 16h31v9H27v4h17v7H27v4h21v9H17V16Z" fill="url(#favicon-gradient)"/>
+</svg>
