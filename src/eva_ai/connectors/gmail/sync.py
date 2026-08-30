@@ -8,6 +8,7 @@ from uuid import UUID
 from eva_ai.connectors.gmail.contracts import (
     AuthorizationRevoked,
     CredentialStore,
+    GmailClient,
     GmailClientFactory,
     GmailNotification,
     HistoryCursorExpired,
@@ -43,6 +44,68 @@ class GmailSyncError(RuntimeError):
     """Retryable synchronization failure with external content removed."""
 
 
+class GmailRecoveryService:
+    def __init__(
+        self,
+        repository: ConnectorRepository,
+        event_service: EventService,
+        topic_name: str,
+    ) -> None:
+        self._repository = repository
+        self._event_service = event_service
+        self._topic_name = topic_name
+
+    async def recover(
+        self,
+        claim: SyncClaim,
+        gmail: GmailClient,
+        now: datetime,
+    ) -> SyncResult:
+        connected_at = claim.connector.connected_at
+        history_id = claim.sync.history_id
+        if connected_at is None or history_id is None:
+            raise GmailSyncError("Gmail connector is not ready for synchronization")
+
+        query = f"in:inbox after:{int(connected_at.timestamp())}"
+        message_ids: dict[str, None] = {}
+        page_token: str | None = None
+        while True:
+            page = await gmail.list_message_ids(query, page_token)
+            for message_id in page.message_ids:
+                message_ids.setdefault(message_id, None)
+            page_token = page.next_page_token
+            if page_token is None:
+                break
+
+        events_created = 0
+        for message_id in message_ids:
+            raw = await gmail.get_message(message_id)
+            if not _has_inbox_label(raw):
+                continue
+            event = normalize_message(raw, claim.connector, history_id)
+            if event.occurred_at < connected_at:
+                continue
+            result = await self._event_service.ingest(event)
+            events_created += int(result.created)
+
+        # Recovery publishes a replacement cursor only after every Event is durable.
+        watch = await gmail.watch(self._topic_name)
+        completed = await self._repository.complete_sync(
+            claim,
+            watch.history_id,
+            now,
+            now + _SAFETY_SYNC_INTERVAL,
+        )
+        if not completed:
+            raise GmailSyncError("Gmail synchronization claim is no longer current")
+        return SyncResult(
+            SyncStatus.SYNCED,
+            claim.connector.id,
+            events_created,
+            watch.history_id,
+        )
+
+
 class GmailSyncService:
     def __init__(
         self,
@@ -52,6 +115,7 @@ class GmailSyncService:
         event_service: EventService,
         clock: Callable[[], datetime],
         lease_seconds: int,
+        recovery_service: GmailRecoveryService,
     ) -> None:
         self._repository = repository
         self._credential_store = credential_store
@@ -59,6 +123,7 @@ class GmailSyncService:
         self._event_service = event_service
         self._clock = clock
         self._lease_seconds = lease_seconds
+        self._recovery_service = recovery_service
 
     async def handle(self, notification: GmailNotification) -> SyncResult:
         connector = await _await_repository(
@@ -138,15 +203,24 @@ class GmailSyncService:
             message_ids: dict[str, None] = {}
             page_token: str | None = None
             final_history_id = start_history_id
-            while True:
-                failure_boundary = "history"
-                page = await gmail.list_history(start_history_id, page_token)
-                final_history_id = page.history_id
-                for message_id in page.message_ids:
-                    message_ids.setdefault(message_id, None)
-                page_token = page.next_page_token
-                if page_token is None:
-                    break
+            try:
+                while True:
+                    failure_boundary = "history"
+                    page = await gmail.list_history(start_history_id, page_token)
+                    final_history_id = page.history_id
+                    for message_id in page.message_ids:
+                        message_ids.setdefault(message_id, None)
+                    page_token = page.next_page_token
+                    if page_token is None:
+                        break
+            except HistoryCursorExpired:
+                # The recovery scan reuses this claim so no worker can advance the old cursor.
+                failure_boundary = "recovery"
+                try:
+                    return await self._recovery_service.recover(claim, gmail, self._clock())
+                except ValueError:
+                    failure_boundary = "normalization"
+                    raise
 
             events_created = 0
             for message_id in message_ids:

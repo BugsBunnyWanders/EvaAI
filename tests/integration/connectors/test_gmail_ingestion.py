@@ -13,7 +13,12 @@ from eva_ai.connectors.gmail.contracts import (
     GmailNotification,
     HistoryPage,
 )
-from eva_ai.connectors.gmail.sync import GmailSyncError, GmailSyncService, SyncStatus
+from eva_ai.connectors.gmail.sync import (
+    GmailRecoveryService,
+    GmailSyncError,
+    GmailSyncService,
+    SyncStatus,
+)
 from eva_ai.connectors.repository import ConnectorRepository
 from eva_ai.connectors.types import ConnectorStatus, SyncClaim
 from eva_ai.db import Database
@@ -205,6 +210,11 @@ async def test_known_status_outcomes_durably_record_notification_before_returnin
         event_service=cast(EventService, UnusedEventService()),
         clock=lambda: NOW + timedelta(minutes=5),
         lease_seconds=300,
+        recovery_service=GmailRecoveryService(
+            repository=repository,
+            event_service=cast(EventService, UnusedEventService()),
+            topic_name="projects/eva/topics/gmail",
+        ),
     )
 
     result = await service.handle(GmailNotification(identity, "100"))
@@ -244,13 +254,19 @@ async def test_crash_replay_creates_one_backbone_and_advances_cursor_after_retry
         NOW + timedelta(hours=1),
     )
     repository = FailCompletionOnceRepository(real_repository)
+    event_service = CheckingEventService(database, reserved.id)
     service = GmailSyncService(
         repository=cast(ConnectorRepository, repository),
         credential_store=cast(CredentialStore, CheckingCredentialStore(database, reserved.id)),
         client_factory=cast(GmailClientFactory, CheckingFactory(database, reserved.id)),
-        event_service=cast(EventService, CheckingEventService(database, reserved.id)),
+        event_service=cast(EventService, event_service),
         clock=lambda: NOW,
         lease_seconds=300,
+        recovery_service=GmailRecoveryService(
+            repository=cast(ConnectorRepository, repository),
+            event_service=cast(EventService, event_service),
+            topic_name="projects/eva/topics/gmail",
+        ),
     )
     notification = GmailNotification(identity, "101")
 
