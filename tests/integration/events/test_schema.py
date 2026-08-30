@@ -27,12 +27,20 @@ from eva_ai.events.types import PrincipalType
         (OutboxMessage, "updated_at", "now()"),
         (OutboxMessage, "state", "PENDING"),
         (OutboxMessage, "attempt_count", "0"),
+        ("connector_accounts", "created_at", "now()"),
+        ("connector_accounts", "updated_at", "now()"),
+        ("connector_accounts", "status", "CONNECTING"),
+        ("gmail_sync_states", "created_at", "now()"),
+        ("gmail_sync_states", "updated_at", "now()"),
     ],
 )
 def test_orm_metadata_matches_required_database_defaults(
-    model: type[Base], column_name: str, expected: str
+    model: type[Base] | str, column_name: str, expected: str
 ) -> None:
-    server_default = model.__table__.c[column_name].server_default
+    table = model.__table__ if isinstance(model, type) else Base.metadata.tables.get(model)
+
+    assert table is not None
+    server_default = table.c[column_name].server_default
 
     assert server_default is not None
     assert str(server_default.arg) == expected

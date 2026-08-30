@@ -1,6 +1,8 @@
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID, uuid7
 
+from eva_ai.connectors.gmail.contracts import WatchResult
 from eva_ai.db.models import User, Workspace
 from eva_ai.db.session import Database
 
@@ -24,3 +26,7 @@ async def create_scope(database: Database) -> Scope:
                 )
             )
     return scope
+
+
+def gmail_watch(history_id: str, expiration: datetime) -> WatchResult:
+    return WatchResult(history_id=history_id, expiration=expiration)
