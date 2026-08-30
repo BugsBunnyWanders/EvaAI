@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from eva_ai.config import get_settings
 from eva_ai.db import Base
+from eva_ai.db import models as models
 
 config = context.config
 if config.config_file_name is not None:
