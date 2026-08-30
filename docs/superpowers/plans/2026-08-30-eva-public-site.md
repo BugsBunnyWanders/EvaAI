@@ -383,7 +383,6 @@ git commit -m "feat: add Eva privacy and terms pages"
 ### Task 3: GitHub Pages Deployment, Documentation, and Release Verification
 
 **Files:**
-- Modify: `tests/unit/site/test_public_site.py`
 - Create: `.github/workflows/pages.yml`
 - Modify: `README.md`
 
@@ -391,49 +390,9 @@ git commit -m "feat: add Eva privacy and terms pages"
 - Consumes: the complete `site/` artifact from Tasks 1 and 2.
 - Produces: repeatable deployment from `main`, local preview instructions, and the operator handoff for Hostinger DNS and Google OAuth production publishing.
 
-- [ ] **Step 1: Add failing deployment and documentation tests**
+- [ ] **Step 1: Implement the pinned least-privilege Pages workflow**
 
-Add assertions that treat the workflow as a security-sensitive release definition:
-
-```python
-REPOSITORY_ROOT = SITE_ROOT.parent
-
-
-def test_pages_workflow_deploys_only_static_site_with_minimum_permissions() -> None:
-    workflow = (REPOSITORY_ROOT / ".github/workflows/pages.yml").read_text(encoding="utf-8")
-    assert "branches: [main]" in workflow
-    assert "workflow_dispatch:" in workflow
-    assert "contents: read" in workflow
-    assert "pages: write" in workflow
-    assert "id-token: write" in workflow
-    assert "path: site" in workflow
-    assert "actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b" in workflow
-    assert "actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b" in workflow
-    assert "actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e" in workflow
-
-
-def test_readme_documents_preview_and_post_merge_domain_steps() -> None:
-    readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
-    for phrase in (
-        "python -m http.server 8080 --directory site",
-        "http://127.0.0.1:8080",
-        "evaatyourservice.com",
-        "GitHub Actions",
-        "Hostinger",
-        "Google Search Console",
-        "publish the OAuth app",
-        "reauthorize the Gmail connector",
-    ):
-        assert phrase in readme
-```
-
-- [ ] **Step 2: Run the deployment tests and confirm missing workflow/docs fail**
-
-Run: `uv run pytest tests/unit/site/test_public_site.py -v`
-
-Expected: FAIL because `.github/workflows/pages.yml` does not exist and README lacks the site operations section.
-
-- [ ] **Step 3: Implement the pinned least-privilege Pages workflow**
+This task contains GitHub Actions configuration and human operator documentation rather than application behavior. Do not add source-grep tests for either artifact; GitHub validates workflow semantics on the pushed branch, while local review checks the permission and artifact boundaries.
 
 Create:
 
@@ -480,7 +439,7 @@ jobs:
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
 ```
 
-- [ ] **Step 4: Document preview and exact operator handoff**
+- [ ] **Step 2: Document preview and exact operator handoff**
 
 Add a “Public website” README section with:
 
@@ -490,23 +449,23 @@ python -m http.server 8080 --directory site
 
 Document preview at `http://127.0.0.1:8080`, deployment through GitHub Actions, Pages source selection, custom-domain setup, the four official GitHub Pages apex `A` records, the `www` CNAME to `bugsbunnywanders.github.io`, preserving Hostinger MX/TXT records, HTTPS enablement, Search Console verification, Google Auth Platform URLs, production publishing, and Gmail connector reauthorization.
 
-- [ ] **Step 5: Run focused and full automated verification**
+- [ ] **Step 3: Run focused and full automated verification**
 
 Run: `uv run pytest tests/unit/site/test_public_site.py -v && make verify && git diff --check`
 
 Expected: all site tests and all existing repository checks pass with no diff whitespace errors.
 
-- [ ] **Step 6: Perform local visual and behavior verification**
+- [ ] **Step 4: Perform local visual and behavior verification**
 
 Serve `site/` on a local ephemeral port. Inspect `/`, `/privacy/`, `/terms/`, and `/404.html` at 390×844 and 1440×1000 viewports. Verify no horizontal overflow, readable policy measure, working navigation, visible focus states, truthful status labels, graceful no-JavaScript content, and reduced-motion behavior. Fix any defects and rerun focused tests.
 
-- [ ] **Step 7: Commit deployment and documentation**
+- [ ] **Step 5: Commit deployment and documentation**
 
 ```bash
-git add .github/workflows/pages.yml README.md tests/unit/site/test_public_site.py
+git add .github/workflows/pages.yml README.md
 git commit -m "ci: deploy Eva public site"
 ```
 
-- [ ] **Step 8: Final branch review and PR handoff**
+- [ ] **Step 6: Final branch review and PR handoff**
 
 Review `git diff main...HEAD`, run `make verify` once more on the exact branch tip, push `codex/eva-public-site`, and open a PR against `main` titled `Add Eva public website`. Include the three production URLs, verification evidence, Pages/DNS operator steps, and an explicit note that merging does not itself change Hostinger DNS or publish the Google OAuth app.
