@@ -1,4 +1,5 @@
-from base64 import urlsafe_b64decode
+from base64 import b64decode
+from binascii import Error as BinasciiError
 from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from email.message import Message
@@ -151,7 +152,8 @@ def _collect_parts(
         attachment_id = (
             None if body is None else _optional_string(body.get("attachmentId"), warnings)
         )
-        if filename or attachment_id is not None:
+        is_attachment = bool(filename) or attachment_id is not None
+        if is_attachment:
             attachments.append(
                 {
                     "filename": filename,
@@ -161,7 +163,11 @@ def _collect_parts(
                 }
             )
 
-        if mime_type in {"text/plain", "text/html"} and content_disposition != "attachment":
+        if (
+            mime_type in {"text/plain", "text/html"}
+            and not is_attachment
+            and content_disposition != "attachment"
+        ):
             decoded = _decode_text(body, charset, warnings)
             if decoded is not None:
                 (plain_parts if mime_type == "text/plain" else html_parts).append(decoded)
@@ -245,8 +251,8 @@ def _decode_text(
         _add_warning(warnings, "invalid_body_data")
         return None
     try:
-        raw_bytes = urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
-    except ValueError, UnicodeEncodeError:
+        raw_bytes = b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
+    except BinasciiError, ValueError:
         _add_warning(warnings, "invalid_base64url")
         return None
 

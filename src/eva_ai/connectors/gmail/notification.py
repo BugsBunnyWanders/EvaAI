@@ -7,11 +7,7 @@ _INVALID_NOTIFICATION_MESSAGE = "invalid Gmail notification"
 
 def decode_notification(data: bytes) -> GmailNotification:
     """Decode already-decoded Pub/Sub notification bytes from Gmail."""
-    try:
-        decoded = json.loads(data)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise InvalidNotification(_INVALID_NOTIFICATION_MESSAGE) from error
-
+    decoded = _parse_json(data)
     if not isinstance(decoded, dict):
         raise InvalidNotification(_INVALID_NOTIFICATION_MESSAGE)
 
@@ -30,3 +26,11 @@ def decode_notification(data: bytes) -> GmailNotification:
 
 def _is_ascii_decimal(value: str) -> bool:
     return bool(value) and value.isascii() and value.isdecimal()
+
+
+def _parse_json(data: bytes) -> object | None:
+    try:
+        decoded: object = json.loads(data)
+        return decoded
+    except UnicodeDecodeError, json.JSONDecodeError:
+        return None

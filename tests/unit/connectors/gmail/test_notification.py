@@ -29,3 +29,32 @@ def test_decode_notification_rejects_malformed_data(data: bytes) -> None:
     """Fails if malformed notification shapes reach synchronization."""
     with pytest.raises(InvalidNotification, match="^invalid Gmail notification$"):
         decode_notification(data)
+
+
+def test_decode_notification_does_not_retain_malformed_json_content_in_exception_chain() -> None:
+    """Fails if parser errors retain raw Pub/Sub data after rejection."""
+    token = b"notification-token-should-not-survive"
+
+    with pytest.raises(InvalidNotification) as caught:
+        decode_notification(b'{"emailAddress":"' + token)
+
+    errors = _exception_chain(caught.value)
+    assert errors == [caught.value]
+    assert all(token.decode() not in repr(error) for error in errors)
+
+
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return chain

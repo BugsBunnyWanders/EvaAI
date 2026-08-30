@@ -127,6 +127,92 @@ def test_normalize_message_decodes_inline_iso_8859_1_text_without_padding() -> N
     assert event.metadata["normalization_warnings"] == []
 
 
+def test_normalize_message_decodes_single_part_plain_text() -> None:
+    """Fails if a non-multipart Gmail body is omitted from readable content."""
+    raw_message = {
+        "id": "msg-single",
+        "threadId": "thread-single",
+        "internalDate": "1788019200000",
+        "payload": {"mimeType": "text/plain", "body": {"data": "SGVsbG8gRXZh"}},
+    }
+
+    event = normalize_message(raw_message, CONNECTOR, history_id="902")
+
+    assert event.payload["plain_text"] == "Hello Eva"
+    assert event.payload["html"] == ""
+
+
+def test_normalize_message_keeps_named_and_identified_text_parts_as_attachment_metadata() -> None:
+    """Fails if text attachments without an attachment disposition become readable bodies."""
+    raw_message = {
+        "id": "msg-text-attachments",
+        "threadId": "thread-text-attachments",
+        "internalDate": "1788019200000",
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "parts": [
+                {
+                    "filename": "notes.txt",
+                    "mimeType": "text/plain",
+                    "body": {"data": "U2hvdWxkIG5vdCBiZSBib2R5", "size": 18},
+                },
+                {
+                    "mimeType": "text/html",
+                    "headers": [{"name": "Content-Disposition", "value": "inline"}],
+                    "body": {
+                        "data": "PHA-U2hvdWxkIG5vdCBiZSBib2R5PC9wPg",
+                        "size": 25,
+                        "attachmentId": "attachment-html-1",
+                    },
+                },
+            ],
+        },
+    }
+
+    event = normalize_message(raw_message, CONNECTOR, history_id="903")
+
+    assert event.payload["plain_text"] == ""
+    assert event.payload["html"] == ""
+    assert event.payload["attachments"] == [
+        {"filename": "notes.txt", "mime_type": "text/plain", "size": 18, "attachment_id": None},
+        {
+            "filename": "",
+            "mime_type": "text/html",
+            "size": 25,
+            "attachment_id": "attachment-html-1",
+        },
+    ]
+
+
+def test_normalize_message_uses_content_free_warnings_for_recoverable_body_defects() -> None:
+    """Fails if invalid base64 or charset/header recovery exposes provider content."""
+    raw_message = {
+        "id": "msg-defects",
+        "threadId": "thread-defects",
+        "internalDate": "1788019200000",
+        "payload": {
+            "mimeType": "multipart/mixed",
+            "headers": [{"name": "From"}],
+            "parts": [
+                {"mimeType": "text/plain", "body": {"data": "%%%"}},
+                {
+                    "mimeType": "text/plain; charset=unknown-charset",
+                    "body": {"data": "SGVsbG8"},
+                },
+            ],
+        },
+    }
+
+    event = normalize_message(raw_message, CONNECTOR, history_id="904")
+
+    assert event.payload["plain_text"] == "Hello"
+    assert event.metadata["normalization_warnings"] == [
+        "malformed_headers",
+        "invalid_base64url",
+        "unsupported_charset",
+    ]
+
+
 def test_normalize_message_keeps_text_attachments_out_of_readable_body() -> None:
     """Fails if a text attachment is mistaken for an inline message body."""
     raw_message = {
