@@ -4,11 +4,11 @@ This guide prepares Eva's local Gmail ingestion path for `saswatray2505@gmail.co
 
 Do not print, inspect in a terminal, commit, or transmit the downloaded OAuth JSON or the authorized-user credentials. Commands in this guide use project `evaai-507018`, topic `eva-gmail-notifications`, and subscription `eva-gmail-ingestion-local`.
 
-## What happens in Task 10 and Task 11
+## Milestone smoke scope and deployment gate
 
-Task 10 only adds the CLI and this documentation. It does **not** run `gcloud`, Application Default Credentials login, OAuth consent, or mailbox access.
+Task 10 added the CLI and documentation. Task 11 performed the local GCP/OAuth smoke after the required manual checkpoints.
 
-Task 11 will run the command-line GCP setup and verification in the next section, apply migrations, connect the mailbox after the manual checkpoint is complete, and execute the live smoke test. Google Auth Platform and Desktop OAuth client creation remain manual Console steps; Task 11 must pause for the downloaded client artifact before OAuth begins.
+The local smoke used an External app in **Testing** only as an explicit exception after publishing was blocked on public branding, privacy, and terms URLs. That refresh authorization may expire after seven days and require reconnection. This exception proves only the local smoke path; it is not production-readiness evidence and does not change the deployment requirement. Before deployment, configure External + **In production**, publish the required public URLs, and rotate/reconnect the stored credential. Google Auth Platform and Desktop OAuth client creation remain manual Console steps.
 
 ## Task 11: idempotent command-line GCP setup
 
@@ -57,6 +57,8 @@ Complete these steps in Google Cloud Console. They are intentionally not automat
 
 During `eva gmail connect`, Google opens a localhost loopback consent flow. Select `saswatray2505@gmail.com`, confirm the single read-only scope, and pass the unverified-app warning for this personal-use app. Stop if the account or requested scope differs.
 
+Testing mode was permitted only for the completed local Milestone 2 smoke. A Testing-mode token may expire in seven days. Do not treat that exception as permission to deploy or as satisfying External + In production.
+
 ## Local configuration and migration
 
 Create the local environment only when it does not already exist, then retain the approved
@@ -78,9 +80,15 @@ EVA_GMAIL_TOPIC_ID=eva-gmail-notifications
 EVA_GMAIL_SUBSCRIPTION_ID=eva-gmail-ingestion-local
 EVA_GMAIL_ACCOUNT=saswatray2505@gmail.com
 EVA_GMAIL_OAUTH_CLIENT_FILE=.secrets/google-oauth-client.json
+EVA_GMAIL_REQUEST_TIMEOUT_SECONDS=30
+EVA_GMAIL_RETRY_ATTEMPTS=3
+EVA_GMAIL_RETRY_INITIAL_BACKOFF_SECONDS=0.5
+EVA_GMAIL_RETRY_MAX_BACKOFF_SECONDS=8
+EVA_GMAIL_RETRY_JITTER_RATIO=0.2
 ```
 
 Do not place OAuth codes, refresh tokens, access tokens, or client JSON contents in `.env`.
+The request timeout configures the blocking Gmail HTTP socket itself. Total attempts include the initial request. Transient request timeouts, 429/rate-limit responses (including Gmail's reason-coded rate-limit 403s), server errors, and network/transport failures retry with bounded exponential backoff and jitter. Revoked authorization and expired history cursors use their dedicated recovery paths instead of consuming the transient retry budget.
 
 ## Create the explicit local scope
 
@@ -108,13 +116,13 @@ make gmail-connect
 The Make target receives the exported UUIDs as quoted shell data. The equivalent direct command is
 `uv run eva gmail connect --user-id "$EVA_USER_ID" --workspace-id "$EVA_WORKSPACE_ID"`.
 
-The command verifies the explicit persisted ownership pair before constructing Google clients or opening a browser. It verifies the authorized Gmail profile against `EVA_GMAIL_ACCOUNT`, stores credentials in Secret Manager, creates the inbox watch with topic `projects/evaai-507018/topics/eva-gmail-notifications`, and prints only the ConnectorAccount UUID.
+The command verifies the explicit persisted ownership pair before constructing Google clients or opening a browser. It samples a local timestamp, verifies the authorized Gmail profile against `EVA_GMAIL_ACCOUNT`, and durably stores that profile's current history cursor and timestamp before creating the inbox watch with topic `projects/evaai-507018/topics/eva-gmail-notifications`. That lower boundary excludes pre-profile history while treating mail in the short profile-to-watch window as post-connection. The command stores refresh credential material in Secret Manager without the current access token or expiry, activates the watch without replacing the lower cursor, and prints only the ConnectorAccount UUID.
 
 ```bash
 export EVA_GMAIL_CONNECTOR_ID=CONNECTOR_UUID
 ```
 
-Re-running connect for the same Workspace and Gmail identity refreshes authorization/watch state without changing the original connection boundary or durable history cursor.
+Re-running connect for the same Workspace and Gmail identity refreshes authorization/watch state without changing the original connection boundary or durable history cursor. The command exits zero only after the connector is `ACTIVE`.
 
 ## Run ingestion and maintenance
 
@@ -132,13 +140,15 @@ Run one deterministic stored-cursor synchronization attempt when replay verifica
 make gmail-sync
 ```
 
+The one-shot sync exits zero only when its result is `SYNCED`; busy, connecting, unknown-account, and reauthorization-required results exit nonzero with a content-free error.
+
 Run one persisted due-maintenance pass and exit:
 
 ```bash
 make gmail-maintain
 ```
 
-`gmail maintain` renews due watches without replacing the durable cursor and performs safety synchronization only after the configured notification-silence interval.
+`gmail maintain` renews due watches without replacing the durable cursor and performs safety synchronization only after the configured notification-silence interval. It exits nonzero when the maintenance summary reports any failed connector.
 
 ## Inspect connector and Event state
 
@@ -161,7 +171,7 @@ For the Task 11 smoke test, send messages only after connection: one plain-text 
 
 - **Worker restart:** restart `make gmail-pull`. The cursor and all due timestamps are persisted; no in-process sleep owns correctness.
 - **Suspected missed notification:** run `make gmail-maintain`, then `make gmail-sync`. Event idempotency makes replay safe.
-- **Expired Gmail history cursor:** a stored-cursor sync automatically performs the bounded inbox recovery from `connected_at`, ingests Events first, then publishes the replacement watch cursor.
+- **Expired Gmail history cursor:** a stored-cursor sync first establishes a replacement watch, then performs the bounded inbox scan from `connected_at`. After every recovered Event is durable, it atomically publishes the replacement cursor, watch expiration, and renewal/safety schedules. Notifications racing the scan remain retryable from the old cursor until that completion commits.
 - **`REAUTHORIZATION_REQUIRED`:** confirm the Desktop client file is still a regular ignored file, then rerun `gmail connect` with the same User and Workspace IDs and complete consent for the configured account.
 - **Retryable `ERROR`:** check ADC, API enablement, topic IAM, network access, and Secret Manager access; then rerun connect or the failed one-pass command. Do not create another ownership scope to bypass an error.
 
@@ -170,8 +180,9 @@ For the Task 11 smoke test, send messages only after connection: one plain-text 
 - `eva: command failed` is intentionally content-free. Confirm all required environment values are present, migrations are at head, PostgreSQL is reachable, and UUIDs were copied exactly.
 - If connect fails before a browser opens, verify `EVA_PUBSUB_PROJECT_ID`, `EVA_GMAIL_ACCOUNT`, `EVA_GMAIL_TOPIC_ID`, the User/Workspace pair, and that `.secrets/google-oauth-client.json` exists and is a regular file. Do not print the file.
 - If Gmail rejects the watch, verify the fully qualified topic is in `evaai-507018` and the Gmail push service account has `roles/pubsub.publisher` on that topic.
+- If transient Gmail calls exhaust their configured attempts, check network/DNS reachability and quota before increasing the socket timeout or retry budget. Keep the attempt count and maximum backoff bounded so a request cannot silently outlive the synchronization lease.
 - If pulls time out with no messages, confirm the subscription targets the approved topic. An empty long-poll deadline is normal.
-- If authorization repeatedly expires, verify the External app is **In production**, not Testing, and that only `gmail.readonly` was granted.
+- If authorization expires within seven days, the local exception is still using Testing mode. Reconnect for local smoke continuity if necessary, but treat External + **In production**, required public URLs, and credential rotation as unresolved deployment gates.
 - Never paste provider responses, OAuth JSON, tokens, email subjects/bodies, full address lists, or the database URL into logs or issue reports.
 
 ## Teardown — documentation only, do not run during milestone work

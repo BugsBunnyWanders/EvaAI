@@ -68,6 +68,7 @@ The connector is split into provider-facing adapters and application services:
 ```text
 connect-gmail command
     -> Google OAuth consent
+    -> verified Gmail profile cursor + local lower-bound timestamp
     -> Secret Manager credential version
     -> ConnectorAccount + GmailSyncState
     -> Gmail users.watch
@@ -117,6 +118,8 @@ The Google Auth Platform configuration uses:
 - access type: offline
 
 The app is personal-use and unverified. The user may pass Google's unverified-app warning during consent. Publishing the app avoids the seven-day refresh-token lifetime applied to an External app left in Testing. Public distribution or more than the personal-use user cap would require a separate verification decision.
+
+The Milestone 2 local smoke used Testing mode only as an explicit local exception after production publishing was blocked on public branding, privacy, and terms URLs. That local token may expire after seven days and require reconnection. The exception is not production-readiness evidence: External + In production, the public URLs, and credential rotation remain deployment gates.
 
 The downloaded OAuth client file is a local bootstrap input, is ignored by Git, and is never copied into source, tests, logs, or committed configuration. After authorization, Eva stores an authorized-user credential document containing the client ID, client secret, refresh token, and token endpoint as a new Secret Manager version. Access tokens are refreshed in memory and are not persisted.
 
@@ -169,14 +172,14 @@ The history ID is represented as a decimal string because Gmail defines it as an
 2. Load the local OAuth desktop-client input.
 3. Generate a state value and run the localhost authorization callback.
 4. Request offline `gmail.readonly` authorization and validate returned state.
-5. Call Gmail profile for the authorized account identity and confirm it matches the intended account.
+5. Sample the local lower-bound timestamp, call Gmail profile, obtain both the authorized account identity and its current history ID, and confirm the identity matches the intended account.
 6. Store the authorized-user credentials in Secret Manager.
 7. Upsert ConnectorAccount metadata in `CONNECTING` state without exposing credential values.
-8. Call `users.watch` with `labelIds=["INBOX"]`, include behavior, and topic `projects/evaai-507018/topics/eva-gmail-notifications`.
-9. Store the watch response history ID as the initial cursor and its expiration timestamp, then mark the connector `ACTIVE`.
-10. Set `connected_at` only for the connector's first successful watch; reauthorization preserves the original no-backfill boundary.
+8. In one short PostgreSQL transaction, store the verified profile history ID in the existing nullable initial cursor and the sampled timestamp in `connected_at`. Preserve both values on every retry.
+9. Call `users.watch` with `labelIds=["INBOX"]`, include behavior, and topic `projects/evaai-507018/topics/eva-gmail-notifications`.
+10. Store the watch expiration and scheduling state, then mark the connector `ACTIVE` without replacing the durable profile cursor.
 
-Storing the initial watch response history ID establishes the no-backfill boundary. Gmail sends an immediate notification after a successful watch. Because the ConnectorAccount already exists as `CONNECTING`, a notification that races the final database update is negative-acknowledged and retried after activation rather than discarded. Synchronization still starts from the stored cursor, so it does not import earlier mail.
+The profile cursor and timestamp form a conservative durable lower boundary before the non-transactional watch side effect. History before the profile cursor remains excluded; mail arriving during profile-to-watch setup is eligible as post-connection mail. If watch activation crashes or its transaction fails, a retry preserves that lower boundary and only refreshes external watch/scheduling state. Gmail's immediate watch notification races a persisted `CONNECTING` connector and is negative-acknowledged until activation. This uses the existing nullable initial cursor safely and requires no schema field or migration.
 
 The command is safely repeatable. Reconnecting the same Workspace, provider, and account updates credentials and watch state rather than creating a second connector.
 
@@ -185,7 +188,8 @@ The command is safely repeatable. Reconnecting the same Workspace, provider, and
 The pull subscriber validates the Pub/Sub envelope before provider work:
 
 - message data exists as bytes from the Google client and decodes to a JSON object; Pub/Sub's base64 wire representation is decoded by the client adapter
-- `emailAddress` and `historyId` are non-empty strings
+- `emailAddress` is a non-empty string
+- `historyId` is either an ASCII decimal string or a non-negative JSON integer and is normalized immediately to the internal decimal string form
 - the email address maps to one active ConnectorAccount
 
 Pub/Sub delivery metadata is not trusted to establish Eva's User or Workspace. Ownership always comes from the persisted ConnectorAccount.
@@ -272,17 +276,17 @@ The same due-work service performs a safety history synchronization after prolon
 
 When `users.history.list` returns HTTP 404 for an expired history ID, Eva performs bounded recovery:
 
-1. List inbox message IDs whose Gmail internal timestamp is at or after ConnectorAccount `connected_at`.
-2. Fetch and normalize those messages through the ordinary path.
-3. Let Event idempotency discard messages already persisted.
-4. Establish a fresh Gmail watch.
-5. Store the new watch history ID only after recovery Events are durable.
+1. Establish a replacement Gmail watch and retain its cursor, expiration, and renewal schedule as the upper cutover candidate.
+2. List inbox message IDs whose Gmail internal timestamp is at or after ConnectorAccount `connected_at`.
+3. Fetch and normalize those messages through the ordinary path.
+4. Let Event idempotency discard messages already persisted.
+5. After every recovery Event is durable, claim-protected commit the replacement cursor together with watch expiration, renewal scheduling, and safety-sync scheduling.
 
-This recovers messages that arrived while Eva was connected without importing pre-connection history. A recovery failure leaves the old state unchanged and retryable.
+Notifications racing the scan observe the active claim, are negative-acknowledged as busy, and later replay from the committed cutover. This recovers messages that arrived while Eva was connected without importing pre-connection history. A recovery failure leaves the old durable cursor unchanged and retryable even though the external replacement watch may already exist.
 
 ## Errors, Retries, and Logging
 
-Transient provider failures include rate limits, server errors, deadlines, and temporary credential-service or network failures. They use bounded exponential backoff with jitter inside one processing attempt where safe; exhaustion returns failure to Pub/Sub for later redelivery.
+Transient provider failures include HTTP 408/429 responses, Gmail's reason-coded rate-limit 403 responses, server errors, deadlines, and temporary credential-service or network failures. Gmail calls use an actual `httplib2` socket timeout plus a bounded total-attempt loop with exponential backoff and symmetric jitter; `asyncio.to_thread()` keeps blocking work off the event loop but is not the timeout mechanism. Exhaustion returns a fixed retryable failure to Pub/Sub or the one-shot command. `invalid_grant`/revocation and expired history remain distinct permanent/recovery classifications and do not consume the transient retry loop.
 
 Permanent authorization failures transition the connector to `REAUTHORIZATION_REQUIRED`. Unparseable individual messages do not advance the cursor silently: the attempt fails unless the normalizer can produce the minimum canonical representation containing a valid Gmail message ID and timestamp.
 
@@ -310,7 +314,10 @@ Typed settings cover:
 - synchronization lease duration
 - watch renewal lead time
 - safety-sync interval
-- Gmail request timeout and bounded retry policy
+- Gmail socket request timeout (`gmail_request_timeout_seconds`, default 30)
+- Gmail total request attempts (`gmail_retry_attempts`, default 3)
+- Gmail initial/max exponential backoff (`gmail_retry_initial_backoff_seconds`, default 0.5; `gmail_retry_max_backoff_seconds`, default 8)
+- Gmail symmetric jitter ratio (`gmail_retry_jitter_ratio`, default 0.2, constrained to 0–1)
 
 No refresh token, access token, OAuth code, or client secret is accepted as a normal environment setting. Application Default Credentials authorize Eva to Pub/Sub and Secret Manager; user OAuth credentials authorize access to the Gmail mailbox.
 
@@ -329,9 +336,12 @@ Unit tests cover:
 - INBOX and `connected_at` filtering
 - Event field mapping and idempotency-key construction
 - transient retry classification and permanent authorization classification
+- socket-timeout transport construction, retry exhaustion, deterministic backoff/jitter, and cancellation
+- cancellation-safe/concurrent lazy Secret Manager and Pub/Sub client construction plus retry-safe cleanup ownership
+- truthful one-shot connect/sync/maintain result and process-exit matrices
 - log/error sanitization
 - watch-renewal and safety-sync due-time decisions with an injected clock
-- expired-history bounded recovery
+- expired-history bounded recovery with watch-before-scan cutover injection
 
 ### PostgreSQL integration tests
 

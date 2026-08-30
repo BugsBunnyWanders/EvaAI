@@ -6,7 +6,7 @@
 
 **Architecture:** Provider-neutral ConnectorAccount and GmailSyncState records hold ownership, health, and durable cursor state while Secret Manager holds OAuth credentials. Focused Google adapters implement OAuth, Gmail, Secret Manager, and Pub/Sub pull contracts; application services bootstrap the watch, serialize history synchronization with a database lease, normalize messages through the existing EventService, and run persisted renewal/recovery work. The local worker acknowledges Pub/Sub only after the Gmail range is durable.
 
-**Tech Stack:** Python `>=3.14,<3.15`, Pydantic 2, SQLAlchemy 2 async ORM, PostgreSQL 17, Alembic, `google-api-python-client` 2.x, `google-auth-oauthlib` 1.x, `google-cloud-secret-manager` 2.x, `google-cloud-pubsub` 2.x, pytest/pytest-asyncio, Ruff, strict mypy, Docker Compose, gcloud CLI, GitHub CLI.
+**Tech Stack:** Python `>=3.14,<3.15`, Pydantic 2, SQLAlchemy 2 async ORM, PostgreSQL 17, Alembic, `google-api-python-client` 2.x, `google-auth-oauthlib` 1.x, `google-auth-httplib2` 0.x, `httplib2` 0.x, `google-cloud-secret-manager` 2.x, `google-cloud-pubsub` 2.x, pytest/pytest-asyncio, Ruff, strict mypy, Docker Compose, gcloud CLI, GitHub CLI.
 
 **Spec:** `docs/superpowers/specs/2026-08-30-milestone-2-gmail-ingestion-design.md`
 
@@ -24,6 +24,7 @@
 - Treat all email content as untrusted data. It cannot supply User/Workspace identity, authorization, policy, approval, or application instructions.
 - Store authorized-user credentials only in Secret Manager. PostgreSQL contains a secret resource reference, never OAuth codes, client secrets, refresh tokens, or access tokens.
 - Preserve at-least-once semantics. Advance the history cursor only after all Events in the range are durable; make replay harmless through `gmail:{connector_account_id}:{message_id}:received`.
+- Before the initial external watch side effect, persist the verified profile cursor and sampled timestamp as the durable lower cutover boundary; preserve both through retry.
 - A watch renewal updates expiration/scheduling fields but never overwrites the durable history cursor.
 - Use database claims only for short state transactions; Gmail, Pub/Sub, and Secret Manager network calls occur without a database transaction held open.
 - Logs never include tokens, OAuth payloads, subjects, bodies, full address lists, or attachment content.
@@ -78,8 +79,8 @@
 
 ### Modified files
 
-- `pyproject.toml` and `uv.lock` — Google Gmail/OAuth/Secret Manager dependencies and `eva` console script.
-- `src/eva_ai/config.py` — Gmail topic, subscription, account, OAuth file, lease, pull timeout, renewal, and safety-sync settings.
+- `pyproject.toml` and `uv.lock` — Google Gmail/OAuth/Secret Manager dependencies, explicit authenticated HTTP transport dependencies, and `eva` console script.
+- `src/eva_ai/config.py` — Gmail topic, subscription, account, OAuth file, lease, pull timeout, request timeout, retry/backoff/jitter, renewal, and safety-sync settings.
 - `src/eva_ai/db/models/__init__.py` — register connector ORM models.
 - `src/eva_ai/logging.py` — permit only non-content Gmail operational identifiers.
 - `tests/integration/factories.py` — ConnectorAccount/GmailSyncState fixtures.
@@ -155,6 +156,11 @@ def test_gmail_settings_have_safe_defaults() -> None:
     assert settings.gmail_pull_timeout_seconds == 30
     assert settings.gmail_watch_renewal_hours == 24
     assert settings.gmail_safety_sync_minutes == 60
+    assert settings.gmail_request_timeout_seconds == 30
+    assert settings.gmail_retry_attempts == 3
+    assert settings.gmail_retry_initial_backoff_seconds == 0.5
+    assert settings.gmail_retry_max_backoff_seconds == 8
+    assert settings.gmail_retry_jitter_ratio == 0.2
 ```
 
 - [ ] **Step 2: Run focused tests and verify RED**
@@ -168,7 +174,7 @@ Expected: collection fails because `eva_ai.connectors` and the Gmail settings do
 Run:
 
 ```bash
-uv add "google-api-python-client>=2,<3" "google-auth-oauthlib>=1,<2" "google-cloud-secret-manager>=2,<3"
+uv add "google-api-python-client>=2,<3" "google-auth-oauthlib>=1,<2" "google-auth-httplib2>=0.4,<1" "httplib2>=0.32,<1" "google-cloud-secret-manager>=2,<3"
 ```
 
 Add to `pyproject.toml`:
@@ -249,6 +255,12 @@ class GmailNotification:
 
 
 @dataclass(frozen=True, slots=True)
+class GmailProfile:
+    email_address: str
+    history_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class WatchResult:
     history_id: str
     expiration: datetime
@@ -292,7 +304,7 @@ class AuthorizationRevoked(RuntimeError):
 
 
 class GmailClient(Protocol):
-    async def get_profile(self) -> str: ...
+    async def get_profile(self) -> GmailProfile: ...
     async def watch(self, topic_name: str) -> WatchResult: ...
     async def list_history(self, start_history_id: str, page_token: str | None) -> HistoryPage: ...
     async def get_message(self, message_id: str) -> Mapping[str, object]: ...
@@ -319,7 +331,7 @@ All provider identifiers remain strings. `authorized_user_json` and message data
 
 - [ ] **Step 5: Add validated Gmail settings**
 
-Add `gmail_topic_id`, `gmail_subscription_id`, `gmail_account`, `gmail_oauth_client_file`, `gmail_sync_lease_seconds`, `gmail_pull_timeout_seconds`, `gmail_watch_renewal_hours`, and `gmail_safety_sync_minutes` to `Settings`. Reuse `pubsub_project_id` as the one GCP project setting and reject blank topic, subscription, and configured account strings.
+Add `gmail_topic_id`, `gmail_subscription_id`, `gmail_account`, `gmail_oauth_client_file`, `gmail_sync_lease_seconds`, `gmail_pull_timeout_seconds`, `gmail_watch_renewal_hours`, `gmail_safety_sync_minutes`, `gmail_request_timeout_seconds`, `gmail_retry_attempts`, `gmail_retry_initial_backoff_seconds`, `gmail_retry_max_backoff_seconds`, and `gmail_retry_jitter_ratio` to `Settings`. Require positive timeout/attempt/backoff values, constrain jitter to 0–1, and reject a maximum backoff below the initial backoff. Reuse `pubsub_project_id` as the one GCP project setting and reject blank topic, subscription, and configured account strings.
 
 - [ ] **Step 6: Run tests, static checks, and commit**
 
@@ -419,7 +431,7 @@ git commit -m "feat: persist Gmail connector state"
 
 **Interfaces:**
 - Consumes: `Database`, `ConnectorAccount`, `GmailSyncState`, `ConnectorRecord`, `GmailSyncRecord`, `SyncClaim`.
-- Produces: `ConnectorRepository.reserve_gmail()`, `attach_secret()`, `activate_initial_watch()`, `find_by_identity()`, `get()`, `claim_sync()`, `complete_sync()`, `release_sync()`, `mark_reauthorization_required()`, `due_for_maintenance()`, and renewal timestamp updates.
+- Produces: `ConnectorRepository.reserve_gmail()`, `attach_secret()`, `prepare_initial_watch()`, `activate_initial_watch()`, `find_by_identity()`, `get()`, `claim_sync()`, `complete_sync()`, `complete_recovery()`, `release_sync()`, `mark_reauthorization_required()`, `due_for_maintenance()`, and renewal timestamp updates.
 
 Use these exact repository signatures:
 
@@ -427,8 +439,10 @@ Use these exact repository signatures:
 async def reserve_gmail(self, user_id: UUID, workspace_id: UUID, account_identity: str,
                         granted_scopes: tuple[str, ...], now: datetime) -> ConnectorRecord: ...
 async def attach_secret(self, connector_id: UUID, secret_reference: str) -> ConnectorRecord: ...
+async def prepare_initial_watch(self, connector_id: UUID, history_id: str,
+                                connected_at: datetime) -> ConnectorRecord: ...
 async def activate_initial_watch(self, connector_id: UUID, watch: WatchResult,
-                                 now: datetime, next_renewal_at: datetime,
+                                 next_renewal_at: datetime,
                                  next_safety_sync_at: datetime) -> ConnectorRecord: ...
 async def find_by_identity(self, account_identity: str) -> ConnectorRecord | None: ...
 async def get(self, connector_id: UUID) -> ConnectorRecord | None: ...
@@ -437,9 +451,12 @@ async def claim_sync(self, connector_id: UUID, now: datetime,
                      lease_seconds: int) -> SyncClaim | None: ...
 async def complete_sync(self, claim: SyncClaim, history_id: str, now: datetime,
                         next_safety_sync_at: datetime) -> bool: ...
+async def complete_recovery(self, claim: SyncClaim, watch: WatchResult, now: datetime,
+                            next_renewal_at: datetime,
+                            next_safety_sync_at: datetime) -> bool: ...
 async def release_sync(self, claim: SyncClaim) -> bool: ...
 async def mark_reauthorization_required(self, connector_id: UUID,
-                                        error_type: str) -> None: ...
+                                        error: BaseException) -> None: ...
 async def due_for_maintenance(self, now: datetime) -> tuple[UUID, ...]: ...
 async def record_watch_renewal(self, claim: SyncClaim, expiration: datetime,
                                next_renewal_at: datetime) -> bool: ...
@@ -447,7 +464,7 @@ async def record_watch_renewal(self, claim: SyncClaim, expiration: datetime,
 
 - [ ] **Step 1: Write failing lifecycle, ownership, and claim tests**
 
-Cover reservation in `CONNECTING`, uniqueness within a Workspace, lowercase Gmail identity, active-secret enforcement, initial activation preserving the first `connected_at`, reauthorization without resetting `connected_at`, two concurrent claimers receiving one claim, expired-lease reclamation, stale-claim completion rejection, and cursor monotonicity.
+Cover reservation in `CONNECTING`, uniqueness within a Workspace, lowercase Gmail identity, active-secret enforcement, durable initial-boundary preparation preserving the first profile cursor and timestamp across activation failure/retry, reauthorization without resetting the boundary, two concurrent claimers receiving one claim, expired-lease reclamation, stale-claim completion rejection, cursor monotonicity, and atomic recovery cursor/watch scheduling completion.
 
 Use this core assertion for renewal safety:
 
@@ -469,7 +486,7 @@ Expected: collection fails because `ConnectorRepository` does not exist.
 
 - [ ] **Step 3: Implement short-transaction lifecycle methods**
 
-Use PostgreSQL `INSERT ... ON CONFLICT` only where the conflict behavior is explicit. `reserve_gmail()` creates or loads `(workspace_id, "gmail", normalized_identity)` and returns the stable connector UUID. `activate_initial_watch()` uses `connected_at = coalesce(connected_at, now)` and writes the initial history cursor only while state is `CONNECTING` or reauthorizing.
+Use PostgreSQL `INSERT ... ON CONFLICT` only where the conflict behavior is explicit. `reserve_gmail()` creates or loads `(workspace_id, "gmail", normalized_identity)` and returns the stable connector UUID. Before the external watch call, `prepare_initial_watch()` uses the existing nullable `GmailSyncState.history_id` plus `connected_at` to persist the verified profile cursor/timestamp only when absent. `activate_initial_watch()` requires that durable boundary, writes watch expiration/scheduling, and never replaces its cursor. No schema change is required.
 
 - [ ] **Step 4: Implement synchronization claim methods**
 
@@ -523,6 +540,13 @@ def test_decode_notification_uses_client_decoded_bytes() -> None:
     assert notification.history_id == "12345"
 
 
+def test_decode_notification_normalizes_numeric_history_id() -> None:
+    notification = decode_notification(
+        b'{"emailAddress":"SaswatRay2505@gmail.com","historyId":12345}'
+    )
+    assert notification.history_id == "12345"
+
+
 @pytest.mark.parametrize("data", [b"", b"not-json", b"[]", b'{"historyId":"1"}'])
 def test_decode_notification_rejects_malformed_data(data: bytes) -> None:
     with pytest.raises(InvalidNotification):
@@ -557,7 +581,7 @@ Expected: collection fails because decoder and normalizer modules do not exist.
 
 - [ ] **Step 4: Implement strict notification decoding**
 
-Decode UTF-8 JSON directly from `Message.data`; do not base64-decode it again. Require an object with nonblank string `emailAddress` and decimal-string `historyId`, lowercase the address, and raise `InvalidNotification` with a fixed content-free message.
+Decode UTF-8 JSON directly from `Message.data`; do not base64-decode it again. Require an object with nonblank string `emailAddress`; accept `historyId` as either an ASCII decimal string or a non-negative JSON integer and normalize it immediately to the internal decimal string. Reject booleans, negatives, fractions, and non-decimal strings. Lowercase the address and raise `InvalidNotification` with a fixed content-free message.
 
 - [ ] **Step 5: Implement recursive MIME normalization**
 
@@ -607,11 +631,11 @@ git commit -m "feat: normalize Gmail received events"
 
 - [ ] **Step 1: Write failing adapter contract tests with injected Google fakes**
 
-Assert OAuth calls `InstalledAppFlow.from_client_secrets_file()` with exactly `(GMAIL_READONLY_SCOPE,)`, runs a localhost server with offline access and consent prompting, and serializes authorized-user credentials without logging them. Assert Gmail watch uses `labelIds=["INBOX"]`, `labelFilterBehavior="INCLUDE"`, and the exact fully qualified topic. Assert history uses `historyTypes=["messageAdded"]`, message fetch uses `format="full"`, and list recovery uses the supplied query/page token.
+Assert OAuth calls `InstalledAppFlow.from_client_secrets_file()` with exactly `(GMAIL_READONLY_SCOPE,)`, runs a localhost server with offline access and consent prompting, and serializes authorized-user credentials with `token` and `expiry` stripped while retaining refresh credentials. Assert Gmail watch uses `labelIds=["INBOX"]`, `labelFilterBehavior="INCLUDE"`, and the exact fully qualified topic. Assert history uses `historyTypes=["messageAdded"]`, message fetch uses `format="full"`, and list recovery uses the supplied query/page token.
 
 These adapter tests cover the official Gmail `users.watch`, `users.history.list`, `users.messages.get`, and `users.messages.list` request shapes without making network calls.
 
-Assert Secret Manager creates `eva-gmail-oauth-{connector_id}` only when absent, always adds a new UTF-8 secret version, returns a reference shaped like `projects/evaai-507018/secrets/eva-gmail-oauth-0191cafe-7b00-7000-8000-000000000001`, and loads `versions/latest`. Assert Pub/Sub builds the exact subscription path, returns decoded `message.data` bytes, and maps ack/nack IDs correctly.
+Assert Secret Manager creates `eva-gmail-oauth-{connector_id}` only when absent, always adds a new UTF-8 secret version, returns a reference shaped like `projects/evaai-507018/secrets/eva-gmail-oauth-0191cafe-7b00-7000-8000-000000000001`, and loads `versions/latest`. Assert Pub/Sub builds the exact subscription path, returns decoded `message.data` bytes, and maps ack/nack IDs correctly. For both lazy GCP adapters, cover serialized concurrent first use, construction failure sanitization, repeated construction cancellation, and close failure/cancellation retry without dropping ownership.
 
 - [ ] **Step 2: Run adapter tests and verify RED**
 
@@ -621,11 +645,11 @@ Expected: collection fails because the adapters do not exist.
 
 - [ ] **Step 3: Implement OAuth and Gmail adapters**
 
-Wrap blocking Google calls, including client construction, with `asyncio.to_thread`. Build Gmail services from `google.oauth2.credentials.Credentials.from_authorized_user_info()` and `googleapiclient.discovery.build("gmail", "v1", cache_discovery=False)`. Convert provider responses into Task 1 DTOs. Map HTTP 404 from `history.list` to `HistoryCursorExpired`, token refresh `invalid_grant` to `AuthorizationRevoked`, and leave rate limits/server/network errors retryable without embedding response bodies in exception text.
+Wrap blocking Google calls, including client construction, with `asyncio.to_thread`. Build Gmail services from `google.oauth2.credentials.Credentials.from_authorized_user_info()`, an explicit `google_auth_httplib2.AuthorizedHttp` over `httplib2.Http(timeout=...)`, and `googleapiclient.discovery.build("gmail", "v1", http=..., cache_discovery=False)`. Convert provider responses into Task 1 DTOs. Run transient HTTP 408/429, reason-coded rate-limit 403, 5xx, refresh, deadline, transport, and network failures through a bounded total-attempt loop with exponential backoff and symmetric jitter; inject sleep/randomness for deterministic tests. Map HTTP 404 from `history.list` to `HistoryCursorExpired` and token refresh `invalid_grant` to `AuthorizationRevoked` without retry. Never embed provider response bodies in exception text. `asyncio.to_thread()` keeps blocking work off the event loop but is not the request timeout.
 
 - [ ] **Step 4: Implement Secret Manager and Pub/Sub pull adapters**
 
-Use Application Default Credentials through official clients. `GooglePullSubscriber.pull()` catches only `google.api_core.exceptions.DeadlineExceeded` and returns an empty tuple; other failures propagate for bounded retry. Negative acknowledgement uses `modify_ack_deadline(..., ack_deadline_seconds=0)`.
+Use Application Default Credentials through official clients. Apply the same non-raising construction-owner pattern as the Gmail factory to lazy Secret Manager and Pub/Sub clients: serialize concurrent construction, retain completed resources through repeated cancellation, and translate constructor failures into fixed chain-free adapter errors. Clear close ownership only after successful cleanup so outer cleanup can retry. `GooglePullSubscriber.pull()` catches only `google.api_core.exceptions.DeadlineExceeded` and returns an empty tuple; other failures propagate for bounded retry. Negative acknowledgement uses `modify_ack_deadline(..., ack_deadline_seconds=0)`.
 
 - [ ] **Step 5: Run adapter tests and commit**
 
@@ -662,7 +686,7 @@ git commit -m "feat: add Google Gmail ingestion adapters"
 
 - [ ] **Step 1: Write failing bootstrap orchestration tests**
 
-Test exact call order and failure state for: correct account; OAuth profile mismatch; secret-store failure; watch failure; reconnect preserving original `connected_at`; and an immediate notification observing `CONNECTING`. Use a fixed clock and assert the initial watch response cursor is stored only after watch succeeds.
+Test exact call order and failure state for: correct account; OAuth profile mismatch; secret-store failure; watch failure; reconnect preserving the original profile cursor/timestamp; a database activation failure after a successful watch followed by retry; and an immediate notification observing `CONNECTING`. Use an advancing clock. Assert the timestamp is sampled immediately before the profile request, the verified profile cursor/timestamp are durable before `watch()`, activation never replaces the cursor with the watch response cursor, and retry preserves the first boundary.
 
 - [ ] **Step 2: Run bootstrap tests and verify RED**
 
@@ -677,17 +701,32 @@ Implement:
 ```python
 grant = await authorizer.authorize(command.client_file, (GMAIL_READONLY_SCOPE,))
 gmail = await client_factory.create(grant.authorized_user_json)
-actual_identity = (await gmail.get_profile()).lower()
+boundary_at = clock()
+profile = await gmail.get_profile()
+actual_identity = profile.email_address.lower()
 if actual_identity != command.expected_identity.lower():
     raise AccountIdentityMismatch("authorized Gmail account does not match configuration")
-connector = await repository.reserve_gmail(command.scope, actual_identity, scopes, now)
+connector = await repository.reserve_gmail(
+    command.user_id,
+    command.workspace_id,
+    actual_identity,
+    scopes,
+    boundary_at,
+)
 secret_reference = await credential_store.put(connector.id, grant.authorized_user_json)
 await repository.attach_secret(connector.id, secret_reference)
+await repository.prepare_initial_watch(connector.id, profile.history_id, boundary_at)
 watch = await gmail.watch(command.topic_name)
-await repository.activate_initial_watch(connector.id, watch, now, renewal_due_at(watch, now))
+activated_at = clock()
+await repository.activate_initial_watch(
+    connector.id,
+    watch,
+    renewal_due_at(watch, activated_at),
+    activated_at + safety_sync_interval,
+)
 ```
 
-Do not log the grant or credential JSON. On failure, leave a non-active connector with a sanitized status reason; re-running the command resumes with the same connector ID.
+The sampled profile cursor/timestamp is the durable lower boundary: pre-profile history stays excluded, while mail in the short profile-to-watch window is intentionally post-connection. Do not log the grant or credential JSON. On failure, leave a non-active connector with a sanitized status reason; re-running the command resumes with the same connector ID and the same boundary.
 
 - [ ] **Step 4: Run tests and commit**
 
@@ -803,7 +842,7 @@ Test renewal at 24 hours, no early renewal, worker-startup due work, safety sync
 
 - [ ] **Step 2: Write failing 404 recovery tests**
 
-Fake `HistoryCursorExpired`, use a fixed `connected_at` whose epoch is `1788064200`, return two `users.messages.list` pages for query `in:inbox after:1788064200`, include one pre-connection result, and assert exact internalDate filtering, idempotent Event ingestion, a fresh watch, and final cursor replacement only after every recovery Event is durable.
+Fake `HistoryCursorExpired`, use a fixed `connected_at` whose epoch is `1788064200`, establish a replacement watch, return two `users.messages.list` pages for query `in:inbox after:1788064200`, include one pre-connection result, and assert exact internalDate filtering, idempotent Event ingestion, and atomic final replacement of cursor plus watch/scheduling fields only after every recovery Event is durable. Inject a message in the watch-to-scan cutover and prove its replay is ingested exactly once rather than treated as already covered.
 
 - [ ] **Step 3: Run maintenance tests and verify RED**
 
@@ -817,7 +856,7 @@ Load only active due connectors. Renewal acquires a synchronization claim, loads
 
 - [ ] **Step 5: Implement bounded expired-history recovery**
 
-Keep the existing sync claim. Page through `list_message_ids(query=f"in:inbox after:{int(connected_at.timestamp())}")`, deduplicate, fetch, recheck `INBOX` and exact `internalDate >= connected_at`, normalize, and ingest. Call a fresh watch only after all Events are durable, then claim-protected-complete with the new watch history ID. Any failure leaves the old cursor retryable.
+Keep the existing sync claim. Establish a replacement watch first and retain its cursor, expiration, and derived renewal schedule as the upper cutover candidate. Then page through `list_message_ids(query=f"in:inbox after:{int(connected_at.timestamp())}")`, deduplicate, fetch, recheck `INBOX` and exact `internalDate >= connected_at`, normalize, and ingest. Only after all Events are durable, call claim-protected `complete_recovery()` to atomically store the replacement cursor, expiration, renewal schedule, safety schedule, and successful-sync time. Notifications racing the scan see the active claim and NACK as busy; any failure leaves the old durable cursor retryable.
 
 - [ ] **Step 6: Run tests and commit**
 
@@ -925,7 +964,7 @@ eva gmail pull
 eva gmail maintain
 ```
 
-Use injected command functions so tests never open a browser or construct real Google clients. Assert `gmail connect` refuses missing project ID, Gmail account, OAuth client file, user ID, or workspace ID with a content-free error.
+Use injected command functions so tests never open a browser or construct real Google clients. Assert `gmail connect` refuses missing project ID, Gmail account, OAuth client file, user ID, or workspace ID with a content-free error. Add command-function and `main()` exit-code matrices proving connect succeeds only for `ACTIVE`, one-shot sync only for `SYNCED`, and maintain fails whenever `MaintenanceSummary.failed > 0`.
 
 - [ ] **Step 2: Run CLI tests and verify RED**
 
@@ -935,7 +974,7 @@ Expected: collection fails because `eva_ai.cli` does not exist.
 
 - [ ] **Step 3: Implement local scope and CLI composition**
 
-`scope create` creates one explicit User and Workspace in a transaction and prints only their UUIDs. `gmail connect` builds OAuth, Gmail, Secret Manager, repository, and bootstrap services and prints the ConnectorAccount UUID. `gmail sync` performs one synchronization from the stored durable cursor for the selected connector, making deterministic replay testing possible. `gmail pull` builds the pull worker and runs continuously. `gmail maintain` executes one due-maintenance pass and exits. Use `argparse` plus `asyncio.run`; keep dependency constructors separately testable.
+`scope create` creates one explicit User and Workspace in a transaction and prints only their UUIDs. `gmail connect` builds OAuth, Gmail, Secret Manager, repository, and bootstrap services and prints the ConnectorAccount UUID only when its result is `ACTIVE`. `gmail sync` performs one synchronization from the stored durable cursor for the selected connector and exits zero only for `SYNCED`, making deterministic replay testing truthful. `gmail pull` builds the pull worker and runs continuously. `gmail maintain` executes one due-maintenance pass and exits nonzero when its summary reports any failures. Use fixed content-free command errors, `argparse`, and `asyncio.run`; keep dependency constructors separately testable.
 
 - [ ] **Step 4: Protect local OAuth material**
 
@@ -954,6 +993,11 @@ EVA_GMAIL_TOPIC_ID=eva-gmail-notifications
 EVA_GMAIL_SUBSCRIPTION_ID=eva-gmail-ingestion-local
 EVA_GMAIL_ACCOUNT=saswatray2505@gmail.com
 EVA_GMAIL_OAUTH_CLIENT_FILE=.secrets/google-oauth-client.json
+EVA_GMAIL_REQUEST_TIMEOUT_SECONDS=30
+EVA_GMAIL_RETRY_ATTEMPTS=3
+EVA_GMAIL_RETRY_INITIAL_BACKOFF_SECONDS=0.5
+EVA_GMAIL_RETRY_MAX_BACKOFF_SECONDS=8
+EVA_GMAIL_RETRY_JITTER_RATIO=0.2
 ```
 
 - [ ] **Step 5: Document idempotent GCP setup and manual OAuth checkpoint**
@@ -968,7 +1012,7 @@ gcloud pubsub subscriptions create eva-gmail-ingestion-local --project=evaai-507
 gcloud auth application-default login
 ```
 
-The guide must instruct the user to configure Google Auth Platform as External, set publishing status to In production, declare only `gmail.readonly`, create a Desktop OAuth client, download it to `.secrets/google-oauth-client.json`, and pass the unverified personal-use warning. Include commands for migration, scope creation, connection, pull worker, database Event inspection, recovery, and explicit teardown. Teardown commands are documentation only and are not executed during milestone work.
+The guide must instruct the user to configure Google Auth Platform as External, set publishing status to In production, declare only `gmail.readonly`, create a Desktop OAuth client, download it to `.secrets/google-oauth-client.json`, and pass the unverified personal-use warning. Record that Testing mode was used only as the explicitly approved local smoke exception when publishing was blocked on public branding/privacy/terms URLs; its token may expire after seven days and this is not production-readiness evidence. External + In production, public URLs, and credential rotation remain deployment gates. Include timeout/retry controls, commands for migration, scope creation, connection, pull worker, database Event inspection, recovery, truthful one-shot exit behavior, and explicit teardown. Teardown commands are documentation only and are not executed during milestone work.
 
 - [ ] **Step 6: Run CLI/docs checks and commit**
 
@@ -1002,6 +1046,8 @@ git commit -m "docs: add Gmail ingestion operations"
 **Interfaces:**
 - Consumes: complete Milestone 2 branch, real GCP project, manual OAuth desktop-client file, personal Gmail mailbox.
 - Produces: verified local ingestion, clean branch, pushed remote branch, and GitHub pull request.
+
+The recorded local smoke used Testing mode only under R9's explicit local exception. Its token may expire after seven days. That evidence does not satisfy deployment readiness: External + In production, the required public branding/privacy/terms URLs, and credential rotation remain gates.
 
 - [ ] **Step 1: Run the full automated verification gate**
 
