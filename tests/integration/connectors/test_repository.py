@@ -315,6 +315,33 @@ async def test_release_sync_only_releases_current_claim(database: Database) -> N
 
 
 @pytest.mark.integration
+async def test_record_notification_is_monotonic_without_mutating_cursor_claim_or_status(
+    database: Database,
+) -> None:
+    """Fails if observing a notification can regress time or alter synchronization ownership."""
+    scope = await create_scope(database)
+    repository = ConnectorRepository(database)
+    connector_id = await reserve_active(repository, scope, history_id="123")
+    claim = await repository.claim_sync(connector_id, NOW, lease_seconds=300)
+    assert claim is not None
+    before = await repository.get_sync_state(connector_id)
+    connector_before = await repository.get(connector_id)
+    observed_at = NOW + timedelta(minutes=2)
+
+    first = await repository.record_notification(connector_id, observed_at)
+    older = await repository.record_notification(connector_id, NOW + timedelta(minutes=1))
+    missing = await repository.record_notification(UUID(int=0), observed_at)
+
+    after = await repository.get_sync_state(connector_id)
+    connector_after = await repository.get(connector_id)
+    assert first is True and older is True and missing is False
+    assert before is not None and after is not None
+    assert after.last_notification_at == observed_at
+    assert after.model_copy(update={"last_notification_at": before.last_notification_at}) == before
+    assert connector_after == connector_before
+
+
+@pytest.mark.integration
 async def test_due_maintenance_loads_only_active_connectors_with_due_work(
     database: Database,
 ) -> None:

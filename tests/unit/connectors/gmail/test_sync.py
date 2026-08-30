@@ -1,9 +1,11 @@
+import asyncio
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import UUID, uuid7
 
 import pytest
+from sqlalchemy.exc import StatementError
 
 from eva_ai.connectors.gmail.contracts import (
     AuthorizationRevoked,
@@ -29,6 +31,7 @@ from eva_ai.connectors.types import (
 )
 from eva_ai.events.service import EventService, IngestResult
 from eva_ai.events.types import NewEvent
+from eva_ai.integrations.gcp.secret_manager import SecretManagerProviderError
 from eva_ai.integrations.gmail.api import GmailProviderError
 
 NOW = datetime(2030, 1, 1, 12, tzinfo=UTC)
@@ -83,6 +86,24 @@ def raw_message(
     }
 
 
+def content_bearing_error(marker: str) -> StatementError:
+    return StatementError(
+        f"database failed with {marker}",
+        "SELECT private_data WHERE identity = :identity",
+        {"identity": marker, "payload": f"message-{marker}"},
+        RuntimeError(f"driver-{marker}"),
+    )
+
+
+def assert_content_free_sync_error(error: GmailSyncError, marker: str) -> None:
+    assert str(error) == "Gmail synchronization failed"
+    assert marker not in str(error)
+    assert marker not in repr(error)
+    assert not hasattr(error, "params")
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
 class FakeRepository:
     def __init__(
         self,
@@ -95,13 +116,22 @@ class FakeRepository:
         self.busy = False
         self.ambiguous = False
         self.complete_failures = 0
-        self.transition_failure: Exception | None = None
+        self.transition_failure: BaseException | None = None
+        self.notification_failure: BaseException | None = None
+        self.completion_failure: BaseException | None = None
+        self.find_failure: BaseException | None = None
+        self.get_failure: BaseException | None = None
+        self.get_sync_failure: BaseException | None = None
+        self.claim_failure: BaseException | None = None
+        self.release_failure: BaseException | None = None
         self.claim: SyncClaim | None = None
         self.marked_error: BaseException | None = None
         self.calls: list[str] = []
 
     async def find_by_identity(self, account_identity: str) -> ConnectorRecord | None:
         self.calls.append("find")
+        if self.find_failure is not None:
+            raise self.find_failure
         if self.ambiguous:
             raise AmbiguousConnectorIdentity("Gmail identity maps to multiple connectors")
         if self.record is None or account_identity.lower() != self.record.account_identity:
@@ -110,16 +140,38 @@ class FakeRepository:
 
     async def get(self, connector_id: UUID) -> ConnectorRecord | None:
         self.calls.append("get")
+        if self.get_failure is not None:
+            raise self.get_failure
         return self.record if self.record is not None and self.record.id == connector_id else None
 
     async def get_sync_state(self, connector_id: UUID) -> GmailSyncRecord | None:
         self.calls.append("get_sync_state")
+        if self.get_sync_failure is not None:
+            raise self.get_sync_failure
         return self.state if self.state is not None and connector_id == CONNECTOR_ID else None
+
+    async def record_notification(self, connector_id: UUID, observed_at: datetime) -> bool:
+        self.calls.append("record_notification")
+        if self.notification_failure is not None:
+            raise self.notification_failure
+        if self.state is None or connector_id != self.state.connector_account_id:
+            return False
+        current = self.state.last_notification_at
+        self.state = self.state.model_copy(
+            update={
+                "last_notification_at": (
+                    observed_at if current is None or observed_at > current else current
+                )
+            }
+        )
+        return True
 
     async def claim_sync(
         self, connector_id: UUID, now: datetime, lease_seconds: int
     ) -> SyncClaim | None:
         self.calls.append("claim")
+        if self.claim_failure is not None:
+            raise self.claim_failure
         if self.busy or self.record is None or self.record.status != ConnectorStatus.ACTIVE:
             return None
         assert self.state is not None and connector_id == self.record.id
@@ -140,6 +192,8 @@ class FakeRepository:
         next_safety_sync_at: datetime,
     ) -> bool:
         self.calls.append("complete")
+        if self.completion_failure is not None:
+            raise self.completion_failure
         if self.complete_failures:
             self.complete_failures -= 1
             return False
@@ -158,6 +212,8 @@ class FakeRepository:
 
     async def release_sync(self, claim: SyncClaim) -> bool:
         self.calls.append("release")
+        if self.release_failure is not None:
+            raise self.release_failure
         if claim != self.claim:
             return False
         self.busy = False
@@ -177,7 +233,7 @@ class FakeRepository:
 
 class FakeCredentialStore:
     def __init__(self) -> None:
-        self.failure: Exception | None = None
+        self.failure: BaseException | None = None
         self.references: list[str] = []
 
     async def get(self, secret_reference: str) -> str:
@@ -196,20 +252,21 @@ class FakeGmailClient:
             None: HistoryPage(message_ids=(), history_id="100", next_page_token=None)
         }
         self.messages: dict[str, Mapping[str, object]] = {}
-        self.failure: Exception | None = None
+        self.history_failure: BaseException | None = None
+        self.message_failure: BaseException | None = None
         self.history_calls: list[tuple[str, str | None]] = []
         self.message_calls: list[str] = []
 
     async def list_history(self, start_history_id: str, page_token: str | None) -> HistoryPage:
         self.history_calls.append((start_history_id, page_token))
-        if self.failure is not None:
-            raise self.failure
+        if self.history_failure is not None:
+            raise self.history_failure
         return self.pages[page_token]
 
     async def get_message(self, message_id: str) -> Mapping[str, object]:
         self.message_calls.append(message_id)
-        if self.failure is not None:
-            raise self.failure
+        if self.message_failure is not None:
+            raise self.message_failure
         return self.messages[message_id]
 
     async def get_profile(self) -> str:
@@ -225,7 +282,7 @@ class FakeGmailClient:
 class FakeGmailClientFactory:
     def __init__(self, gmail: FakeGmailClient) -> None:
         self.gmail = gmail
-        self.failure: Exception | None = None
+        self.failure: BaseException | None = None
         self.credentials: list[str] = []
 
     async def create(self, authorized_user_json: str) -> GmailClient:
@@ -239,9 +296,12 @@ class RecordingEventService:
     def __init__(self) -> None:
         self.by_key: dict[str, IngestResult] = {}
         self.events: list[NewEvent] = []
+        self.failure: BaseException | None = None
 
     async def ingest(self, command: NewEvent) -> IngestResult:
         self.events.append(command)
+        if self.failure is not None:
+            raise self.failure
         existing = self.by_key.get(command.idempotency_key)
         if existing is not None:
             return IngestResult(existing.event_id, created=False)
@@ -305,6 +365,7 @@ async def test_sync_pages_from_durable_cursor_deduplicates_and_filters_current_m
     assert [event.external_id for event in harness.events.events] == ["message-1", "message-2"]
     assert harness.repository.state is not None
     assert harness.repository.state.history_id == "105"
+    assert harness.repository.state.last_notification_at == NOW
     assert harness.repository.state.next_safety_sync_at == NOW + timedelta(minutes=60)
 
 
@@ -331,7 +392,7 @@ async def test_already_covered_notification_uses_persisted_cursor_without_provid
     result = await harness.handle(history_id="499")
 
     assert result == SyncResult(SyncStatus.ALREADY_COVERED, CONNECTOR_ID, 0, "500")
-    assert harness.repository.calls == ["find", "get_sync_state"]
+    assert harness.repository.calls == ["find", "record_notification", "get_sync_state"]
     assert harness.credentials.references == []
     assert harness.gmail.history_calls == []
 
@@ -346,6 +407,8 @@ async def test_active_claim_returns_busy_without_loading_credentials() -> None:
     assert result == SyncResult(SyncStatus.BUSY, CONNECTOR_ID, 0, "100")
     assert harness.credentials.references == []
     assert harness.gmail.history_calls == []
+    assert harness.repository.state is not None
+    assert harness.repository.state.last_notification_at == NOW
 
 
 @pytest.mark.parametrize("status", [ConnectorStatus.CONNECTING, ConnectorStatus.ERROR])
@@ -357,6 +420,8 @@ async def test_known_retryable_connector_state_returns_connecting(status: Connec
 
     assert result == SyncResult(SyncStatus.CONNECTING, CONNECTOR_ID, 0, "100")
     assert harness.credentials.references == []
+    assert harness.repository.state is not None
+    assert harness.repository.state.last_notification_at == NOW
 
 
 @pytest.mark.parametrize(
@@ -388,6 +453,28 @@ async def test_terminal_or_unknown_connector_never_ingests(
     assert result.events_created == 0
     assert harness.credentials.references == []
     assert harness.gmail.history_calls == []
+    assert harness.repository.state is not None
+    if record is not None and record.status != ConnectorStatus.DISABLED:
+        assert harness.repository.state.last_notification_at == NOW
+    else:
+        assert harness.repository.state.last_notification_at is None
+
+
+async def test_notification_observation_failure_is_chain_free_and_retryable() -> None:
+    """Fails if a known notification can be acknowledged without durable observation."""
+    harness = Harness()
+    harness.repository.notification_failure = RuntimeError(
+        "private-database-response owner@example.com"
+    )
+
+    with pytest.raises(GmailSyncError) as raised:
+        await harness.handle()
+
+    assert str(raised.value) == "Gmail notification observation failed"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "owner@example.com" not in repr(raised.value)
+    assert harness.credentials.references == []
 
 
 async def test_ambiguous_identity_fails_closed_without_mailbox_identity_in_error() -> None:
@@ -442,7 +529,7 @@ async def test_transient_provider_error_stays_retryable_and_releases_claim() -> 
     """Fails if a transient Gmail error becomes reauthorization or keeps a live lease."""
     harness = Harness()
     provider_error = GmailProviderError("Gmail API request failed")
-    harness.gmail.failure = provider_error
+    harness.gmail.history_failure = provider_error
 
     with pytest.raises(GmailProviderError) as raised:
         await harness.handle()
@@ -459,7 +546,7 @@ async def test_expired_history_propagates_for_recovery_and_releases_claim() -> N
     """Fails if Task 8 cannot distinguish bounded recovery from transient failure."""
     harness = Harness()
     expired = HistoryCursorExpired("Gmail history cursor expired")
-    harness.gmail.failure = expired
+    harness.gmail.history_failure = expired
 
     with pytest.raises(HistoryCursorExpired) as raised:
         await harness.handle()
@@ -494,6 +581,28 @@ async def test_invalid_message_error_is_content_free_and_prevents_cursor_advance
     assert harness.repository.state is not None and harness.repository.state.history_id == "100"
 
 
+async def test_invalid_message_with_parser_cause_is_rebuilt_chain_free() -> None:
+    """Fails if a normalization parser exception remains reachable through the public chain."""
+    harness = Harness()
+    harness.gmail.pages = {
+        None: HistoryPage(message_ids=("broken",), history_id="101", next_page_token=None)
+    }
+    harness.gmail.messages = {
+        "broken": {
+            **raw_message("broken", NOW),
+            "internalDate": "999999999999999999999999999999999999999999999999",
+        }
+    }
+
+    with pytest.raises(ValueError) as raised:
+        await harness.handle()
+
+    assert str(raised.value) == "invalid Gmail message"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert harness.repository.busy is False
+
+
 async def test_crash_style_repeat_reuses_event_and_only_then_advances_cursor() -> None:
     """Fails if Event/cursor transaction separation creates duplicates or skips replay."""
     harness = Harness()
@@ -515,3 +624,151 @@ async def test_crash_style_repeat_reuses_event_and_only_then_advances_cursor() -
     assert len(harness.events.events) == 2
     assert len(harness.events.by_key) == 1
     assert harness.repository.state is not None and harness.repository.state.history_id == "101"
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["credentials", "factory", "history", "message", "event", "completion"],
+)
+async def test_cancellation_during_claimed_await_releases_claim_and_propagates_unchanged(
+    stage: str,
+) -> None:
+    """Fails if worker shutdown strands a lease or cancellation changes classification."""
+    harness = Harness()
+    cancellation = asyncio.CancelledError(f"cancelled-at-{stage}")
+    harness.gmail.pages = {
+        None: HistoryPage(message_ids=("message-1",), history_id="101", next_page_token=None)
+    }
+    harness.gmail.messages = {"message-1": raw_message("message-1", NOW)}
+    if stage == "credentials":
+        harness.credentials.failure = cancellation
+    elif stage == "factory":
+        harness.factory.failure = cancellation
+    elif stage == "history":
+        harness.gmail.history_failure = cancellation
+    elif stage == "message":
+        harness.gmail.message_failure = cancellation
+    elif stage == "event":
+        harness.events.failure = cancellation
+    else:
+        harness.repository.completion_failure = cancellation
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await harness.handle()
+
+    assert raised.value is cancellation
+    assert harness.repository.busy is False
+    assert harness.repository.calls[-1] == "release"
+    assert harness.repository.state is not None
+    assert harness.repository.state.history_id == "100"
+
+
+async def test_cancellation_during_reauthorization_transition_releases_claim() -> None:
+    """Fails if cancellation during the terminal transition is masked or strands its lease."""
+    harness = Harness()
+    harness.credentials.failure = AuthorizationRevoked("Google authorization has been revoked")
+    cancellation = asyncio.CancelledError("cancelled-during-transition")
+    harness.repository.transition_failure = cancellation
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await harness.handle()
+
+    assert raised.value is cancellation
+    assert harness.repository.busy is False
+    assert harness.repository.calls[-1] == "release"
+    assert harness.repository.state is not None
+    assert harness.repository.state.history_id == "100"
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["identity_lookup", "handle_sync_read", "connector_read", "sync_read", "claim"],
+)
+async def test_repository_failures_are_content_free_retryable_errors(boundary: str) -> None:
+    """Fails if SQL parameters or mailbox identity escape a repository boundary."""
+    harness = Harness()
+    marker = f"private-{boundary}@example.com"
+    failure = content_bearing_error(marker)
+    if boundary == "identity_lookup":
+        harness.repository.find_failure = failure
+        operation = harness.handle()
+    elif boundary == "handle_sync_read":
+        harness.repository.get_sync_failure = failure
+        operation = harness.handle()
+    elif boundary == "connector_read":
+        harness.repository.get_failure = failure
+        operation = harness.service.sync_connector(CONNECTOR_ID)
+    elif boundary == "sync_read":
+        harness.repository.get_sync_failure = failure
+        operation = harness.service.sync_connector(CONNECTOR_ID)
+    else:
+        harness.repository.claim_failure = failure
+        operation = harness.service.sync_connector(CONNECTOR_ID)
+
+    with pytest.raises(GmailSyncError) as raised:
+        await operation
+
+    assert_content_free_sync_error(raised.value, marker)
+    assert harness.repository.busy is False
+
+
+@pytest.mark.parametrize("boundary", ["event", "completion"])
+async def test_claimed_database_failures_release_and_remove_message_content(
+    boundary: str,
+) -> None:
+    """Fails if Event or cursor SQL errors retain normalized email content or a live claim."""
+    harness = Harness()
+    marker = f"private-{boundary}-subject-and-body"
+    failure = content_bearing_error(marker)
+    harness.gmail.pages = {
+        None: HistoryPage(message_ids=("message-1",), history_id="101", next_page_token=None)
+    }
+    harness.gmail.messages = {"message-1": raw_message("message-1", NOW)}
+    if boundary == "event":
+        harness.events.failure = failure
+    else:
+        harness.repository.completion_failure = failure
+
+    with pytest.raises(GmailSyncError) as raised:
+        await harness.handle()
+
+    assert_content_free_sync_error(raised.value, marker)
+    assert harness.repository.busy is False
+    assert harness.repository.calls[-1] == "release"
+    assert harness.repository.state is not None
+    assert harness.repository.state.history_id == "100"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        GmailProviderError("Gmail API request failed"),
+        SecretManagerProviderError("Secret Manager credential read failed"),
+        HistoryCursorExpired("Gmail history cursor expired"),
+        GmailSyncError("Gmail synchronization claim is no longer current"),
+    ],
+)
+async def test_safe_retryable_exception_types_remain_unchanged(failure: Exception) -> None:
+    """Fails if later workers lose the provider, recovery, or synchronization classification."""
+    harness = Harness()
+    harness.credentials.failure = failure
+
+    with pytest.raises(type(failure)) as raised:
+        await harness.handle()
+
+    assert raised.value is failure
+    assert harness.repository.busy is False
+
+
+async def test_cancellation_is_not_masked_when_claim_release_also_fails() -> None:
+    """Fails if an independent cleanup error replaces worker cancellation."""
+    harness = Harness()
+    cancellation = asyncio.CancelledError("cancelled-provider-operation")
+    harness.gmail.history_failure = cancellation
+    harness.repository.release_failure = RuntimeError("private-release-response")
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await harness.handle()
+
+    assert raised.value is cancellation
+    assert harness.repository.calls[-1] == "release"

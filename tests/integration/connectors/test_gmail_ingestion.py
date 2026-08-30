@@ -15,7 +15,7 @@ from eva_ai.connectors.gmail.contracts import (
 )
 from eva_ai.connectors.gmail.sync import GmailSyncError, GmailSyncService, SyncStatus
 from eva_ai.connectors.repository import ConnectorRepository
-from eva_ai.connectors.types import SyncClaim
+from eva_ai.connectors.types import ConnectorStatus, SyncClaim
 from eva_ai.db import Database
 from eva_ai.db.models import Event, EventProcessing, GmailSyncState, OutboxMessage
 from eva_ai.events.service import EventService, IngestResult
@@ -47,6 +47,24 @@ class CheckingCredentialStore:
 
     async def put(self, connector_id: UUID, authorized_user_json: str) -> str:
         raise AssertionError("synchronization must not write credentials")
+
+
+class UnusedCredentialStore:
+    async def get(self, secret_reference: str) -> str:
+        raise AssertionError("status-only notification must not load credentials")
+
+    async def put(self, connector_id: UUID, authorized_user_json: str) -> str:
+        raise AssertionError("synchronization must not write credentials")
+
+
+class UnusedClientFactory:
+    async def create(self, authorized_user_json: str) -> GmailClient:
+        raise AssertionError("status-only notification must not construct Gmail client")
+
+
+class UnusedEventService:
+    async def ingest(self, command: NewEvent) -> IngestResult:
+        raise AssertionError("status-only notification must not ingest")
 
 
 class CheckingGmailClient:
@@ -134,6 +152,73 @@ class FailCompletionOnceRepository:
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    ("status", "expected_status", "expected_history_id"),
+    [
+        (ConnectorStatus.CONNECTING, SyncStatus.CONNECTING, None),
+        (ConnectorStatus.ERROR, SyncStatus.CONNECTING, "100"),
+        (
+            ConnectorStatus.REAUTHORIZATION_REQUIRED,
+            SyncStatus.REAUTHORIZATION_REQUIRED,
+            "100",
+        ),
+        (ConnectorStatus.ACTIVE, SyncStatus.ALREADY_COVERED, "100"),
+    ],
+)
+async def test_known_status_outcomes_durably_record_notification_before_returning(
+    database: Database,
+    status: ConnectorStatus,
+    expected_status: SyncStatus,
+    expected_history_id: str | None,
+) -> None:
+    """Fails if a known terminal/covered outcome returns before PostgreSQL observes it."""
+    scope = await create_scope(database)
+    identity = f"status-{status.value.lower()}+{scope.workspace_id}@example.com"
+    repository = ConnectorRepository(database)
+    reserved = await repository.reserve_gmail(
+        scope.user_id,
+        scope.workspace_id,
+        identity,
+        ("https://www.googleapis.com/auth/gmail.readonly",),
+        NOW,
+    )
+    if status != ConnectorStatus.CONNECTING:
+        await repository.attach_secret(reserved.id, "projects/eva/secrets/status/versions/1")
+        await repository.activate_initial_watch(
+            reserved.id,
+            gmail_watch("100", NOW + timedelta(days=7)),
+            NOW,
+            NOW + timedelta(days=1),
+            NOW + timedelta(hours=1),
+        )
+    if status == ConnectorStatus.ERROR:
+        await repository.mark_error(reserved.id, RuntimeError("synthetic provider failure"))
+    elif status == ConnectorStatus.REAUTHORIZATION_REQUIRED:
+        await repository.mark_reauthorization_required(
+            reserved.id,
+            RuntimeError("synthetic authorization failure"),
+        )
+    service = GmailSyncService(
+        repository=repository,
+        credential_store=cast(CredentialStore, UnusedCredentialStore()),
+        client_factory=cast(GmailClientFactory, UnusedClientFactory()),
+        event_service=cast(EventService, UnusedEventService()),
+        clock=lambda: NOW + timedelta(minutes=5),
+        lease_seconds=300,
+    )
+
+    result = await service.handle(GmailNotification(identity, "100"))
+
+    state = await repository.get_sync_state(reserved.id)
+    assert result.status == expected_status
+    assert result.final_history_id == expected_history_id
+    assert state is not None
+    assert state.last_notification_at == NOW + timedelta(minutes=5)
+    assert state.history_id == expected_history_id
+    assert state.claim_id is None and state.lease_expires_at is None
+
+
+@pytest.mark.integration
 async def test_crash_replay_creates_one_backbone_and_advances_cursor_after_retry(
     database: Database,
 ) -> None:
@@ -200,4 +285,5 @@ async def test_crash_replay_creates_one_backbone_and_advances_cursor_after_retry
     assert result.final_history_id == "101"
     assert counts == (1, 1, 1)
     assert final_state is not None and final_state.history_id == "101"
+    assert final_state.last_notification_at == NOW
     assert final_state.claim_id is None and final_state.lease_expires_at is None

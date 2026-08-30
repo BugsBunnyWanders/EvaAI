@@ -1,4 +1,5 @@
-from collections.abc import Callable, Mapping
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -9,11 +10,14 @@ from eva_ai.connectors.gmail.contracts import (
     CredentialStore,
     GmailClientFactory,
     GmailNotification,
+    HistoryCursorExpired,
 )
 from eva_ai.connectors.gmail.normalizer import normalize_message
-from eva_ai.connectors.repository import ConnectorRepository
+from eva_ai.connectors.repository import AmbiguousConnectorIdentity, ConnectorRepository
 from eva_ai.connectors.types import ConnectorRecord, ConnectorStatus, GmailSyncRecord, SyncClaim
 from eva_ai.events.service import EventService
+from eva_ai.integrations.gcp.secret_manager import SecretManagerProviderError
+from eva_ai.integrations.gmail.api import GmailProviderError
 
 _SAFETY_SYNC_INTERVAL = timedelta(minutes=60)
 
@@ -57,11 +61,25 @@ class GmailSyncService:
         self._lease_seconds = lease_seconds
 
     async def handle(self, notification: GmailNotification) -> SyncResult:
-        connector = await self._repository.find_by_identity(notification.email_address)
+        connector = await _await_repository(
+            self._repository.find_by_identity(notification.email_address)
+        )
         if connector is None or connector.status == ConnectorStatus.DISABLED:
             return SyncResult(SyncStatus.UNKNOWN_ACCOUNT, None, 0, None)
 
-        sync = await self._repository.get_sync_state(connector.id)
+        observation_failed = False
+        try:
+            observed = await self._repository.record_notification(
+                connector.id,
+                self._clock(),
+            )
+        except Exception:
+            observation_failed = True
+            observed = False
+        if observation_failed or not observed:
+            raise GmailSyncError("Gmail notification observation failed")
+
+        sync = await _await_repository(self._repository.get_sync_state(connector.id))
         inactive = self._inactive_result(connector, sync)
         if inactive is not None:
             return inactive
@@ -77,19 +95,21 @@ class GmailSyncService:
         return await self.sync_connector(connector.id)
 
     async def sync_connector(self, connector_id: UUID) -> SyncResult:
-        connector = await self._repository.get(connector_id)
+        connector = await _await_repository(self._repository.get(connector_id))
         if connector is None or connector.status == ConnectorStatus.DISABLED:
             return SyncResult(SyncStatus.UNKNOWN_ACCOUNT, None, 0, None)
 
-        sync = await self._repository.get_sync_state(connector_id)
+        sync = await _await_repository(self._repository.get_sync_state(connector_id))
         inactive = self._inactive_result(connector, sync)
         if inactive is not None:
             return inactive
 
-        claim = await self._repository.claim_sync(
-            connector_id,
-            self._clock(),
-            self._lease_seconds,
+        claim = await _await_repository(
+            self._repository.claim_sync(
+                connector_id,
+                self._clock(),
+                self._lease_seconds,
+            )
         )
         if claim is None:
             return SyncResult(
@@ -102,9 +122,16 @@ class GmailSyncService:
 
     async def _synchronize_claim(self, claim: SyncClaim) -> SyncResult:
         revoked: AuthorizationRevoked | None = None
+        cancelled: asyncio.CancelledError | None = None
+        preserved_failure: Exception | None = None
+        unsafe_failure = False
+        invalid_message = False
+        failure_boundary = "connector"
         try:
             secret_reference, start_history_id, connected_at = _claim_inputs(claim)
+            failure_boundary = "credentials"
             authorized_user_json = await self._credential_store.get(secret_reference)
+            failure_boundary = "client"
             gmail = await self._client_factory.create(authorized_user_json)
 
             # Claim acquisition is already committed; no SQL transaction spans provider I/O.
@@ -112,6 +139,7 @@ class GmailSyncService:
             page_token: str | None = None
             final_history_id = start_history_id
             while True:
+                failure_boundary = "history"
                 page = await gmail.list_history(start_history_id, page_token)
                 final_history_id = page.history_id
                 for message_id in page.message_ids:
@@ -122,17 +150,21 @@ class GmailSyncService:
 
             events_created = 0
             for message_id in message_ids:
+                failure_boundary = "message"
                 raw = await gmail.get_message(message_id)
                 if not _has_inbox_label(raw):
                     continue
+                failure_boundary = "normalization"
                 event = normalize_message(raw, claim.connector, final_history_id)
                 if event.occurred_at < connected_at:
                     continue
                 # Every Event commits independently before the cursor completion transaction.
+                failure_boundary = "event"
                 result = await self._event_service.ingest(event)
                 events_created += int(result.created)
 
             completed_at = self._clock()
+            failure_boundary = "completion"
             completed = await self._repository.complete_sync(
                 claim,
                 final_history_id,
@@ -147,13 +179,51 @@ class GmailSyncService:
                 events_created,
                 final_history_id,
             )
+        except asyncio.CancelledError as error:
+            cancelled = error
         except AuthorizationRevoked as error:
             revoked = error
+        except (
+            GmailProviderError,
+            SecretManagerProviderError,
+            HistoryCursorExpired,
+            GmailSyncError,
+        ) as error:
+            preserved_failure = error
+        except ValueError:
+            if failure_boundary == "normalization":
+                invalid_message = True
+            else:
+                unsafe_failure = True
         except Exception:
-            await self._release_safely(claim)
-            raise
+            unsafe_failure = True
 
-        if await self._mark_reauthorization(claim.connector.id, revoked):
+        if cancelled is not None:
+            await self._release_after_cancellation(claim)
+            raise cancelled
+        if preserved_failure is not None:
+            await self._release_safely(claim)
+            raise preserved_failure
+        if unsafe_failure:
+            await self._release_safely(claim)
+            raise GmailSyncError("Gmail synchronization failed")
+        if invalid_message:
+            await self._release_safely(claim)
+            raise ValueError("invalid Gmail message")
+
+        transition_cancelled: asyncio.CancelledError | None = None
+        try:
+            marked_reauthorization = await self._mark_reauthorization(
+                claim.connector.id,
+                revoked,
+            )
+        except asyncio.CancelledError as error:
+            transition_cancelled = error
+            marked_reauthorization = False
+        if transition_cancelled is not None:
+            await self._release_after_cancellation(claim)
+            raise transition_cancelled
+        if marked_reauthorization:
             return SyncResult(
                 SyncStatus.REAUTHORIZATION_REQUIRED,
                 claim.connector.id,
@@ -168,6 +238,13 @@ class GmailSyncService:
             await self._repository.release_sync(claim)
         except Exception:
             # The bounded lease remains reclaimable; a release error must not mask the cause.
+            pass
+
+    async def _release_after_cancellation(self, claim: SyncClaim) -> None:
+        try:
+            await self._repository.release_sync(claim)
+        except BaseException:
+            # Preserve the cancellation object even if cleanup is independently interrupted.
             pass
 
     async def _mark_reauthorization(
@@ -210,6 +287,31 @@ def _cursor_covers(persisted: str | None, notification: str) -> bool:
         and notification.isdecimal()
         and int(persisted) >= int(notification)
     )
+
+
+async def _await_repository[T](operation: Awaitable[T]) -> T:
+    preserved_failure: Exception | None = None
+    unsafe_failure = False
+    try:
+        return await operation
+    except asyncio.CancelledError:
+        raise
+    except (
+        AmbiguousConnectorIdentity,
+        GmailProviderError,
+        SecretManagerProviderError,
+        HistoryCursorExpired,
+        GmailSyncError,
+    ) as error:
+        preserved_failure = error
+    except Exception:
+        unsafe_failure = True
+
+    if preserved_failure is not None:
+        raise preserved_failure
+    if unsafe_failure:
+        raise GmailSyncError("Gmail synchronization failed")
+    raise AssertionError("repository operation produced no result")
 
 
 def _claim_inputs(claim: SyncClaim) -> tuple[str, str, datetime]:

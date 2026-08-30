@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Any, cast
 from uuid import UUID, uuid7
 
-from sqlalchemy import Numeric, exists, literal, or_, select, update
+from sqlalchemy import Numeric, case, exists, literal, or_, select, update
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import CursorResult
@@ -155,6 +155,24 @@ class ConnectorRepository:
         async with self._database.session() as session:
             sync = await session.get(GmailSyncState, connector_id)
         return _sync_record(sync) if sync is not None else None
+
+    async def record_notification(self, connector_id: UUID, observed_at: datetime) -> bool:
+        monotonic_observation = case(
+            (
+                or_(
+                    GmailSyncState.last_notification_at.is_(None),
+                    GmailSyncState.last_notification_at < observed_at,
+                ),
+                observed_at,
+            ),
+            else_=GmailSyncState.last_notification_at,
+        )
+        statement = (
+            update(GmailSyncState)
+            .where(GmailSyncState.connector_account_id == connector_id)
+            .values(last_notification_at=monotonic_observation)
+        )
+        return await self._updated(statement)
 
     async def claim_sync(
         self,
