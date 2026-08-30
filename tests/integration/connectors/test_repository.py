@@ -196,8 +196,13 @@ async def test_initial_activation_preserves_first_connection_boundary_on_reautho
     assert reactivated.status == ConnectorStatus.ACTIVE
     assert reactivated.connected_at == original.connected_at == NOW
     assert reactivated.secret_reference == "projects/eva/secrets/gmail/versions/2"
-    assert state is not None and state.history_id == "200"
+    assert state is not None
+    assert state.history_id == "100"
+    assert state.watch_expiration == NOW + timedelta(days=14)
+    assert state.next_watch_renewal_at == NOW + timedelta(days=3)
+    assert state.next_safety_sync_at == NOW + timedelta(days=2, hours=1)
 
+    await repository.attach_secret(connector_id, "projects/eva/secrets/gmail/versions/3")
     repeated = await repository.activate_initial_watch(
         connector_id,
         gmail_watch("300", NOW + timedelta(days=21)),
@@ -208,7 +213,12 @@ async def test_initial_activation_preserves_first_connection_boundary_on_reautho
     repeated_state = await repository.get_sync_state(connector_id)
 
     assert repeated.connected_at == NOW
-    assert repeated_state is not None and repeated_state.history_id == "200"
+    assert repeated.secret_reference == "projects/eva/secrets/gmail/versions/3"
+    assert repeated_state is not None
+    assert repeated_state.history_id == "100"
+    assert repeated_state.watch_expiration == NOW + timedelta(days=21)
+    assert repeated_state.next_watch_renewal_at == NOW + timedelta(days=5)
+    assert repeated_state.next_safety_sync_at == NOW + timedelta(days=4, hours=1)
 
 
 @pytest.mark.integration
@@ -398,3 +408,72 @@ async def test_reauthorization_clears_claim_without_resetting_cursor_or_connecti
     stored_error = f"{row.last_error_type}:{row.last_error_summary}"
     assert "secret" not in stored_error
     assert "message-content" not in stored_error
+
+
+@pytest.mark.integration
+async def test_error_transition_is_sanitized_and_retry_reservation_restores_connecting(
+    database: Database,
+) -> None:
+    """Fails if retryable failures require OAuth, leak details, or allocate a new connector."""
+    scope = await create_scope(database)
+    repository = ConnectorRepository(database)
+    connector_id = await reserve_active(repository, scope, history_id="durable-before-error")
+    claim = await repository.claim_sync(connector_id, NOW, lease_seconds=300)
+    assert claim is not None
+
+    await repository.mark_error(
+        connector_id, RuntimeError("provider-token=secret private-response-text")
+    )
+    failed = await repository.get(connector_id)
+    failed_state = await repository.get_sync_state(connector_id)
+    async with database.session() as session:
+        failed_row = await session.scalar(
+            select(ConnectorAccount).where(ConnectorAccount.id == connector_id)
+        )
+
+    assert failed is not None and failed.status == ConnectorStatus.ERROR
+    assert failed.connected_at == NOW
+    assert failed_state is not None
+    assert failed_state.history_id == "durable-before-error"
+    assert failed_state.claim_id is None and failed_state.lease_expires_at is None
+    assert failed_row is not None
+    assert failed_row.last_error_type == "RuntimeError"
+    assert failed_row.last_error_summary == "operation failed"
+    stored_error = f"{failed_row.last_error_type}:{failed_row.last_error_summary}"
+    assert "secret" not in stored_error and "private-response-text" not in stored_error
+
+    retried = await repository.reserve_gmail(
+        scope.user_id,
+        scope.workspace_id,
+        "owner@example.com",
+        ("https://www.googleapis.com/auth/gmail.readonly",),
+        NOW + timedelta(minutes=1),
+    )
+    async with database.session() as session:
+        retried_row = await session.scalar(
+            select(ConnectorAccount).where(ConnectorAccount.id == connector_id)
+        )
+
+    assert retried.id == connector_id
+    assert retried.status == ConnectorStatus.CONNECTING
+    assert retried.connected_at == NOW
+    assert retried_row is not None
+    assert retried_row.last_error_type is None and retried_row.last_error_summary is None
+
+    await repository.attach_secret(connector_id, "projects/eva/secrets/gmail/versions/2")
+    recovered = await repository.activate_initial_watch(
+        connector_id,
+        gmail_watch("new-watch-boundary", NOW + timedelta(days=8)),
+        NOW + timedelta(minutes=1),
+        NOW + timedelta(days=1),
+        NOW + timedelta(hours=1),
+    )
+    recovered_state = await repository.get_sync_state(connector_id)
+
+    assert recovered.status == ConnectorStatus.ACTIVE
+    assert recovered.connected_at == NOW
+    assert recovered_state is not None
+    assert recovered_state.history_id == "durable-before-error"
+    assert recovered_state.watch_expiration == NOW + timedelta(days=8)
+    assert recovered_state.next_watch_renewal_at == NOW + timedelta(days=1)
+    assert recovered_state.next_safety_sync_at == NOW + timedelta(hours=1)

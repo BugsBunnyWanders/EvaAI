@@ -12,6 +12,7 @@ from eva_ai.connectors.gmail.bootstrap import (
     GmailBootstrapService,
 )
 from eva_ai.connectors.gmail.contracts import (
+    AuthorizationRevoked,
     AuthorizedUserGrant,
     CredentialStore,
     GmailClient,
@@ -38,8 +39,13 @@ WATCH = WatchResult(history_id="812", expiration=NOW + timedelta(days=7))
 
 
 class FakeRepository:
-    def __init__(self, calls: list[str]) -> None:
+    def __init__(
+        self,
+        calls: list[str],
+        transition_failure: Exception | None = None,
+    ) -> None:
         self.calls = calls
+        self.transition_failure = transition_failure
         self.record: ConnectorRecord | None = None
         self.history_id: str | None = None
         self.last_error_type: str | None = None
@@ -119,11 +125,21 @@ class FakeRepository:
 
     async def mark_reauthorization_required(self, connector_id: UUID, error: BaseException) -> None:
         self.calls.append("mark_reauthorization_required")
+        if self.transition_failure is not None:
+            raise self.transition_failure
         assert self.record is not None and connector_id == self.record.id
         self.last_error_type = type(error).__name__
         self.record = self.record.model_copy(
             update={"status": ConnectorStatus.REAUTHORIZATION_REQUIRED}
         )
+
+    async def mark_error(self, connector_id: UUID, error: BaseException) -> None:
+        self.calls.append("mark_error")
+        if self.transition_failure is not None:
+            raise self.transition_failure
+        assert self.record is not None and connector_id == self.record.id
+        self.last_error_type = type(error).__name__
+        self.record = self.record.model_copy(update={"status": ConnectorStatus.ERROR})
 
     def observe_initial_notification(self) -> None:
         self.calls.append("notification")
@@ -170,7 +186,7 @@ class FakeGmailClient:
         calls: list[str],
         *,
         identity: str = "Owner@Example.COM",
-        watch_failure: GmailProviderError | None = None,
+        watch_failure: Exception | None = None,
         on_watch: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.calls = calls
@@ -220,12 +236,13 @@ class Harness:
         *,
         identity: str = "Owner@Example.COM",
         secret_failure: SecretManagerProviderError | None = None,
-        watch_failure: GmailProviderError | None = None,
+        watch_failure: Exception | None = None,
+        transition_failure: Exception | None = None,
         on_watch: Callable[[], Awaitable[None]] | None = None,
         now: datetime = NOW,
     ) -> None:
         self.calls: list[str] = []
-        self.repository = FakeRepository(self.calls)
+        self.repository = FakeRepository(self.calls, transition_failure)
         self.authorizer = FakeAuthorizer(self.calls)
         self.credential_store = FakeCredentialStore(self.calls, secret_failure)
         self.gmail = FakeGmailClient(
@@ -312,7 +329,7 @@ async def test_connect_rejects_oauth_identity_mismatch_before_reserving_or_stori
 
 
 async def test_connect_marks_reserved_connector_when_secret_storage_fails() -> None:
-    """Fails if a secret-store failure leaves CONNECTING or persists unsafe error text."""
+    """Fails if a retryable secret-store failure requires OAuth instead of a retry."""
     harness = Harness(
         secret_failure=SecretManagerProviderError("Secret Manager credential write failed")
     )
@@ -326,17 +343,17 @@ async def test_connect_marks_reserved_connector_when_secret_storage_fails() -> N
         "get_profile",
         "reserve",
         "put_secret",
-        "mark_reauthorization_required",
+        "mark_error",
     ]
     assert harness.repository.record is not None
-    assert harness.repository.record.status == ConnectorStatus.REAUTHORIZATION_REQUIRED
+    assert harness.repository.record.status == ConnectorStatus.ERROR
     assert harness.repository.last_error_type == "SecretManagerProviderError"
     assert harness.repository.record.secret_reference is None
     assert harness.repository.history_id is None
 
 
 async def test_connect_marks_reserved_connector_and_keeps_cursor_empty_when_watch_fails() -> None:
-    """Fails if a watch failure leaves CONNECTING/ACTIVE or stores an unconfirmed cursor."""
+    """Fails if a retryable watch failure requires OAuth or stores an unconfirmed cursor."""
     harness = Harness(watch_failure=GmailProviderError("Gmail API request failed"))
 
     with pytest.raises(GmailProviderError, match="Gmail API request failed"):
@@ -350,13 +367,59 @@ async def test_connect_marks_reserved_connector_and_keeps_cursor_empty_when_watc
         "put_secret",
         "attach_secret",
         "watch",
-        "mark_reauthorization_required",
+        "mark_error",
     ]
     assert harness.repository.record is not None
-    assert harness.repository.record.status == ConnectorStatus.REAUTHORIZATION_REQUIRED
+    assert harness.repository.record.status == ConnectorStatus.ERROR
     assert harness.repository.last_error_type == "GmailProviderError"
     assert harness.repository.record.secret_reference == SECRET_REFERENCE
     assert harness.repository.history_id is None
+
+
+async def test_connect_marks_only_authorization_revocation_for_reauthorization() -> None:
+    """Fails if revoked credentials are treated as retryable without new authorization."""
+    harness = Harness(watch_failure=AuthorizationRevoked("Google authorization has been revoked"))
+
+    with pytest.raises(AuthorizationRevoked, match="authorization has been revoked"):
+        await harness.connect()
+
+    assert harness.calls[-2:] == ["watch", "mark_reauthorization_required"]
+    assert harness.repository.record is not None
+    assert harness.repository.record.status == ConnectorStatus.REAUTHORIZATION_REQUIRED
+    assert harness.repository.last_error_type == "AuthorizationRevoked"
+    assert harness.repository.history_id is None
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "expected_transition"),
+    [
+        (GmailProviderError("Gmail API request failed"), "mark_error"),
+        (
+            AuthorizationRevoked("Google authorization has been revoked"),
+            "mark_reauthorization_required",
+        ),
+    ],
+)
+async def test_connect_preserves_original_error_when_failure_transition_fails(
+    provider_error: Exception,
+    expected_transition: str,
+) -> None:
+    """Fails if repository errors mask or retain the original provider failure."""
+    harness = Harness(
+        watch_failure=provider_error,
+        transition_failure=RuntimeError("private-database-response token=secret"),
+    )
+
+    with pytest.raises(type(provider_error)) as raised:
+        await harness.connect()
+
+    assert raised.value is provider_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert raised.value.__notes__ == ["connector failure state could not be persisted"]
+    assert harness.calls[-2:] == ["watch", expected_transition]
+    assert "private-database-response" not in repr(raised.value)
+    assert "token=secret" not in repr(raised.value)
 
 
 async def test_reconnect_reuses_connector_and_preserves_original_connected_at() -> None:
@@ -418,3 +481,25 @@ async def test_initial_watch_notification_observes_connecting_before_activation(
         "notification",
         "activate",
     ]
+
+
+async def test_connect_keeps_disabled_connector_inert() -> None:
+    """Fails if connect implicitly re-enables a connector disabled by persisted policy."""
+    harness = Harness()
+    harness.repository.record = ConnectorRecord(
+        id=CONNECTOR_ID,
+        user_id=USER_ID,
+        workspace_id=WORKSPACE_ID,
+        provider="gmail",
+        account_identity="owner@example.com",
+        granted_scopes=(GMAIL_READONLY_SCOPE,),
+        status=ConnectorStatus.DISABLED,
+        secret_reference=SECRET_REFERENCE,
+        connected_at=NOW,
+    )
+
+    connector = await harness.connect()
+
+    assert connector.status == ConnectorStatus.DISABLED
+    assert connector.connected_at == NOW
+    assert harness.calls == ["authorize", "create_client", "get_profile", "reserve"]

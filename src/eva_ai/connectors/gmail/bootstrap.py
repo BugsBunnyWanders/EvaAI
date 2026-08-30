@@ -5,13 +5,14 @@ from pathlib import Path
 from uuid import UUID
 
 from eva_ai.connectors.gmail.contracts import (
+    AuthorizationRevoked,
     CredentialStore,
     GmailClientFactory,
     OAuthAuthorizer,
     WatchResult,
 )
 from eva_ai.connectors.repository import ConnectorRepository
-from eva_ai.connectors.types import ConnectorRecord
+from eva_ai.connectors.types import ConnectorRecord, ConnectorStatus
 from eva_ai.integrations.gmail.oauth import GMAIL_READONLY_SCOPE
 
 _GMAIL_SCOPES = (GMAIL_READONLY_SCOPE,)
@@ -62,6 +63,8 @@ class GmailBootstrapService:
             _GMAIL_SCOPES,
             now,
         )
+        if connector.status == ConnectorStatus.DISABLED:
+            return connector
         try:
             secret_reference = await self._credential_store.put(
                 connector.id, grant.authorized_user_json
@@ -76,8 +79,18 @@ class GmailBootstrapService:
                 now + _SAFETY_SYNC_INTERVAL,
             )
         except Exception as error:
-            await self._repository.mark_reauthorization_required(connector.id, error)
+            await self._persist_failure_state(connector.id, error)
             raise
+
+    async def _persist_failure_state(self, connector_id: UUID, error: Exception) -> None:
+        # State persistence is best effort; the original sanitized provider error must win.
+        try:
+            if isinstance(error, AuthorizationRevoked):
+                await self._repository.mark_reauthorization_required(connector_id, error)
+            else:
+                await self._repository.mark_error(connector_id, error)
+        except Exception:
+            error.add_note("connector failure state could not be persisted")
 
 
 def _renewal_due_at(watch: WatchResult, now: datetime) -> datetime:

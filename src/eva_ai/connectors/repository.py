@@ -75,6 +75,10 @@ class ConnectorRepository:
                     raise ConnectorScopeMismatchError(
                         "connector user does not match persisted owner"
                     )
+                if account.status == ConnectorStatus.ERROR:
+                    account.status = ConnectorStatus.CONNECTING
+                    account.last_error_type = None
+                    account.last_error_summary = None
                 sync_insert = (
                     insert(GmailSyncState)
                     .values(connector_account_id=account.id, created_at=now, updated_at=now)
@@ -108,6 +112,7 @@ class ConnectorRepository:
                 if account.status not in {
                     ConnectorStatus.CONNECTING,
                     ConnectorStatus.REAUTHORIZATION_REQUIRED,
+                    ConnectorStatus.ACTIVE,
                 }:
                     return _connector_record(account)
                 if account.secret_reference is None:
@@ -119,7 +124,8 @@ class ConnectorRepository:
                 account.connected_at = account.connected_at or now
                 account.last_error_type = None
                 account.last_error_summary = None
-                sync.history_id = watch.history_id
+                # A repeat watch refreshes scheduling but cannot move the durable cursor.
+                sync.history_id = sync.history_id or watch.history_id
                 sync.watch_expiration = watch.expiration
                 sync.next_watch_renewal_at = next_renewal_at
                 sync.next_safety_sync_at = next_safety_sync_at
@@ -243,6 +249,26 @@ class ConnectorRepository:
             .where(ConnectorAccount.id == connector_id)
             .values(
                 status=ConnectorStatus.REAUTHORIZATION_REQUIRED,
+                last_error_type=type(error).__name__,
+                last_error_summary="operation failed",
+            )
+        )
+        clear_claim = (
+            update(GmailSyncState)
+            .where(GmailSyncState.connector_account_id == connector_id)
+            .values(claim_id=None, lease_expires_at=None)
+        )
+        async with self._database.session() as session:
+            async with session.begin():
+                await session.execute(connector_update)
+                await session.execute(clear_claim)
+
+    async def mark_error(self, connector_id: UUID, error: BaseException) -> None:
+        connector_update = (
+            update(ConnectorAccount)
+            .where(ConnectorAccount.id == connector_id)
+            .values(
+                status=ConnectorStatus.ERROR,
                 last_error_type=type(error).__name__,
                 last_error_summary="operation failed",
             )
