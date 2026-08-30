@@ -59,3 +59,16 @@ def test_event_backbone_settings_reject_non_positive_limits() -> None:
 def test_event_backbone_settings_reject_blank_topic_id(topic_id: str) -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, pubsub_topic_id=topic_id)
+
+
+def test_gmail_settings_have_safe_defaults() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.gmail_topic_id == "eva-gmail-notifications"
+    assert settings.gmail_subscription_id == "eva-gmail-ingestion-local"
+    assert settings.gmail_account is None
+    assert settings.gmail_oauth_client_file is None
+    assert settings.gmail_sync_lease_seconds == 300
+    assert settings.gmail_pull_timeout_seconds == 30
+    assert settings.gmail_watch_renewal_hours == 24
+    assert settings.gmail_safety_sync_minutes == 60
