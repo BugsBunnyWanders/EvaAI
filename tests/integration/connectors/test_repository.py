@@ -5,7 +5,7 @@ from uuid import UUID
 import pytest
 from sqlalchemy import select
 
-from eva_ai.connectors.repository import ConnectorRepository
+from eva_ai.connectors.repository import AmbiguousConnectorIdentity, ConnectorRepository
 from eva_ai.connectors.types import ConnectorStatus
 from eva_ai.db import Database
 from eva_ai.db.models import ConnectorAccount
@@ -61,6 +61,17 @@ async def test_reserve_gmail_normalizes_identity_and_is_stable_within_workspace(
         ("scope-b",),
         NOW + timedelta(minutes=1),
     )
+    state = await repository.get_sync_state(first.id)
+    found = await repository.find_by_identity(identity.upper())
+    missing = await repository.find_by_identity("missing@example.com")
+    assert first.id == second.id
+    assert first.account_identity == identity.lower()
+    assert first.status == ConnectorStatus.CONNECTING
+    assert first.secret_reference is None and first.connected_at is None
+    assert state is not None and state.history_id is None
+    assert found == first
+    assert missing is None
+
     other_scope = await create_scope(database)
     other = await repository.reserve_gmail(
         other_scope.user_id,
@@ -70,17 +81,32 @@ async def test_reserve_gmail_normalizes_identity_and_is_stable_within_workspace(
         NOW,
     )
 
-    state = await repository.get_sync_state(first.id)
-    found = await repository.find_by_identity(identity.upper())
-    missing = await repository.find_by_identity("missing@example.com")
-    assert first.id == second.id
     assert first.id != other.id
-    assert first.account_identity == identity.lower()
-    assert first.status == ConnectorStatus.CONNECTING
-    assert first.secret_reference is None and first.connected_at is None
-    assert state is not None and state.history_id is None
-    assert found == first
-    assert missing is None
+
+
+@pytest.mark.integration
+async def test_find_by_identity_rejects_cross_workspace_ambiguity(database: Database) -> None:
+    repository = ConnectorRepository(database)
+    first_scope = await create_scope(database)
+    second_scope = await create_scope(database)
+    identity = f"shared+{first_scope.workspace_id}@example.com"
+    await repository.reserve_gmail(
+        first_scope.user_id,
+        first_scope.workspace_id,
+        identity,
+        ("scope",),
+        NOW,
+    )
+    await repository.reserve_gmail(
+        second_scope.user_id,
+        second_scope.workspace_id,
+        identity,
+        ("scope",),
+        NOW,
+    )
+
+    with pytest.raises(AmbiguousConnectorIdentity, match="multiple connectors"):
+        await repository.find_by_identity(identity.upper())
 
 
 @pytest.mark.integration

@@ -23,6 +23,10 @@ _GMAIL_PROVIDER = "gmail"
 _ERROR_CLASS = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+class AmbiguousConnectorIdentity(RuntimeError):
+    pass
+
+
 class ConnectorRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
@@ -116,17 +120,19 @@ class ConnectorRepository:
                 return _connector_record(account)
 
     async def find_by_identity(self, account_identity: str) -> ConnectorRecord | None:
-        async with self._database.session() as session:
-            account = await session.scalar(
-                select(ConnectorAccount)
-                .where(
-                    ConnectorAccount.provider == _GMAIL_PROVIDER,
-                    ConnectorAccount.account_identity == account_identity.lower(),
-                )
-                .order_by(ConnectorAccount.created_at, ConnectorAccount.id)
-                .limit(1)
+        statement = (
+            select(ConnectorAccount)
+            .where(
+                ConnectorAccount.provider == _GMAIL_PROVIDER,
+                ConnectorAccount.account_identity == account_identity.lower(),
             )
-        return _connector_record(account) if account is not None else None
+            .limit(2)
+        )
+        async with self._database.session() as session:
+            accounts = (await session.scalars(statement)).all()
+        if len(accounts) > 1:
+            raise AmbiguousConnectorIdentity("Gmail identity maps to multiple connectors")
+        return _connector_record(accounts[0]) if accounts else None
 
     async def get(self, connector_id: UUID) -> ConnectorRecord | None:
         async with self._database.session() as session:
