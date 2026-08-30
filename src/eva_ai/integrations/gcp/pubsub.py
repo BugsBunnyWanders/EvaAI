@@ -22,7 +22,9 @@ class PubSubClient(Protocol):
 class GooglePubSubPublisher:
     def __init__(self, project_id: str, client: PubSubClient | None = None) -> None:
         self._project_id = project_id
-        self._client = client or cast(PubSubClient, pubsub_v1.PublisherClient())
+        self._client = (
+            client if client is not None else cast(PubSubClient, pubsub_v1.PublisherClient())
+        )
 
     async def publish(self, message: OutboundMessage) -> str:
         topic = self._client.topic_path(self._project_id, message.destination)

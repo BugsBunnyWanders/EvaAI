@@ -1,4 +1,5 @@
 import json
+from typing import Never
 from uuid import uuid7
 
 import pytest
@@ -40,6 +41,15 @@ class FakeClient:
         return FakeFuture()
 
 
+class FalseyClient(FakeClient):
+    def __bool__(self) -> bool:
+        return False
+
+
+def fail_default_client_construction() -> Never:
+    raise AssertionError("the injected client must be honored")
+
+
 @pytest.mark.asyncio
 async def test_google_publisher_serializes_envelope_and_awaits_ack() -> None:
     client = FakeClient()
@@ -56,3 +66,19 @@ async def test_google_publisher_serializes_envelope_and_awaits_ack() -> None:
         "event_id": str(message.envelope.event_id),
         "workspace_id": str(message.envelope.workspace_id),
     }
+
+
+@pytest.mark.asyncio
+async def test_google_publisher_honors_a_falsey_injected_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FalseyClient()
+    monkeypatch.setattr(
+        "eva_ai.integrations.gcp.pubsub.pubsub_v1.PublisherClient",
+        fail_default_client_construction,
+    )
+
+    provider_id = await GooglePubSubPublisher("eva-project", client).publish(outbound_message())
+
+    assert provider_id == "provider-message-42"
+    assert len(client.published) == 1
