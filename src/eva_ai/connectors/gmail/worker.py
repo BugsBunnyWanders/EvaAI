@@ -77,30 +77,20 @@ class GmailPullWorker:
 
         # Decisions are grouped only after every message has been classified independently.
         transport_failed = False
-        cancellation: asyncio.CancelledError | None = None
         if acknowledge:
             try:
                 await self._subscriber.acknowledge(tuple(acknowledge))
-            except asyncio.CancelledError as error:
-                cancellation = error
             except Exception:
                 transport_failed = True
         if negative_acknowledge:
             try:
                 await self._subscriber.negative_acknowledge(tuple(negative_acknowledge))
-            except asyncio.CancelledError as error:
-                if cancellation is None:
-                    cancellation = error
             except Exception:
                 transport_failed = True
 
         maintenance_failed = False
         try:
             summary = await self._maintenance.run_due(self._clock())
-        except asyncio.CancelledError as error:
-            if cancellation is None:
-                cancellation = error
-            summary = None
         except Exception:
             maintenance_failed = True
             summary = None
@@ -119,8 +109,6 @@ class GmailPullWorker:
                 outcome="failed",
                 error_category="maintenance_failed",
             )
-        if cancellation is not None:
-            raise cancellation
         if transport_failed:
             _log_operational_failure(
                 "Gmail acknowledgement transport failed",

@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import logging
+from contextlib import suppress
 from datetime import UTC, datetime
 from typing import cast
 from uuid import UUID
@@ -100,6 +101,69 @@ class FakeMaintenanceService:
         self.calls.append(now)
         if self.failure is not None:
             raise self.failure
+        return self.summary
+
+
+class PromptCancellationSubscriber(FakeSubscriber):
+    def __init__(
+        self,
+        messages: tuple[PullMessage, ...],
+        cancellation: asyncio.CancelledError,
+        cancel_at: str,
+        later_work_release: asyncio.Event,
+    ) -> None:
+        super().__init__(messages)
+        self.cancellation = cancellation
+        self.cancel_at = cancel_at
+        self.cancel_started = asyncio.Event()
+        self.close_started = asyncio.Event()
+        self.later_work_started = asyncio.Event()
+        self.later_work_release = later_work_release
+
+    async def acknowledge(self, ack_ids: tuple[str, ...]) -> None:
+        self.calls.append(("acknowledge", ack_ids))
+        if self.cancel_at == "ack":
+            self.cancel_started.set()
+            raise self.cancellation
+
+    async def negative_acknowledge(self, ack_ids: tuple[str, ...]) -> None:
+        self.calls.append(("negative_acknowledge", ack_ids))
+        if self.cancel_at == "nack":
+            self.cancel_started.set()
+            raise self.cancellation
+        if self.cancel_at == "ack":
+            self.later_work_started.set()
+            await self.later_work_release.wait()
+
+    async def close(self) -> None:
+        self.calls.append(("close", None))
+        self.close_started.set()
+        if self.close_failure is not None:
+            raise self.close_failure
+
+
+class PromptCancellationMaintenance(FakeMaintenanceService):
+    def __init__(
+        self,
+        cancellation: asyncio.CancelledError,
+        cancel_at: str,
+        later_work_release: asyncio.Event,
+    ) -> None:
+        super().__init__()
+        self.cancellation = cancellation
+        self.cancel_at = cancel_at
+        self.cancel_started = asyncio.Event()
+        self.later_work_started = asyncio.Event()
+        self.later_work_release = later_work_release
+
+    async def run_due(self, now: datetime) -> MaintenanceSummary:
+        self.calls.append(now)
+        if self.cancel_at == "maintenance":
+            self.cancel_started.set()
+            raise self.cancellation
+        if self.cancel_at == "nack":
+            self.later_work_started.set()
+            await self.later_work_release.wait()
         return self.summary
 
 
@@ -265,6 +329,48 @@ async def test_transport_and_maintenance_failures_are_both_operationally_visible
     } >= {"transport_failed", "maintenance_failed"}
 
 
+async def test_simultaneous_ack_nack_and_maintenance_failures_keep_all_boundaries_safe() -> None:
+    """Fails if one ordinary failure skips a group, hides maintenance, or leaks exception text."""
+    stream = io.StringIO()
+    configure_logging(
+        Settings(log_level="INFO", log_format=LogFormat.JSON, _env_file=None), stream=stream
+    )
+    harness = Harness((message(1), message(2)))
+    harness.sync.outcomes = {
+        "owner-1@example.com": SyncResult(SyncStatus.SYNCED, CONNECTOR_ID, 1, "101"),
+        "owner-2@example.com": SyncResult(SyncStatus.BUSY, CONNECTOR_ID, 0, "100"),
+    }
+    markers = (
+        "ack-provider-private",
+        "nack-token-private",
+        "maintenance-body-private",
+    )
+    harness.subscriber.ack_failure = RuntimeError(markers[0])
+    harness.subscriber.nack_failure = RuntimeError(markers[1])
+    harness.maintenance.failure = RuntimeError(markers[2])
+
+    with pytest.raises(GmailWorkerTransportError) as raised:
+        await harness.worker.run_once()
+
+    assert str(raised.value) == "Gmail acknowledgement transport failed"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert harness.subscriber.calls == [
+        ("pull", (10, 17)),
+        ("acknowledge", ("ack-1",)),
+        ("negative_acknowledge", ("ack-2",)),
+    ]
+    assert harness.maintenance.calls == [NOW]
+    rendered = stream.getvalue()
+    assert {json.loads(line)["error_category"] for line in rendered.splitlines()} >= {
+        "synchronization_busy",
+        "maintenance_failed",
+        "transport_failed",
+    }
+    for marker in markers:
+        assert marker not in rendered
+
+
 @pytest.mark.parametrize("failed_operation", ["ack", "nack"])
 async def test_acknowledgement_failure_is_safe_and_other_group_is_attempted(
     failed_operation: str,
@@ -360,6 +466,81 @@ async def test_run_forever_propagates_cancellation_after_close_without_sleep() -
 
     assert raised.value is cancellation
     assert harness.subscriber.calls == [("pull", (10, 17)), ("close", None)]
+
+
+@pytest.mark.parametrize(
+    ("cancel_at", "expected_subscriber_calls", "expected_maintenance_calls"),
+    [
+        ("ack", ["pull", "acknowledge", "close"], []),
+        (
+            "nack",
+            ["pull", "acknowledge", "negative_acknowledge", "close"],
+            [],
+        ),
+        (
+            "maintenance",
+            ["pull", "acknowledge", "negative_acknowledge", "close"],
+            [NOW],
+        ),
+    ],
+)
+async def test_run_forever_enters_close_promptly_at_each_post_pull_cancellation(
+    cancel_at: str,
+    expected_subscriber_calls: list[str],
+    expected_maintenance_calls: list[datetime],
+) -> None:
+    """Fails if cancellation starts a later non-cleanup await before subscriber close."""
+    cancellation = asyncio.CancelledError(f"cancelled-at-{cancel_at}")
+    release_later_work = asyncio.Event()
+    messages = (message(1), message(2))
+    subscriber = PromptCancellationSubscriber(
+        messages,
+        cancellation,
+        cancel_at,
+        release_later_work,
+    )
+    subscriber.close_failure = RuntimeError("close-provider-token-private")
+    maintenance = PromptCancellationMaintenance(
+        cancellation,
+        cancel_at,
+        release_later_work,
+    )
+    sync = FakeSyncService()
+    sync.outcomes = {
+        "owner-1@example.com": SyncResult(SyncStatus.SYNCED, CONNECTOR_ID, 1, "101"),
+        "owner-2@example.com": SyncResult(SyncStatus.BUSY, CONNECTOR_ID, 0, "100"),
+    }
+    worker = GmailPullWorker(
+        subscriber=cast(PullSubscriber, subscriber),
+        sync_service=cast(GmailSyncService, sync),
+        maintenance=cast(GmailMaintenanceService, maintenance),
+        clock=lambda: NOW,
+        pull_timeout_seconds=17,
+    )
+    task = asyncio.create_task(worker.run_forever())
+    cancel_started = (
+        maintenance.cancel_started if cancel_at == "maintenance" else subscriber.cancel_started
+    )
+
+    try:
+        await asyncio.wait_for(cancel_started.wait(), timeout=0.5)
+        await asyncio.wait_for(subscriber.close_started.wait(), timeout=0.5)
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+    finally:
+        release_later_work.set()
+        if not task.done():
+            with suppress(asyncio.CancelledError):
+                await task
+
+    assert raised.value is cancellation
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "close-provider-token-private" not in repr(raised.value)
+    assert [name for name, _ in subscriber.calls] == expected_subscriber_calls
+    assert maintenance.calls == expected_maintenance_calls
+    assert not subscriber.later_work_started.is_set()
+    assert not maintenance.later_work_started.is_set()
 
 
 async def test_close_failure_is_chain_free_and_does_not_mask_cancellation() -> None:

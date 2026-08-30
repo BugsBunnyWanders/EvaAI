@@ -8,7 +8,7 @@ from uuid import UUID
 
 from eva_ai.config import LogFormat, Settings
 
-_SAFE_CONTEXT_FIELDS = (
+_SAFE_IDENTIFIER_FIELDS = (
     "event_id",
     "user_id",
     "workspace_id",
@@ -18,21 +18,62 @@ _SAFE_CONTEXT_FIELDS = (
     "gmail_message_id",
     "gmail_thread_id",
     "claim_id",
-    "operation",
-    "outcome",
-    "error_category",
 )
+_SAFE_CATEGORY_VALUES = {
+    "operation": frozenset(
+        {
+            "acknowledgement",
+            "gmail_pull",
+            "maintenance",
+            "notification_decode",
+            "notification_sync",
+            "pull",
+            "subscriber_close",
+        }
+    ),
+    "outcome": frozenset(
+        {
+            "acknowledged",
+            "already_handled",
+            "busy",
+            "failed",
+            "handled",
+            "negative_acknowledged",
+            "published",
+            "stale",
+        }
+    ),
+    "error_category": frozenset(
+        {
+            "connector_connecting",
+            "credential_provider_transient",
+            "gmail_provider_transient",
+            "internal_failure",
+            "maintenance_failed",
+            "malformed_notification",
+            "provider_transient",
+            "synchronization_busy",
+            "synchronization_failed",
+            "transport_failed",
+            "unknown_account",
+        }
+    ),
+}
 
 
 def _safe_context(record: logging.LogRecord) -> dict[str, str]:
     context: dict[str, str] = {}
-    # LogRecord extras are arbitrary; only known identifiers and outcomes cross this boundary.
-    for field in _SAFE_CONTEXT_FIELDS:
+    # LogRecord extras are arbitrary; identifiers and fixed categories cross separate gates.
+    for field in _SAFE_IDENTIFIER_FIELDS:
         value = getattr(record, field, None)
         if isinstance(value, str):
             context[field] = value
         elif isinstance(value, UUID):
             context[field] = str(value)
+    for field, allowed_values in _SAFE_CATEGORY_VALUES.items():
+        value = getattr(record, field, None)
+        if isinstance(value, str) and value in allowed_values:
+            context[field] = value
     return context
 
 

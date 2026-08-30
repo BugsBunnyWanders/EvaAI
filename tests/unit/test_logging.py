@@ -5,8 +5,18 @@ import sys
 from types import TracebackType
 from uuid import UUID, uuid7
 
+import pytest
+
 from eva_ai.config import LogFormat, Settings
 from eva_ai.logging import JsonFormatter, configure_logging
+
+CATEGORY_MARKERS = (
+    "recipient-private@example.com",
+    "body-private",
+    "refresh-token-private",
+    "provider-response-private",
+    "RuntimeError('exception-repr-private')",
+)
 
 
 class SecretPayload:
@@ -172,6 +182,41 @@ def test_formatter_omits_unavailable_allowlisted_identifiers() -> None:
     assert payload["pubsub_message_id"] == "pubsub-message-1"
     assert "connector_id" not in payload
     assert "workspace_id" not in payload
+
+
+@pytest.mark.parametrize("category_key", ["operation", "outcome", "error_category"])
+@pytest.mark.parametrize("log_format", [LogFormat.JSON, LogFormat.CONSOLE])
+def test_formatter_omits_unapproved_categorical_values(
+    category_key: str,
+    log_format: LogFormat,
+) -> None:
+    """Fails if content can cross the log boundary under an allowlisted category key."""
+    stream = io.StringIO()
+    settings = Settings(log_level="INFO", log_format=log_format, _env_file=None)
+    context: dict[str, UUID | str] = {
+        "connector_id": uuid7(),
+        "pubsub_message_id": "pubsub-message-1",
+        "operation": "gmail_pull",
+        "outcome": "published",
+        "error_category": "provider_transient",
+    }
+    context[category_key] = " | ".join(CATEGORY_MARKERS)
+    configure_logging(settings, stream=stream)
+
+    logging.getLogger("eva.test").warning("fixed message", extra=context)
+
+    rendered = stream.getvalue()
+    for marker in CATEGORY_MARKERS:
+        assert marker not in rendered
+    if log_format is LogFormat.JSON:
+        payload = json.loads(rendered)
+        assert category_key not in payload
+        assert payload["connector_id"] == str(context["connector_id"])
+        assert payload["pubsub_message_id"] == "pubsub-message-1"
+    else:
+        assert f"{category_key}=" not in rendered
+        assert f"connector_id={context['connector_id']}" in rendered
+        assert "pubsub_message_id=pubsub-message-1" in rendered
 
 
 def test_configure_logging_replaces_root_handlers() -> None:
