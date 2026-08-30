@@ -213,6 +213,23 @@ def test_normalize_message_uses_content_free_warnings_for_recoverable_body_defec
     ]
 
 
+@pytest.mark.parametrize("encoded", ["+w", "/w"])
+def test_normalize_message_rejects_standard_base64_alphabet(encoded: str) -> None:
+    """Fails if standard Base64 characters are accepted in Gmail base64url data."""
+    raw_message = {
+        "id": "msg-standard-base64",
+        "threadId": "thread-standard-base64",
+        "internalDate": "1788019200000",
+        "payload": {"mimeType": "text/plain", "body": {"data": encoded}},
+    }
+
+    event = normalize_message(raw_message, CONNECTOR, history_id="905")
+
+    assert event.payload["plain_text"] == ""
+    assert event.payload["html"] == ""
+    assert event.metadata["normalization_warnings"] == ["invalid_base64url"]
+
+
 def test_normalize_message_keeps_text_attachments_out_of_readable_body() -> None:
     """Fails if a text attachment is mistaken for an inline message body."""
     raw_message = {

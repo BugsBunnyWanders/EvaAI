@@ -22,6 +22,7 @@ _SELECTED_HEADERS = {
     "subject": "subject",
 }
 _INVALID_MESSAGE_MESSAGE = "invalid Gmail message"
+_BASE64URL_ALPHABET = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
 
 
 def normalize_message(
@@ -250,6 +251,9 @@ def _decode_text(
     if not isinstance(encoded, str):
         _add_warning(warnings, "invalid_body_data")
         return None
+    if not _is_base64url(encoded):
+        _add_warning(warnings, "invalid_base64url")
+        return None
     try:
         raw_bytes = b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
     except BinasciiError, ValueError:
@@ -268,6 +272,17 @@ def _decode_text(
     except UnicodeDecodeError:
         _add_warning(warnings, "utf8_decode_error")
         return raw_bytes.decode("utf-8", errors="replace")
+
+
+def _is_base64url(value: str) -> bool:
+    padding_start = value.find("=")
+    unpadded = value if padding_start == -1 else value[:padding_start]
+    padding = "" if padding_start == -1 else value[padding_start:]
+    return (
+        len(padding) <= 2
+        and all(character == "=" for character in padding)
+        and all(character in _BASE64URL_ALPHABET for character in unpadded)
+    )
 
 
 def _attachment_size(body: Mapping[str, object] | None, warnings: list[str]) -> int:
