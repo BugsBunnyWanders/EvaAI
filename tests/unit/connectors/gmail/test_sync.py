@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import cast
 from uuid import UUID, uuid7
@@ -13,6 +13,7 @@ from eva_ai.connectors.gmail.contracts import (
     GmailClient,
     GmailClientFactory,
     GmailNotification,
+    GmailProfile,
     HistoryCursorExpired,
     HistoryPage,
     MessageListPage,
@@ -213,6 +214,35 @@ class FakeRepository:
         self.busy = False
         return True
 
+    async def complete_recovery(
+        self,
+        claim: SyncClaim,
+        watch: WatchResult,
+        now: datetime,
+        next_renewal_at: datetime,
+        next_safety_sync_at: datetime,
+    ) -> bool:
+        self.calls.append("complete_recovery")
+        if self.completion_failure is not None:
+            raise self.completion_failure
+        if self.complete_failures:
+            self.complete_failures -= 1
+            return False
+        assert claim == self.claim and self.state is not None
+        self.state = self.state.model_copy(
+            update={
+                "history_id": watch.history_id,
+                "watch_expiration": watch.expiration,
+                "last_successful_sync_at": now,
+                "next_watch_renewal_at": next_renewal_at,
+                "next_safety_sync_at": next_safety_sync_at,
+                "claim_id": None,
+                "lease_expires_at": None,
+            }
+        )
+        self.busy = False
+        return True
+
     async def release_sync(self, claim: SyncClaim) -> bool:
         self.calls.append("release")
         if self.release_failure is not None:
@@ -265,6 +295,7 @@ class FakeGmailClient:
         self.message_list_calls: list[tuple[str, str | None]] = []
         self.watch_result = WatchResult("200", NOW + timedelta(days=7))
         self.watch_calls: list[str] = []
+        self.on_watch: Callable[[], Awaitable[None]] | None = None
         self.operations: list[str] = []
         self.close_calls = 0
         self.close_failures: list[BaseException] = []
@@ -282,12 +313,14 @@ class FakeGmailClient:
             raise self.message_failure
         return self.messages[message_id]
 
-    async def get_profile(self) -> str:
+    async def get_profile(self) -> GmailProfile:
         raise AssertionError("synchronization must not load the Gmail profile")
 
     async def watch(self, topic_name: str) -> WatchResult:
         self.watch_calls.append(topic_name)
         self.operations.append("watch")
+        if self.on_watch is not None:
+            await self.on_watch()
         if self.watch_failure is not None:
             raise self.watch_failure
         return self.watch_result
@@ -615,8 +648,8 @@ async def test_recovery_failure_preserves_provider_type_and_releases_claim() -> 
     assert harness.repository.state is not None and harness.repository.state.history_id == "100"
 
 
-async def test_expired_history_recovers_exact_connected_range_before_fresh_watch() -> None:
-    """Fails on a broad query, incomplete paging/dedupe, coarse-only filtering, or early watch."""
+async def test_expired_history_recovers_exact_connected_range_after_fresh_watch() -> None:
+    """Fails on a broad query, incomplete paging/dedupe, coarse filtering, or late watch."""
     connected_at = datetime.fromtimestamp(1788064200, tz=UTC)
     harness = Harness(record=connector().model_copy(update={"connected_at": connected_at}))
     harness.gmail.history_failure = HistoryCursorExpired("Gmail history cursor expired")
@@ -643,18 +676,46 @@ async def test_expired_history_recovers_exact_connected_range_before_fresh_watch
     assert [event.external_id for event in harness.events.events] == ["at-boundary", "after"]
     assert harness.gmail.watch_calls == ["projects/eva/topics/gmail"]
     assert harness.gmail.operations == [
+        "watch",
         "message:at-boundary",
         "event:at-boundary",
         "message:before",
         "message:removed",
         "message:after",
         "event:after",
-        "watch",
     ]
     assert harness.repository.state is not None
     assert harness.repository.state.history_id == "250"
+    assert harness.repository.state.watch_expiration == NOW + timedelta(days=7)
+    assert harness.repository.state.next_watch_renewal_at == NOW + timedelta(hours=24)
     assert harness.repository.state.next_safety_sync_at == NOW + timedelta(minutes=60)
     assert harness.gmail.close_calls == 1
+
+
+async def test_recovery_watch_precedes_scan_so_cutover_arrival_is_ingested_once() -> None:
+    """Fails if scan-then-watch lets a covered cutover message disappear permanently."""
+    connected_at = datetime.fromtimestamp(1788064200, tz=UTC)
+    harness = Harness(record=connector().model_copy(update={"connected_at": connected_at}))
+    harness.gmail.history_failure = HistoryCursorExpired("Gmail history cursor expired")
+    harness.gmail.message_list_pages = {None: MessageListPage((), None)}
+    harness.gmail.watch_result = WatchResult("250", NOW + timedelta(days=7))
+
+    async def arrive_at_cutover() -> None:
+        harness.gmail.message_list_pages = {None: MessageListPage(("cutover",), None)}
+        harness.gmail.messages["cutover"] = raw_message(
+            "cutover", connected_at + timedelta(milliseconds=1)
+        )
+
+    harness.gmail.on_watch = arrive_at_cutover
+
+    first = await harness.handle("250")
+    second = await harness.handle("250")
+
+    assert first == SyncResult(SyncStatus.SYNCED, CONNECTOR_ID, 1, "250")
+    assert second == SyncResult(SyncStatus.ALREADY_COVERED, CONNECTOR_ID, 0, "250")
+    assert [event.external_id for event in harness.events.events] == ["cutover"]
+    assert len(harness.events.by_key) == 1
+    assert harness.gmail.operations[:3] == ["watch", "message:cutover", "event:cutover"]
 
 
 async def test_repeated_sync_attempts_close_each_attempt_client() -> None:
@@ -767,9 +828,7 @@ async def test_recovery_failure_keeps_old_cursor_retryable(failure_boundary: str
     assert harness.repository.state is not None
     assert harness.repository.state.history_id == "100"
     assert harness.repository.busy is False
-    assert harness.gmail.watch_calls == (
-        [] if failure_boundary == "event" else ["projects/eva/topics/gmail"]
-    )
+    assert harness.gmail.watch_calls == ["projects/eva/topics/gmail"]
 
 
 async def test_invalid_message_error_is_content_free_and_prevents_cursor_advance() -> None:

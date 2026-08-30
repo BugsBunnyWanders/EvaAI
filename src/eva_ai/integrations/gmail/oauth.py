@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -15,7 +16,7 @@ class OAuthAuthorizationError(RuntimeError):
 
 
 class OAuthCredentials(Protocol):
-    def to_json(self) -> str: ...
+    def to_json(self, strip: Sequence[str] | None = None) -> str: ...
 
 
 class OAuthFlow(Protocol):
@@ -41,7 +42,9 @@ class GoogleDesktopOAuthAuthorizer:
         def authorize_sync() -> AuthorizedUserGrant:
             flow = self._flow_factory(str(client_file), _REQUIRED_SCOPES)
             credentials = flow.run_local_server(access_type="offline", prompt="consent")
-            return AuthorizedUserGrant(authorized_user_json=credentials.to_json())
+            return AuthorizedUserGrant(
+                authorized_user_json=credentials.to_json(strip=("token", "expiry"))
+            )
 
         grant: AuthorizedUserGrant | None = None
         failed = False

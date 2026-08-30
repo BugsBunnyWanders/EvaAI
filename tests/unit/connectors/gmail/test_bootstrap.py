@@ -18,6 +18,7 @@ from eva_ai.connectors.gmail.contracts import (
     CredentialStore,
     GmailClient,
     GmailClientFactory,
+    GmailProfile,
     OAuthAuthorizer,
     WatchResult,
 )
@@ -37,6 +38,7 @@ TOPIC_NAME = "projects/eva/topics/eva-gmail-notifications"
 AUTHORIZED_USER_JSON = '{"type":"authorized_user","refresh_token":"synthetic"}'
 SECRET_REFERENCE = "projects/eva/secrets/eva-gmail-oauth-connector"
 WATCH = WatchResult(history_id="812", expiration=NOW + timedelta(days=7))
+PROFILE = GmailProfile(email_address="Owner@Example.COM", history_id="811")
 
 
 class FakeRepository:
@@ -51,11 +53,11 @@ class FakeRepository:
         self.history_id: str | None = None
         self.last_error_type: str | None = None
         self.reserve_arguments: tuple[UUID, UUID, str, tuple[str, ...], datetime] | None = None
+        self.prepare_arguments: tuple[UUID, str, datetime] | None = None
         self.activation_arguments: (
             tuple[
                 UUID,
                 WatchResult,
-                datetime,
                 datetime,
                 datetime,
             ]
@@ -98,11 +100,25 @@ class FakeRepository:
         self.record = self.record.model_copy(update={"secret_reference": secret_reference})
         return self.record
 
+    async def prepare_initial_watch(
+        self,
+        connector_id: UUID,
+        history_id: str,
+        connected_at: datetime,
+    ) -> ConnectorRecord:
+        self.calls.append("prepare_initial_watch")
+        assert self.record is not None and connector_id == self.record.id
+        self.prepare_arguments = (connector_id, history_id, connected_at)
+        self.history_id = self.history_id or history_id
+        self.record = self.record.model_copy(
+            update={"connected_at": self.record.connected_at or connected_at}
+        )
+        return self.record
+
     async def activate_initial_watch(
         self,
         connector_id: UUID,
         watch: WatchResult,
-        now: datetime,
         next_renewal_at: datetime,
         next_safety_sync_at: datetime,
     ) -> ConnectorRecord:
@@ -111,17 +127,10 @@ class FakeRepository:
         self.activation_arguments = (
             connector_id,
             watch,
-            now,
             next_renewal_at,
             next_safety_sync_at,
         )
-        self.history_id = watch.history_id
-        self.record = self.record.model_copy(
-            update={
-                "status": ConnectorStatus.ACTIVE,
-                "connected_at": self.record.connected_at or now,
-            }
-        )
+        self.record = self.record.model_copy(update={"status": ConnectorStatus.ACTIVE})
         return self.record
 
     async def mark_reauthorization_required(self, connector_id: UUID, error: BaseException) -> None:
@@ -146,7 +155,7 @@ class FakeRepository:
         self.calls.append("notification")
         assert self.record is not None
         assert self.record.status == ConnectorStatus.CONNECTING
-        assert self.history_id is None
+        assert self.history_id == PROFILE.history_id
 
 
 class FakeAuthorizer:
@@ -199,9 +208,9 @@ class FakeGmailClient:
         self.on_watch = on_watch
         self.watch_topic: str | None = None
 
-    async def get_profile(self) -> str:
+    async def get_profile(self) -> GmailProfile:
         self.calls.append("get_profile")
-        return self.identity
+        return GmailProfile(email_address=self.identity, history_id=PROFILE.history_id)
 
     async def watch(self, topic_name: str) -> WatchResult:
         self.calls.append("watch")
@@ -283,8 +292,8 @@ class Harness:
         )
 
 
-async def test_connect_runs_exact_bootstrap_sequence_and_activates_from_watch_cursor() -> None:
-    """Fails on reordering, wrong boundary arguments, or cursor persistence before watch."""
+async def test_connect_persists_profile_boundary_before_watch_then_activates() -> None:
+    """Fails if the crash-safe lower cursor is not durable before the watch side effect."""
     harness = Harness()
 
     connector = await harness.connect()
@@ -296,6 +305,7 @@ async def test_connect_runs_exact_bootstrap_sequence_and_activates_from_watch_cu
         "reserve",
         "put_secret",
         "attach_secret",
+        "prepare_initial_watch",
         "watch",
         "activate",
     ]
@@ -309,17 +319,17 @@ async def test_connect_runs_exact_bootstrap_sequence_and_activates_from_watch_cu
         NOW,
     )
     assert harness.credential_store.put_arguments == (CONNECTOR_ID, AUTHORIZED_USER_JSON)
+    assert harness.repository.prepare_arguments == (CONNECTOR_ID, PROFILE.history_id, NOW)
     assert harness.gmail.watch_topic == TOPIC_NAME
     assert harness.repository.activation_arguments == (
         CONNECTOR_ID,
         WATCH,
-        NOW,
         NOW + timedelta(hours=24),
         NOW + timedelta(minutes=60),
     )
     assert connector.status == ConnectorStatus.ACTIVE
     assert connector.connected_at == NOW
-    assert harness.repository.history_id == WATCH.history_id
+    assert harness.repository.history_id == PROFILE.history_id
     assert harness.gmail.close_calls == 1
 
 
@@ -400,10 +410,64 @@ async def test_connect_uses_injected_watch_and_safety_intervals() -> None:
     await harness.connect()
 
     assert harness.repository.activation_arguments is not None
-    assert harness.repository.activation_arguments[3:] == (
+    assert harness.repository.activation_arguments[2:] == (
         NOW + timedelta(hours=6),
         NOW + timedelta(minutes=17),
     )
+
+
+async def test_connect_uses_profile_time_for_boundary_and_post_watch_time_for_scheduling() -> None:
+    """Fails if the durable lower boundary is delayed until after the external watch."""
+    harness = Harness()
+    clock_values = iter((NOW, LATER))
+    harness.service = GmailBootstrapService(
+        repository=cast(ConnectorRepository, harness.repository),
+        authorizer=cast(OAuthAuthorizer, harness.authorizer),
+        credential_store=cast(CredentialStore, harness.credential_store),
+        client_factory=cast(GmailClientFactory, harness.client_factory),
+        clock=lambda: next(clock_values),
+    )
+
+    connector = await harness.connect()
+
+    assert connector.connected_at == NOW
+    assert harness.repository.prepare_arguments == (CONNECTOR_ID, PROFILE.history_id, NOW)
+    assert harness.repository.activation_arguments is not None
+    assert harness.repository.activation_arguments[2:] == (
+        LATER + timedelta(hours=24),
+        LATER + timedelta(minutes=60),
+    )
+
+
+async def test_connect_samples_boundary_time_before_requesting_profile_cursor() -> None:
+    """Fails if an arrival between the profile response and clock sample can be filtered out."""
+    harness = Harness()
+    clock_calls = 0
+
+    def clock() -> datetime:
+        nonlocal clock_calls
+        clock_calls += 1
+        harness.calls.append(f"clock:{clock_calls}")
+        return NOW if clock_calls == 1 else LATER
+
+    harness.service = GmailBootstrapService(
+        repository=cast(ConnectorRepository, harness.repository),
+        authorizer=cast(OAuthAuthorizer, harness.authorizer),
+        credential_store=cast(CredentialStore, harness.credential_store),
+        client_factory=cast(GmailClientFactory, harness.client_factory),
+        clock=clock,
+    )
+
+    await harness.connect()
+
+    assert harness.calls[:5] == [
+        "authorize",
+        "create_client",
+        "clock:1",
+        "get_profile",
+        "reserve",
+    ]
+    assert harness.repository.prepare_arguments == (CONNECTOR_ID, PROFILE.history_id, NOW)
 
 
 async def test_connect_rejects_oauth_identity_mismatch_before_reserving_or_storing() -> None:
@@ -448,8 +512,8 @@ async def test_connect_marks_reserved_connector_when_secret_storage_fails() -> N
     assert harness.gmail.close_calls == 1
 
 
-async def test_connect_marks_reserved_connector_and_keeps_cursor_empty_when_watch_fails() -> None:
-    """Fails if a retryable watch failure requires OAuth or stores an unconfirmed cursor."""
+async def test_connect_marks_reserved_connector_and_keeps_profile_cursor_when_watch_fails() -> None:
+    """Fails if a retryable watch failure loses the durable lower cursor."""
     harness = Harness(watch_failure=GmailProviderError("Gmail API request failed"))
 
     with pytest.raises(GmailProviderError, match="Gmail API request failed"):
@@ -462,6 +526,7 @@ async def test_connect_marks_reserved_connector_and_keeps_cursor_empty_when_watc
         "reserve",
         "put_secret",
         "attach_secret",
+        "prepare_initial_watch",
         "watch",
         "mark_error",
     ]
@@ -469,7 +534,7 @@ async def test_connect_marks_reserved_connector_and_keeps_cursor_empty_when_watc
     assert harness.repository.record.status == ConnectorStatus.ERROR
     assert harness.repository.last_error_type == "GmailProviderError"
     assert harness.repository.record.secret_reference == SECRET_REFERENCE
-    assert harness.repository.history_id is None
+    assert harness.repository.history_id == PROFILE.history_id
     assert harness.gmail.close_calls == 1
 
 
@@ -484,7 +549,7 @@ async def test_connect_marks_only_authorization_revocation_for_reauthorization()
     assert harness.repository.record is not None
     assert harness.repository.record.status == ConnectorStatus.REAUTHORIZATION_REQUIRED
     assert harness.repository.last_error_type == "AuthorizationRevoked"
-    assert harness.repository.history_id is None
+    assert harness.repository.history_id == PROFILE.history_id
 
 
 @pytest.mark.parametrize(
@@ -542,7 +607,7 @@ async def test_reconnect_reuses_connector_and_preserves_original_connected_at() 
     assert reconnected.connected_at == first.connected_at == NOW
     assert reconnected.status == ConnectorStatus.ACTIVE
     assert harness.repository.activation_arguments is not None
-    assert harness.repository.activation_arguments[2] == LATER
+    assert harness.repository.activation_arguments[2] == LATER + timedelta(hours=24)
     assert harness.calls == [
         "authorize",
         "create_client",
@@ -550,6 +615,7 @@ async def test_reconnect_reuses_connector_and_preserves_original_connected_at() 
         "reserve",
         "put_secret",
         "attach_secret",
+        "prepare_initial_watch",
         "watch",
         "activate",
     ]
@@ -574,6 +640,7 @@ async def test_initial_watch_notification_observes_connecting_before_activation(
         "reserve",
         "put_secret",
         "attach_secret",
+        "prepare_initial_watch",
         "watch",
         "notification",
         "activate",

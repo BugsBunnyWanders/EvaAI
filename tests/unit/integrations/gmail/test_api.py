@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 
 import pytest
 from google.auth.exceptions import RefreshError
+from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp  # type: ignore[import-untyped]
 from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
 from httplib2 import Response  # type: ignore[import-untyped]
 
@@ -45,6 +47,7 @@ class GmailResources:
         self.calls: list[tuple[str, dict[str, object]]] = []
         self.results: dict[str, Mapping[str, object]] = {}
         self.errors: dict[str, Exception] = {}
+        self.error_sequences: dict[str, list[Exception]] = {}
         self.close_calls = 0
         self.close_failures: list[BaseException] = []
 
@@ -60,9 +63,9 @@ class GmailResources:
     def _request(self, operation: str, kwargs: dict[str, object]) -> ExecutableRequest:
         assert threading.get_ident() != self.main_thread_id
         self.calls.append((operation, kwargs))
-        return ExecutableRequest(
-            self.results.get(operation), self.main_thread_id, self.errors.get(operation)
-        )
+        error_sequence = self.error_sequences.get(operation, [])
+        error = error_sequence.pop(0) if error_sequence else self.errors.get(operation)
+        return ExecutableRequest(self.results.get(operation), self.main_thread_id, error)
 
     def getProfile(self, **kwargs: object) -> ExecutableRequest:  # noqa: N802
         return self._request("get_profile", kwargs)
@@ -89,7 +92,11 @@ async def test_gmail_client_emits_exact_requests_and_converts_provider_responses
     """Fails on a wrong Gmail endpoint shape, blocking call, or DTO conversion."""
     service = GmailResources(threading.get_ident())
     service.results = {
-        "get_profile": {"emailAddress": "owner@example.com", "messagesTotal": 3},
+        "get_profile": {
+            "emailAddress": "owner@example.com",
+            "historyId": "811",
+            "messagesTotal": 3,
+        },
         "watch": {"historyId": "812", "expiration": "1788105600000"},
         "list_history": {
             "history": [
@@ -132,7 +139,8 @@ async def test_gmail_client_emits_exact_requests_and_converts_provider_responses
     message = await client.get_message("message-1")
     listed = await client.list_message_ids("after:1788105600 label:inbox", "message-page-1")
 
-    assert profile == "owner@example.com"
+    assert profile.email_address == "owner@example.com"
+    assert profile.history_id == "811"
     assert watch.history_id == "812"
     assert watch.expiration == datetime(2026, 8, 30, 16, 0, tzinfo=UTC)
     assert history.message_ids == ("message-1", "message-2")
@@ -183,8 +191,10 @@ async def test_gmail_factory_constructs_credentials_and_service_off_the_event_lo
     main_thread_id = threading.get_ident()
     credential_json = '{"refresh_token":"factory-secret","client_id":"client-id"}'
     credentials_sentinel = object()
+    http_sentinel = object()
     service = GmailResources(main_thread_id)
     credential_calls: list[tuple[dict[str, object], tuple[str, ...]]] = []
+    transport_calls: list[tuple[object, float]] = []
     build_calls: list[tuple[str, str, object, bool]] = []
 
     def credentials_factory(info: dict[str, object], scopes: tuple[str, ...]) -> object:
@@ -192,25 +202,190 @@ async def test_gmail_factory_constructs_credentials_and_service_off_the_event_lo
         credential_calls.append((info, scopes))
         return credentials_sentinel
 
+    def http_transport_factory(credentials: object, timeout_seconds: float) -> object:
+        assert threading.get_ident() != main_thread_id
+        transport_calls.append((credentials, timeout_seconds))
+        return http_sentinel
+
     def build_service(
-        api: str, version: str, *, credentials: object, cache_discovery: bool
+        api: str, version: str, *, http: object, cache_discovery: bool
     ) -> GmailResources:
         assert threading.get_ident() != main_thread_id
-        build_calls.append((api, version, credentials, cache_discovery))
+        build_calls.append((api, version, http, cache_discovery))
         return service
 
     caplog.set_level(logging.DEBUG)
     client = await GoogleGmailClientFactory(
         credentials_factory=credentials_factory,
         build_service=build_service,
+        http_transport_factory=http_transport_factory,
     ).create(credential_json)
 
     assert isinstance(client, GoogleGmailClient)
     assert credential_calls == [
         (json.loads(credential_json), ("https://www.googleapis.com/auth/gmail.readonly",))
     ]
-    assert build_calls == [("gmail", "v1", credentials_sentinel, False)]
+    assert transport_calls == [(credentials_sentinel, 30.0)]
+    assert build_calls == [("gmail", "v1", http_sentinel, False)]
     assert "factory-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_gmail_factory_applies_request_timeout_to_socket_transport() -> None:
+    """Fails if the request deadline does not reach the blocking HTTP transport."""
+    credentials = Credentials(  # type: ignore[no-untyped-call]
+        token="synthetic-access-token",
+        refresh_token="synthetic-refresh-token",
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id="synthetic-client-id",
+        client_secret="synthetic-client-secret",
+    )
+    service = GmailResources(threading.get_ident())
+    captured_http: object | None = None
+
+    def build_service(
+        api: str,
+        version: str,
+        *,
+        http: object,
+        cache_discovery: bool,
+    ) -> GmailResources:
+        del api, version, cache_discovery
+        nonlocal captured_http
+        captured_http = http
+        return service
+
+    client = await GoogleGmailClientFactory(
+        credentials_factory=lambda *_: credentials,
+        build_service=build_service,
+        request_timeout_seconds=7.25,
+    ).create("{}")
+
+    assert isinstance(captured_http, AuthorizedHttp)
+    assert captured_http.http.timeout == 7.25
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_gmail_client_retries_transient_failures_with_bounded_backoff_and_jitter() -> None:
+    """Fails if rate limits, server errors, or socket deadlines bypass bounded retry."""
+    service = GmailResources(threading.get_ident())
+    service.results["get_profile"] = {
+        "emailAddress": "owner@example.com",
+        "historyId": "811",
+    }
+    service.error_sequences["get_profile"] = [
+        http_error(429, b'"private-rate-limit"'),
+        http_error(503, b'"private-server-response"'),
+        TimeoutError("private-socket-deadline"),
+    ]
+    delays: list[float] = []
+    random_values = iter((0.0, 0.5, 1.0))
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    client = GoogleGmailClient(
+        service,
+        retry_attempts=4,
+        retry_initial_backoff_seconds=1.0,
+        retry_max_backoff_seconds=3.0,
+        retry_jitter_ratio=0.25,
+        sleep=record_sleep,
+        randomness=lambda: next(random_values),
+    )
+
+    profile = await client.get_profile()
+
+    assert profile.email_address == "owner@example.com"
+    assert [operation for operation, _ in service.calls] == ["get_profile"] * 4
+    assert delays == [0.75, 2.0, 3.0]
+
+
+@pytest.mark.asyncio
+async def test_gmail_client_retries_reason_coded_http_403_rate_limit() -> None:
+    """Fails if Gmail's legacy 403 quota signal is treated as permanent."""
+    service = GmailResources(threading.get_ident())
+    service.results["get_profile"] = {
+        "emailAddress": "owner@example.com",
+        "historyId": "811",
+    }
+    service.error_sequences["get_profile"] = [
+        http_error(
+            403,
+            b'{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}',
+        )
+    ]
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    client = GoogleGmailClient(
+        service,
+        retry_attempts=2,
+        retry_initial_backoff_seconds=0.5,
+        retry_jitter_ratio=0.0,
+        sleep=record_sleep,
+    )
+
+    profile = await client.get_profile()
+
+    assert profile.history_id == "811"
+    assert [operation for operation, _ in service.calls] == ["get_profile"] * 2
+    assert delays == [0.5]
+
+
+@pytest.mark.asyncio
+async def test_gmail_client_stops_after_retry_attempt_limit() -> None:
+    """Fails if a transient network failure can retry without a fixed attempt bound."""
+    service = GmailResources(threading.get_ident())
+    marker = "private-network-response"
+    service.errors["get_message"] = OSError(marker)
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    client = GoogleGmailClient(
+        service,
+        retry_attempts=3,
+        retry_initial_backoff_seconds=0.1,
+        retry_max_backoff_seconds=1.0,
+        retry_jitter_ratio=0.0,
+        sleep=record_sleep,
+        randomness=lambda: 0.5,
+    )
+
+    with pytest.raises(GmailProviderError) as raised:
+        await client.get_message("message-1")
+
+    assert str(raised.value) == "Gmail API request failed"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert marker not in repr(raised.value)
+    assert [operation for operation, _ in service.calls] == ["get_message"] * 3
+    assert delays == [0.1, 0.2]
+
+
+@pytest.mark.asyncio
+async def test_gmail_client_retry_sleep_propagates_cancellation_unchanged() -> None:
+    """Fails if shutdown is delayed or reclassified after a transient Gmail failure."""
+    service = GmailResources(threading.get_ident())
+    service.errors["get_message"] = http_error(503, b'"private-server-response"')
+    cancellation = asyncio.CancelledError("retry-sleep-cancelled")
+
+    async def cancel_sleep(delay: float) -> None:
+        del delay
+        raise cancellation
+
+    client = GoogleGmailClient(service, sleep=cancel_sleep)
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await client.get_message("message-1")
+
+    assert raised.value is cancellation
+    assert [operation for operation, _ in service.calls] == ["get_message"]
 
 
 @pytest.mark.parametrize(
@@ -525,6 +700,7 @@ async def test_history_404_maps_to_content_free_cursor_expiry() -> None:
     assert str(raised.value) == "Gmail history cursor expired"
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+    assert [operation for operation, _ in service.calls] == ["list_history"]
 
 
 @pytest.mark.asyncio
@@ -541,6 +717,7 @@ async def test_invalid_grant_maps_to_content_free_authorization_revoked() -> Non
     assert str(raised.value) == "Google authorization has been revoked"
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+    assert [operation for operation, _ in service.calls] == ["get_profile"]
 
 
 @pytest.mark.asyncio

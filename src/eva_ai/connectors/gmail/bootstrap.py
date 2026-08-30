@@ -58,19 +58,20 @@ class GmailBootstrapService:
         gmail = await self._client_factory.create(grant.authorized_user_json)
 
         async def bootstrap() -> ConnectorRecord:
-            actual_identity = (await gmail.get_profile()).lower()
+            boundary_at = self._clock()
+            profile = await gmail.get_profile()
+            actual_identity = profile.email_address.lower()
             if actual_identity != command.expected_identity.lower():
                 raise AccountIdentityMismatch(
                     "authorized Gmail account does not match configuration"
                 )
 
-            now = self._clock()
             connector = await self._repository.reserve_gmail(
                 command.user_id,
                 command.workspace_id,
                 actual_identity,
                 _GMAIL_SCOPES,
-                now,
+                boundary_at,
             )
             if connector.status == ConnectorStatus.DISABLED:
                 return connector
@@ -79,13 +80,19 @@ class GmailBootstrapService:
                     connector.id, grant.authorized_user_json
                 )
                 await self._repository.attach_secret(connector.id, secret_reference)
+                # This lower profile cursor makes a post-watch crash replayable on retry.
+                await self._repository.prepare_initial_watch(
+                    connector.id,
+                    profile.history_id,
+                    boundary_at,
+                )
                 watch = await gmail.watch(command.topic_name)
+                activated_at = self._clock()
                 return await self._repository.activate_initial_watch(
                     connector.id,
                     watch,
-                    now,
-                    _renewal_due_at(watch, now, self._watch_renewal_interval),
-                    now + self._safety_sync_interval,
+                    _renewal_due_at(watch, activated_at, self._watch_renewal_interval),
+                    activated_at + self._safety_sync_interval,
                 )
             except Exception as error:
                 await self._persist_failure_state(connector.id, error)

@@ -1,11 +1,15 @@
 import asyncio
 import json
-from collections.abc import Callable, Mapping, Sequence
+import random
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import Enum, auto
 from typing import Protocol, cast
 
-from google.auth.exceptions import RefreshError
+import google_auth_httplib2  # type: ignore[import-untyped]
+import httplib2  # type: ignore[import-untyped]
+from google.auth.credentials import Credentials as GoogleCredentials
+from google.auth.exceptions import RefreshError, TransportError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore[import-untyped]
 from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
@@ -13,6 +17,7 @@ from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
 from eva_ai.connectors.gmail.contracts import (
     AuthorizationRevoked,
     GmailClient,
+    GmailProfile,
     HistoryCursorExpired,
     HistoryPage,
     MessageListPage,
@@ -21,6 +26,8 @@ from eva_ai.connectors.gmail.contracts import (
 from eva_ai.integrations.gmail.oauth import GMAIL_READONLY_SCOPE
 
 _GMAIL_SCOPES = (GMAIL_READONLY_SCOPE,)
+_TRANSIENT_HTTP_STATUSES = frozenset({408, 429})
+_TRANSIENT_HTTP_403_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
 
 
 class GmailProviderError(RuntimeError):
@@ -40,6 +47,7 @@ class _RequestFailure(Enum):
     AUTHORIZATION_REVOKED = auto()
     AUTHORIZATION_REFRESH = auto()
     HISTORY_EXPIRED = auto()
+    TRANSIENT = auto()
     PROVIDER = auto()
 
 
@@ -79,12 +87,13 @@ class BuildService(Protocol):
         api: str,
         version: str,
         *,
-        credentials: object,
+        http: object,
         cache_discovery: bool,
     ) -> object: ...
 
 
 CredentialsFactory = Callable[[dict[str, object], tuple[str, ...]], object]
+HttpTransportFactory = Callable[[object, float], object]
 
 
 def _default_credentials_factory(info: dict[str, object], scopes: tuple[str, ...]) -> object:
@@ -97,14 +106,21 @@ def _default_build_service(
     api: str,
     version: str,
     *,
-    credentials: object,
+    http: object,
     cache_discovery: bool,
 ) -> object:
     return build(
         api,
         version,
-        credentials=credentials,
+        http=http,
         cache_discovery=cache_discovery,
+    )
+
+
+def _default_http_transport_factory(credentials: object, timeout_seconds: float) -> object:
+    return google_auth_httplib2.AuthorizedHttp(
+        cast(GoogleCredentials, credentials),
+        http=httplib2.Http(timeout=timeout_seconds),
     )
 
 
@@ -113,9 +129,25 @@ class GoogleGmailClientFactory:
         self,
         credentials_factory: CredentialsFactory = _default_credentials_factory,
         build_service: BuildService = _default_build_service,
+        request_timeout_seconds: float = 30.0,
+        http_transport_factory: HttpTransportFactory = _default_http_transport_factory,
+        retry_attempts: int = 3,
+        retry_initial_backoff_seconds: float = 0.5,
+        retry_max_backoff_seconds: float = 8.0,
+        retry_jitter_ratio: float = 0.2,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        randomness: Callable[[], float] = random.random,
     ) -> None:
         self._credentials_factory = credentials_factory
         self._build_service = build_service
+        self._request_timeout_seconds = request_timeout_seconds
+        self._http_transport_factory = http_transport_factory
+        self._retry_attempts = retry_attempts
+        self._retry_initial_backoff_seconds = retry_initial_backoff_seconds
+        self._retry_max_backoff_seconds = retry_max_backoff_seconds
+        self._retry_jitter_ratio = retry_jitter_ratio
+        self._sleep = sleep
+        self._randomness = randomness
         self._clients: list[GoogleGmailClient] = []
 
     async def create(self, authorized_user_json: str) -> GmailClient:
@@ -132,15 +164,28 @@ class GoogleGmailClientFactory:
             except ValueError:
                 return _ClientCreationFailure.INVALID_CREDENTIALS
             try:
+                http = self._http_transport_factory(
+                    credentials,
+                    self._request_timeout_seconds,
+                )
                 service = self._build_service(
                     "gmail",
                     "v1",
-                    credentials=credentials,
+                    http=http,
                     cache_discovery=False,
                 )
             except HttpError:
                 return _ClientCreationFailure.PROVIDER
-            return GoogleGmailClient(service, self._release)
+            return GoogleGmailClient(
+                service,
+                self._release,
+                retry_attempts=self._retry_attempts,
+                retry_initial_backoff_seconds=self._retry_initial_backoff_seconds,
+                retry_max_backoff_seconds=self._retry_max_backoff_seconds,
+                retry_jitter_ratio=self._retry_jitter_ratio,
+                sleep=self._sleep,
+                randomness=self._randomness,
+            )
 
         async def own_construction() -> GoogleGmailClient | _ClientCreationFailure:
             try:
@@ -205,10 +250,23 @@ class GoogleGmailClient:
         self,
         service: object,
         on_closed: Callable[[GoogleGmailClient], None] | None = None,
+        *,
+        retry_attempts: int = 3,
+        retry_initial_backoff_seconds: float = 0.5,
+        retry_max_backoff_seconds: float = 8.0,
+        retry_jitter_ratio: float = 0.2,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        randomness: Callable[[], float] = random.random,
     ) -> None:
         self._service = cast(GmailService, service)
         self._on_closed = on_closed
         self._closed = False
+        self._retry_attempts = retry_attempts
+        self._retry_initial_backoff_seconds = retry_initial_backoff_seconds
+        self._retry_max_backoff_seconds = retry_max_backoff_seconds
+        self._retry_jitter_ratio = retry_jitter_ratio
+        self._sleep = sleep
+        self._randomness = randomness
 
     async def close(self) -> None:
         if self._closed:
@@ -218,14 +276,14 @@ class GoogleGmailClient:
         if self._on_closed is not None:
             self._on_closed(self)
 
-    async def get_profile(self) -> str:
+    async def get_profile(self) -> GmailProfile:
         response = await self._execute(
             lambda: self._service.users().getProfile(userId="me").execute()
         )
-        email_address = response.get("emailAddress")
-        if not isinstance(email_address, str) or not email_address:
-            raise GmailProviderError("Gmail API returned an invalid profile")
-        return email_address
+        return GmailProfile(
+            email_address=_required_string(response, "emailAddress", "profile"),
+            history_id=_required_string(response, "historyId", "profile"),
+        )
 
     async def watch(self, topic_name: str) -> WatchResult:
         response = await self._execute(
@@ -300,20 +358,35 @@ class GoogleGmailClient:
         *,
         history_request: bool = False,
     ) -> Mapping[str, object]:
-        result: Mapping[str, object] | _RequestFailure
-        try:
-            result = await asyncio.to_thread(operation)
-        except RefreshError as error:
-            details = " ".join(str(item) for item in error.args).lower()
-            if "invalid_grant" in details:
-                result = _RequestFailure.AUTHORIZATION_REVOKED
-            else:
-                result = _RequestFailure.AUTHORIZATION_REFRESH
-        except HttpError as error:
-            if history_request and getattr(error.resp, "status", None) == 404:
-                result = _RequestFailure.HISTORY_EXPIRED
-            else:
-                result = _RequestFailure.PROVIDER
+        result: Mapping[str, object] | _RequestFailure = _RequestFailure.PROVIDER
+        for attempt in range(self._retry_attempts):
+            try:
+                result = await asyncio.to_thread(operation)
+            except RefreshError as error:
+                details = " ".join(str(item) for item in error.args).lower()
+                if "invalid_grant" in details:
+                    result = _RequestFailure.AUTHORIZATION_REVOKED
+                else:
+                    result = _RequestFailure.AUTHORIZATION_REFRESH
+            except HttpError as error:
+                status = getattr(error.resp, "status", None)
+                if history_request and status == 404:
+                    result = _RequestFailure.HISTORY_EXPIRED
+                elif _is_transient_http_error(error, status) or (
+                    isinstance(status, int) and 500 <= status <= 599
+                ):
+                    result = _RequestFailure.TRANSIENT
+                else:
+                    result = _RequestFailure.PROVIDER
+            except httplib2.HttpLib2Error, OSError, TransportError:
+                result = _RequestFailure.TRANSIENT
+
+            retryable = result is _RequestFailure.AUTHORIZATION_REFRESH or (
+                result is _RequestFailure.TRANSIENT
+            )
+            if not retryable or attempt + 1 >= self._retry_attempts:
+                break
+            await self._sleep(self._retry_delay(attempt))
 
         if result is _RequestFailure.AUTHORIZATION_REVOKED:
             raise AuthorizationRevoked("Google authorization has been revoked")
@@ -321,9 +394,41 @@ class GoogleGmailClient:
             raise GmailProviderError("Gmail authorization refresh failed")
         if result is _RequestFailure.HISTORY_EXPIRED:
             raise HistoryCursorExpired("Gmail history cursor expired")
-        if result is _RequestFailure.PROVIDER:
+        if result is _RequestFailure.TRANSIENT or result is _RequestFailure.PROVIDER:
             raise GmailProviderError("Gmail API request failed")
         return result
+
+    def _retry_delay(self, retry_index: int) -> float:
+        base = min(
+            self._retry_initial_backoff_seconds * (2**retry_index),
+            self._retry_max_backoff_seconds,
+        )
+        sample = min(1.0, max(0.0, self._randomness()))
+        jitter_factor = 1.0 - self._retry_jitter_ratio + (2.0 * self._retry_jitter_ratio * sample)
+        return float(min(self._retry_max_backoff_seconds, base * jitter_factor))
+
+
+def _is_transient_http_error(error: HttpError, status: object) -> bool:
+    if status in _TRANSIENT_HTTP_STATUSES:
+        return True
+    if status != 403:
+        return False
+    try:
+        payload = json.loads(error.content)
+    except json.JSONDecodeError, TypeError, UnicodeDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    error_data = payload.get("error")
+    if not isinstance(error_data, dict):
+        return False
+    details = error_data.get("errors")
+    if not isinstance(details, list):
+        return False
+    return any(
+        isinstance(detail, dict) and detail.get("reason") in _TRANSIENT_HTTP_403_REASONS
+        for detail in details
+    )
 
 
 def _parse_expiration(expiration_millis: str) -> datetime | None:

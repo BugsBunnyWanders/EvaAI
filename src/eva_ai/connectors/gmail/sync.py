@@ -22,6 +22,7 @@ from eva_ai.integrations.gcp.secret_manager import SecretManagerProviderError
 from eva_ai.integrations.gmail.api import GmailProviderError
 
 _SAFETY_SYNC_INTERVAL = timedelta(minutes=60)
+_WATCH_RENEWAL_INTERVAL = timedelta(hours=24)
 
 
 class SyncStatus(StrEnum):
@@ -52,11 +53,13 @@ class GmailRecoveryService:
         event_service: EventService,
         topic_name: str,
         safety_sync_interval: timedelta = _SAFETY_SYNC_INTERVAL,
+        watch_renewal_interval: timedelta = _WATCH_RENEWAL_INTERVAL,
     ) -> None:
         self._repository = repository
         self._event_service = event_service
         self._topic_name = topic_name
         self._safety_sync_interval = safety_sync_interval
+        self._watch_renewal_interval = watch_renewal_interval
 
     async def recover(
         self,
@@ -69,6 +72,9 @@ class GmailRecoveryService:
         if connected_at is None or history_id is None:
             raise GmailSyncError("Gmail connector is not ready for synchronization")
 
+        # Establish the upper cutover before scanning. Notifications racing this scan stay
+        # retryable from the old durable cursor until claim-protected completion succeeds.
+        watch = await gmail.watch(self._topic_name)
         query = f"in:inbox after:{int(connected_at.timestamp())}"
         message_ids: dict[str, None] = {}
         page_token: str | None = None
@@ -91,12 +97,14 @@ class GmailRecoveryService:
             result = await self._event_service.ingest(event)
             events_created += int(result.created)
 
-        # Recovery publishes a replacement cursor only after every Event is durable.
-        watch = await gmail.watch(self._topic_name)
-        completed = await self._repository.complete_sync(
+        completed = await self._repository.complete_recovery(
             claim,
-            watch.history_id,
+            watch,
             now,
+            min(
+                now + self._watch_renewal_interval,
+                watch.expiration - self._watch_renewal_interval,
+            ),
             now + self._safety_sync_interval,
         )
         if not completed:

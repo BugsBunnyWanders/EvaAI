@@ -1,5 +1,7 @@
 import asyncio
-from typing import Protocol
+from collections.abc import Callable
+from enum import Enum, auto
+from typing import Protocol, cast
 from uuid import UUID
 
 from google.api_core.exceptions import AlreadyExists, NotFound
@@ -37,10 +39,30 @@ class SecretManagerClient(Protocol):
     ) -> AccessSecretVersionResponse: ...
 
 
+class _ClientConstructionFailure(Enum):
+    PROVIDER = auto()
+
+
+SecretManagerClientFactory = Callable[[], SecretManagerClient]
+
+
+def _default_client_factory() -> SecretManagerClient:
+    return cast(SecretManagerClient, secretmanager.SecretManagerServiceClient())
+
+
 class GoogleSecretManagerCredentialStore:
-    def __init__(self, project_id: str, client: SecretManagerClient | None = None) -> None:
+    def __init__(
+        self,
+        project_id: str,
+        client: SecretManagerClient | None = None,
+        client_factory: SecretManagerClientFactory = _default_client_factory,
+    ) -> None:
         self._project_id = project_id
         self._client = client
+        self._client_factory = client_factory
+        self._construction_owner: (
+            asyncio.Task[SecretManagerClient | _ClientConstructionFailure] | None
+        ) = None
 
     async def put(self, connector_id: UUID, authorized_user_json: str) -> str:
         client = await self._get_client()
@@ -98,10 +120,40 @@ class GoogleSecretManagerCredentialStore:
         client = self._client
         if client is not None:
             await asyncio.to_thread(client.transport.close)
-            self._client = None
+            if self._client is client:
+                self._client = None
 
     async def _get_client(self) -> SecretManagerClient:
-        if self._client is None:
-            client = await asyncio.to_thread(secretmanager.SecretManagerServiceClient)
-            self._client = client
-        return self._client
+        if self._client is not None:
+            return self._client
+
+        construction_owner = self._construction_owner
+        if construction_owner is None:
+
+            async def own_construction() -> SecretManagerClient | _ClientConstructionFailure:
+                try:
+                    return await asyncio.to_thread(self._client_factory)
+                except BaseException:
+                    return _ClientConstructionFailure.PROVIDER
+
+            construction_owner = asyncio.create_task(own_construction())
+            self._construction_owner = construction_owner
+
+        cancelled: asyncio.CancelledError | None = None
+        while True:
+            try:
+                result = await asyncio.shield(construction_owner)
+                break
+            except asyncio.CancelledError as error:
+                if cancelled is None:
+                    cancelled = error
+
+        if self._construction_owner is construction_owner:
+            self._construction_owner = None
+        if result is not _ClientConstructionFailure.PROVIDER:
+            self._client = result
+        if cancelled is not None:
+            raise cancelled
+        if result is _ClientConstructionFailure.PROVIDER:
+            raise SecretManagerProviderError("Secret Manager client construction failed")
+        return result

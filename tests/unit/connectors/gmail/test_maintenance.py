@@ -11,6 +11,7 @@ from eva_ai.connectors.gmail.contracts import (
     CredentialStore,
     GmailClient,
     GmailClientFactory,
+    GmailProfile,
     HistoryPage,
     MessageListPage,
     WatchResult,
@@ -175,7 +176,7 @@ class FakeGmailClient:
             raise self.watch_failure
         return self.watch_result
 
-    async def get_profile(self) -> str:
+    async def get_profile(self) -> GmailProfile:
         raise AssertionError("maintenance must not load profile")
 
     async def list_history(self, start_history_id: str, page_token: str | None) -> HistoryPage:

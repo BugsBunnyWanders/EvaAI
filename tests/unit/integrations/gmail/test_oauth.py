@@ -1,8 +1,12 @@
+import json
 import logging
 import threading
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from google.oauth2.credentials import Credentials
 
 from eva_ai.connectors.gmail.contracts import AuthorizedUserGrant
 from eva_ai.integrations.gmail.oauth import (
@@ -17,8 +21,9 @@ class FakeCredentials:
         self._authorized_user_json = authorized_user_json
         self._main_thread_id = main_thread_id
 
-    def to_json(self) -> str:
+    def to_json(self, strip: Sequence[str] | None = None) -> str:
         assert threading.get_ident() != self._main_thread_id
+        assert strip == ("token", "expiry")
         return self._authorized_user_json
 
 
@@ -31,6 +36,15 @@ class FakeFlow:
     def run_local_server(self, **kwargs: str) -> FakeCredentials:
         assert threading.get_ident() != self._main_thread_id
         self.local_server_calls.append(kwargs)
+        return self._credentials
+
+
+class ProductionShapedFlow:
+    def __init__(self, credentials: Credentials) -> None:
+        self._credentials = credentials
+
+    def run_local_server(self, **kwargs: str) -> Credentials:
+        del kwargs
         return self._credentials
 
 
@@ -62,6 +76,32 @@ async def test_authorize_requests_only_offline_readonly_access_without_logging_c
     assert flow.local_server_calls == [{"access_type": "offline", "prompt": "consent"}]
     assert secret_json not in caplog.text
     assert "never-log-this" not in repr(grant)
+
+
+@pytest.mark.asyncio
+async def test_authorize_persists_refresh_material_without_access_token_or_expiry() -> None:
+    """Fails if the OAuth grant copies the current bearer token into durable storage."""
+    credentials = Credentials(  # type: ignore[no-untyped-call]
+        token="short-lived-access-token",
+        refresh_token="durable-refresh-token",
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id="desktop-client-id",
+        client_secret="desktop-client-secret",
+        scopes=[GMAIL_READONLY_SCOPE],
+    )
+    credentials.expiry = datetime(2026, 8, 30, 12, 34, 56, tzinfo=UTC)
+
+    grant = await GoogleDesktopOAuthAuthorizer(
+        flow_factory=lambda *_: ProductionShapedFlow(credentials)
+    ).authorize(Path("/private/oauth-client.json"), (GMAIL_READONLY_SCOPE,))
+
+    stored = json.loads(grant.authorized_user_json)
+    assert stored["refresh_token"] == "durable-refresh-token"
+    assert stored["token_uri"] == "https://oauth2.googleapis.com/token"
+    assert stored["client_id"] == "desktop-client-id"
+    assert stored["client_secret"] == "desktop-client-secret"
+    assert stored["scopes"] == [GMAIL_READONLY_SCOPE]
+    assert {"token", "access_token", "expiry"}.isdisjoint(stored)
 
 
 @pytest.mark.asyncio

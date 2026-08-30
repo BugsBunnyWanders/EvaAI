@@ -11,7 +11,7 @@ from uuid import UUID
 
 from eva_ai.config import Settings, get_settings
 from eva_ai.connectors.gmail.bootstrap import ConnectGmail, GmailBootstrapService
-from eva_ai.connectors.gmail.maintenance import GmailMaintenanceService
+from eva_ai.connectors.gmail.maintenance import GmailMaintenanceService, MaintenanceSummary
 from eva_ai.connectors.gmail.sync import (
     GmailRecoveryService,
     GmailSyncService,
@@ -19,6 +19,7 @@ from eva_ai.connectors.gmail.sync import (
 )
 from eva_ai.connectors.gmail.worker import GmailPullWorker
 from eva_ai.connectors.repository import ConnectorRepository
+from eva_ai.connectors.types import ConnectorStatus
 from eva_ai.db.session import Database
 from eva_ai.events.service import EventService
 from eva_ai.integrations.gcp.secret_manager import GoogleSecretManagerCredentialStore
@@ -102,7 +103,13 @@ def build_gmail_dependencies(settings: Settings) -> GmailDependencies:
     database = Database(settings.database_url.get_secret_value())
     repository = ConnectorRepository(database)
     credential_store = GoogleSecretManagerCredentialStore(project_id)
-    client_factory = GoogleGmailClientFactory()
+    client_factory = GoogleGmailClientFactory(
+        request_timeout_seconds=settings.gmail_request_timeout_seconds,
+        retry_attempts=settings.gmail_retry_attempts,
+        retry_initial_backoff_seconds=settings.gmail_retry_initial_backoff_seconds,
+        retry_max_backoff_seconds=settings.gmail_retry_max_backoff_seconds,
+        retry_jitter_ratio=settings.gmail_retry_jitter_ratio,
+    )
     authorizer = GoogleDesktopOAuthAuthorizer()
     event_service = EventService(database, settings.pubsub_topic_id)
     clock = _utc_now
@@ -113,6 +120,7 @@ def build_gmail_dependencies(settings: Settings) -> GmailDependencies:
         event_service,
         topic_name,
         safety_sync_interval=safety_interval,
+        watch_renewal_interval=watch_interval,
     )
     sync_service = GmailSyncService(
         repository,
@@ -235,6 +243,8 @@ async def gmail_connect_command(
     cleanup_failed = await dependencies.close()
     _raise_after_cleanup(primary_failure, cleanup_failed)
     assert connector is not None
+    if connector.status is not ConnectorStatus.ACTIVE:
+        raise CliValidationError("Gmail connection did not become active")
     print(connector.id, file=stdout or sys.stdout)
 
 
@@ -254,8 +264,8 @@ async def gmail_sync_command(
         primary_failure = error
     cleanup_failed = await dependencies.close()
     _raise_after_cleanup(primary_failure, cleanup_failed)
-    if result is None or result.status is SyncStatus.UNKNOWN_ACCOUNT:
-        raise CliValidationError("Connector is unavailable")
+    if result is None or result.status is not SyncStatus.SYNCED:
+        raise CliValidationError("Gmail synchronization did not complete")
 
 
 async def gmail_pull_command(
@@ -283,12 +293,15 @@ async def gmail_maintain_command(
     _validate_runtime_configuration(settings, require_subscription=False)
     dependencies = dependency_builder(settings)
     primary_failure: BaseException | None = None
+    summary: MaintenanceSummary | None = None
     try:
-        await dependencies.maintenance.run_due((clock or _utc_now)())
+        summary = await dependencies.maintenance.run_due((clock or _utc_now)())
     except BaseException as error:
         primary_failure = error
     cleanup_failed = await dependencies.close()
     _raise_after_cleanup(primary_failure, cleanup_failed)
+    if summary is None or summary.failed > 0:
+        raise CliValidationError("Gmail maintenance reported failures")
 
 
 def build_command_functions(settings: Settings) -> CommandFunctions:

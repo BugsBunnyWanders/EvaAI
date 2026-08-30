@@ -100,6 +100,99 @@ class FakeSecretManagerClient:
 
 
 @pytest.mark.asyncio
+async def test_lazy_secret_manager_constructor_failure_is_fixed_and_chain_free() -> None:
+    """Fails if default-client construction exposes provider-controlled details."""
+    marker = "private-secret-manager-constructor-response"
+
+    def client_factory() -> FakeSecretManagerClient:
+        assert threading.get_ident() != threading.main_thread().ident
+        raise RuntimeError(marker)
+
+    store = GoogleSecretManagerCredentialStore(
+        "evaai-507018",
+        client_factory=client_factory,
+    )
+
+    with pytest.raises(SecretManagerProviderError) as raised:
+        await store.get("projects/evaai-507018/secrets/gmail")
+
+    assert str(raised.value) == "Secret Manager client construction failed"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert marker not in repr(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_secret_manager_use_constructs_one_client() -> None:
+    """Fails if racing first operations allocate separate Secret Manager transports."""
+    client = FakeSecretManagerClient(secret_exists=True)
+    construction_calls = 0
+
+    def client_factory() -> FakeSecretManagerClient:
+        nonlocal construction_calls
+        construction_calls += 1
+        return client
+
+    store = GoogleSecretManagerCredentialStore(
+        "evaai-507018",
+        client_factory=client_factory,
+    )
+
+    first, second = await asyncio.gather(
+        store.get("projects/evaai-507018/secrets/first"),
+        store.get("projects/evaai-507018/secrets/second"),
+    )
+
+    assert (first, second) == ("stored-secret", "stored-secret")
+    assert construction_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancellation_count", [1, 4])
+async def test_cancelled_secret_manager_construction_keeps_completed_client_owned(
+    cancellation_count: int,
+) -> None:
+    """Fails if cancellation can discard a client completed by the worker thread."""
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    client = FakeSecretManagerClient(secret_exists=True)
+    construction_calls = 0
+
+    def client_factory() -> FakeSecretManagerClient:
+        nonlocal construction_calls
+        construction_calls += 1
+        started.set()
+        try:
+            assert release.wait(timeout=2)
+            return client
+        finally:
+            finished.set()
+
+    store = GoogleSecretManagerCredentialStore(
+        "evaai-507018",
+        client_factory=client_factory,
+    )
+    operation = asyncio.create_task(store.get("projects/evaai-507018/secrets/gmail"))
+    assert await asyncio.wait_for(asyncio.to_thread(started.wait), timeout=2)
+    markers = [object() for _ in range(cancellation_count)]
+    accepted: list[bool] = []
+    for marker in markers:
+        accepted.append(operation.cancel(marker))
+        await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await operation
+
+    assert await asyncio.wait_for(asyncio.to_thread(finished.wait), timeout=2)
+    assert accepted == [True] * cancellation_count
+    assert raised.value.args == (markers[0],)
+    assert await store.get("projects/evaai-507018/secrets/gmail") == "stored-secret"
+    assert construction_calls == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("secret_exists", [False, True])
 async def test_put_creates_only_when_absent_and_always_adds_utf8_version(
     secret_exists: bool,

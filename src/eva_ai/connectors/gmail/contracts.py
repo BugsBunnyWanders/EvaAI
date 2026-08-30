@@ -14,6 +14,12 @@ class GmailNotification:
 
 
 @dataclass(frozen=True, slots=True)
+class GmailProfile:
+    email_address: str
+    history_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class WatchResult:
     history_id: str
     expiration: datetime
@@ -61,7 +67,7 @@ class GmailClientCleanupError(RuntimeError):
 
 
 class GmailClient(Protocol):
-    async def get_profile(self) -> str: ...
+    async def get_profile(self) -> GmailProfile: ...
 
     async def watch(self, topic_name: str) -> WatchResult: ...
 

@@ -96,11 +96,32 @@ class ConnectorRepository:
                 account.secret_reference = secret_reference
                 return _connector_record(account)
 
+    async def prepare_initial_watch(
+        self,
+        connector_id: UUID,
+        history_id: str,
+        connected_at: datetime,
+    ) -> ConnectorRecord:
+        async with self._database.session() as session:
+            async with session.begin():
+                account = await session.get(ConnectorAccount, connector_id, with_for_update=True)
+                if account is None:
+                    raise LookupError("connector was not found")
+                if account.secret_reference is None:
+                    raise ValueError("an initial watch boundary requires a secret reference")
+                sync = await session.get(GmailSyncState, connector_id, with_for_update=True)
+                if sync is None:
+                    raise LookupError("Gmail sync state was not found")
+                # The first verified profile is the durable lower cutover boundary. A retry
+                # may refresh the watch, but cannot replace this cursor or timestamp.
+                account.connected_at = account.connected_at or connected_at
+                sync.history_id = sync.history_id or history_id
+                return _connector_record(account)
+
     async def activate_initial_watch(
         self,
         connector_id: UUID,
         watch: WatchResult,
-        now: datetime,
         next_renewal_at: datetime,
         next_safety_sync_at: datetime,
     ) -> ConnectorRecord:
@@ -120,12 +141,11 @@ class ConnectorRepository:
                 sync = await session.get(GmailSyncState, connector_id, with_for_update=True)
                 if sync is None:
                     raise LookupError("Gmail sync state was not found")
+                if account.connected_at is None or sync.history_id is None:
+                    raise ValueError("an active connector requires an initial watch boundary")
                 account.status = ConnectorStatus.ACTIVE
-                account.connected_at = account.connected_at or now
                 account.last_error_type = None
                 account.last_error_summary = None
-                # A repeat watch refreshes scheduling but cannot move the durable cursor.
-                sync.history_id = sync.history_id or watch.history_id
                 sync.watch_expiration = watch.expiration
                 sync.next_watch_renewal_at = next_renewal_at
                 sync.next_safety_sync_at = next_safety_sync_at
@@ -243,6 +263,41 @@ class ConnectorRepository:
             .values(
                 history_id=history_id,
                 last_successful_sync_at=now,
+                next_safety_sync_at=next_safety_sync_at,
+                claim_id=None,
+                lease_expires_at=None,
+            )
+        )
+        return await self._updated(statement)
+
+    async def complete_recovery(
+        self,
+        claim: SyncClaim,
+        watch: WatchResult,
+        now: datetime,
+        next_renewal_at: datetime,
+        next_safety_sync_at: datetime,
+    ) -> bool:
+        if not watch.history_id or not watch.history_id.isdecimal():
+            return False
+        history_value = Decimal(watch.history_id)
+        cursor_is_not_lower = or_(
+            GmailSyncState.history_id.is_(None),
+            sql_cast(GmailSyncState.history_id, Numeric)
+            <= sql_cast(literal(history_value), Numeric),
+        )
+        statement = (
+            update(GmailSyncState)
+            .where(
+                GmailSyncState.connector_account_id == claim.connector.id,
+                GmailSyncState.claim_id == claim.claim_id,
+                cursor_is_not_lower,
+            )
+            .values(
+                history_id=watch.history_id,
+                watch_expiration=watch.expiration,
+                last_successful_sync_at=now,
+                next_watch_renewal_at=next_renewal_at,
                 next_safety_sync_at=next_safety_sync_at,
                 claim_id=None,
                 lease_expires_at=None,

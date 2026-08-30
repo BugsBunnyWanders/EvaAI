@@ -1,17 +1,23 @@
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import cast
 from uuid import UUID
 
 import pytest
 from sqlalchemy import func, select
 
+from eva_ai.connectors.gmail.bootstrap import ConnectGmail, GmailBootstrapService
 from eva_ai.connectors.gmail.contracts import (
+    AuthorizedUserGrant,
     CredentialStore,
     GmailClient,
     GmailClientFactory,
     GmailNotification,
+    GmailProfile,
     HistoryPage,
+    OAuthAuthorizer,
+    WatchResult,
 )
 from eva_ai.connectors.gmail.sync import (
     GmailRecoveryService,
@@ -52,6 +58,89 @@ class CheckingCredentialStore:
 
     async def put(self, connector_id: UUID, authorized_user_json: str) -> str:
         raise AssertionError("synchronization must not write credentials")
+
+
+class BootstrapCredentialStore:
+    def __init__(self) -> None:
+        self.value = '{"type":"authorized_user","refresh_token":"synthetic"}'
+
+    async def put(self, connector_id: UUID, authorized_user_json: str) -> str:
+        assert authorized_user_json == self.value
+        return f"projects/eva/secrets/{connector_id}"
+
+    async def get(self, secret_reference: str) -> str:
+        assert secret_reference.startswith("projects/eva/secrets/")
+        return self.value
+
+
+class StaticAuthorizer:
+    async def authorize(self, client_file: Path, scopes: tuple[str, ...]) -> AuthorizedUserGrant:
+        del client_file, scopes
+        return AuthorizedUserGrant(
+            authorized_user_json='{"type":"authorized_user","refresh_token":"synthetic"}'
+        )
+
+
+class BootstrapGmailClient:
+    def __init__(self, profile: GmailProfile, watch: WatchResult) -> None:
+        self.profile = profile
+        self.watch_result = watch
+        self.watch_calls = 0
+
+    async def get_profile(self) -> GmailProfile:
+        return self.profile
+
+    async def watch(self, topic_name: str) -> WatchResult:
+        assert topic_name == "projects/eva/topics/gmail"
+        self.watch_calls += 1
+        return self.watch_result
+
+    async def list_history(self, start_history_id: str, page_token: str | None) -> HistoryPage:
+        raise AssertionError("bootstrap must not list history")
+
+    async def get_message(self, message_id: str) -> Mapping[str, object]:
+        raise AssertionError("bootstrap must not fetch messages")
+
+    async def list_message_ids(self, query: str, page_token: str | None) -> object:
+        raise AssertionError("bootstrap must not scan messages")
+
+    async def close(self) -> None:
+        return None
+
+
+class SequenceClientFactory:
+    def __init__(self, clients: list[GmailClient]) -> None:
+        self.clients = clients
+
+    async def create(self, authorized_user_json: str) -> GmailClient:
+        assert "synthetic" in authorized_user_json
+        return self.clients.pop(0)
+
+
+class FailInitialActivationOnceRepository:
+    def __init__(self, real: ConnectorRepository) -> None:
+        self.real = real
+        self.failures = 1
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.real, name)
+
+    async def activate_initial_watch(
+        self,
+        connector_id: UUID,
+        watch: WatchResult,
+        next_renewal_at: datetime,
+        next_safety_sync_at: datetime,
+    ) -> object:
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("synthetic activation transaction failure")
+        return await self.real.activate_initial_watch(
+            connector_id,
+            watch,
+            next_renewal_at,
+            next_safety_sync_at,
+        )
 
 
 class UnusedCredentialStore:
@@ -98,7 +187,7 @@ class CheckingGmailClient:
             },
         }
 
-    async def get_profile(self) -> str:
+    async def get_profile(self) -> GmailProfile:
         raise AssertionError("synchronization must not load profile")
 
     async def watch(self, topic_name: str) -> object:
@@ -192,10 +281,10 @@ async def test_known_status_outcomes_durably_record_notification_before_returnin
     )
     if status != ConnectorStatus.CONNECTING:
         await repository.attach_secret(reserved.id, "projects/eva/secrets/status/versions/1")
+        await repository.prepare_initial_watch(reserved.id, "100", NOW)
         await repository.activate_initial_watch(
             reserved.id,
             gmail_watch("100", NOW + timedelta(days=7)),
-            NOW,
             NOW + timedelta(days=1),
             NOW + timedelta(hours=1),
         )
@@ -249,10 +338,10 @@ async def test_crash_replay_creates_one_backbone_and_advances_cursor_after_retry
     await real_repository.attach_secret(
         reserved.id, "projects/eva/secrets/gmail-ingestion/versions/1"
     )
+    await real_repository.prepare_initial_watch(reserved.id, "100", NOW)
     await real_repository.activate_initial_watch(
         reserved.id,
         gmail_watch("100", NOW + timedelta(days=7)),
-        NOW,
         NOW + timedelta(days=1),
         NOW + timedelta(hours=1),
     )
@@ -306,3 +395,113 @@ async def test_crash_replay_creates_one_backbone_and_advances_cursor_after_retry
     assert final_state is not None and final_state.history_id == "101"
     assert final_state.last_notification_at == NOW
     assert final_state.claim_id is None and final_state.lease_expires_at is None
+
+
+@pytest.mark.integration
+async def test_successful_initial_watch_activation_crash_replays_from_profile_boundary_once(
+    database: Database,
+) -> None:
+    """Fails if retry replaces the only cursor able to discover post-watch crash mail."""
+    scope = await create_scope(database)
+    identity = f"bootstrap-crash+{scope.workspace_id}@example.com"
+    real_repository = ConnectorRepository(database)
+    repository = FailInitialActivationOnceRepository(real_repository)
+    credential_store = BootstrapCredentialStore()
+    first_client = BootstrapGmailClient(
+        GmailProfile(identity, "100"),
+        gmail_watch("150", NOW + timedelta(days=7)),
+    )
+    second_client = BootstrapGmailClient(
+        GmailProfile(identity, "200"),
+        gmail_watch("250", NOW + timedelta(days=7, minutes=1)),
+    )
+    sync_client = CheckingGmailClient(database, UUID(int=0))
+    factory = SequenceClientFactory(
+        [
+            cast(GmailClient, first_client),
+            cast(GmailClient, second_client),
+            cast(GmailClient, sync_client),
+        ]
+    )
+    clock_values = iter(
+        (
+            NOW,
+            NOW + timedelta(seconds=1),
+            NOW + timedelta(minutes=1),
+            NOW + timedelta(minutes=1, seconds=1),
+        )
+    )
+    bootstrap = GmailBootstrapService(
+        repository=cast(ConnectorRepository, repository),
+        authorizer=cast(OAuthAuthorizer, StaticAuthorizer()),
+        credential_store=cast(CredentialStore, credential_store),
+        client_factory=cast(GmailClientFactory, factory),
+        clock=lambda: next(clock_values),
+    )
+    command = ConnectGmail(
+        user_id=scope.user_id,
+        workspace_id=scope.workspace_id,
+        expected_identity=identity,
+        client_file=Path("synthetic-client.json"),
+        topic_name="projects/eva/topics/gmail",
+    )
+
+    with pytest.raises(RuntimeError, match="activation transaction failure"):
+        await bootstrap.connect(command)
+
+    failed_connector = await real_repository.find_by_identity(identity)
+    assert failed_connector is not None
+    failed_state = await real_repository.get_sync_state(failed_connector.id)
+    assert failed_connector.status == ConnectorStatus.ERROR
+    assert failed_state is not None and failed_state.history_id == "100"
+    sync_client.connector_id = failed_connector.id
+
+    active = await bootstrap.connect(command)
+    activated_state = await real_repository.get_sync_state(active.id)
+    assert active.status == ConnectorStatus.ACTIVE
+    assert active.connected_at == NOW
+    assert activated_state is not None and activated_state.history_id == "100"
+    assert first_client.watch_calls == second_client.watch_calls == 1
+
+    event_service = CheckingEventService(database, active.id)
+    sync_service = GmailSyncService(
+        repository=real_repository,
+        credential_store=cast(CredentialStore, credential_store),
+        client_factory=cast(GmailClientFactory, factory),
+        event_service=cast(EventService, event_service),
+        clock=lambda: NOW + timedelta(minutes=2),
+        lease_seconds=300,
+        recovery_service=GmailRecoveryService(
+            repository=real_repository,
+            event_service=cast(EventService, event_service),
+            topic_name="projects/eva/topics/gmail",
+        ),
+    )
+    notification = GmailNotification(identity, "101")
+
+    first_sync = await sync_service.handle(notification)
+    second_sync = await sync_service.handle(notification)
+
+    async with database.session() as session:
+        counts = (
+            await session.scalar(
+                select(func.count())
+                .select_from(Event)
+                .where(Event.workspace_id == scope.workspace_id)
+            ),
+            await session.scalar(
+                select(func.count())
+                .select_from(EventProcessing)
+                .join(Event, Event.id == EventProcessing.event_id)
+                .where(Event.workspace_id == scope.workspace_id)
+            ),
+            await session.scalar(
+                select(func.count())
+                .select_from(OutboxMessage)
+                .join(Event, Event.id == OutboxMessage.event_id)
+                .where(Event.workspace_id == scope.workspace_id)
+            ),
+        )
+    assert first_sync.status == SyncStatus.SYNCED
+    assert second_sync.status == SyncStatus.ALREADY_COVERED
+    assert counts == (1, 1, 1)

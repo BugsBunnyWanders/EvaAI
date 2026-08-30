@@ -37,10 +37,10 @@ async def reserve_active(
         now,
     )
     await repository.attach_secret(connector.id, "projects/eva/secrets/gmail/versions/1")
+    await repository.prepare_initial_watch(connector.id, history_id, now)
     await repository.activate_initial_watch(
         connector.id,
         gmail_watch(history_id, now + timedelta(days=7)),
-        now,
         now + timedelta(days=1),
         now + timedelta(hours=1),
     )
@@ -161,13 +161,57 @@ async def test_initial_activation_requires_a_secret_reference(database: Database
         await repository.activate_initial_watch(
             connector.id,
             gmail_watch("100", NOW + timedelta(days=7)),
-            NOW,
             NOW + timedelta(days=1),
             NOW + timedelta(hours=1),
         )
 
     stored = await repository.get(connector.id)
     assert stored is not None and stored.status == ConnectorStatus.CONNECTING
+
+
+@pytest.mark.integration
+async def test_initial_profile_boundary_survives_watch_activation_failure_and_retry(
+    database: Database,
+) -> None:
+    """Fails if a later watch can replace the durable pre-side-effect lower cursor."""
+    scope = await create_scope(database)
+    repository = ConnectorRepository(database)
+    connector = await repository.reserve_gmail(
+        scope.user_id, scope.workspace_id, "owner@example.com", ("scope",), NOW
+    )
+    await repository.attach_secret(connector.id, "projects/eva/secrets/gmail/versions/1")
+
+    prepared = await repository.prepare_initial_watch(connector.id, "100", NOW)
+    await repository.mark_error(connector.id, RuntimeError("activation failed"))
+    retried = await repository.reserve_gmail(
+        scope.user_id,
+        scope.workspace_id,
+        "owner@example.com",
+        ("scope",),
+        NOW + timedelta(minutes=1),
+    )
+    await repository.attach_secret(connector.id, "projects/eva/secrets/gmail/versions/2")
+    preserved = await repository.prepare_initial_watch(
+        connector.id,
+        "200",
+        NOW + timedelta(minutes=1),
+    )
+    activated = await repository.activate_initial_watch(
+        connector.id,
+        gmail_watch("300", NOW + timedelta(days=7)),
+        NOW + timedelta(days=1),
+        NOW + timedelta(hours=1),
+    )
+    state = await repository.get_sync_state(connector.id)
+
+    assert prepared.connected_at == NOW
+    assert retried.id == connector.id
+    assert preserved.connected_at == NOW
+    assert activated.status == ConnectorStatus.ACTIVE
+    assert activated.connected_at == NOW
+    assert state is not None
+    assert state.history_id == "100"
+    assert state.watch_expiration == NOW + timedelta(days=7)
 
 
 @pytest.mark.integration
@@ -187,7 +231,6 @@ async def test_initial_activation_preserves_first_connection_boundary_on_reautho
     reactivated = await repository.activate_initial_watch(
         connector_id,
         gmail_watch("200", NOW + timedelta(days=14)),
-        NOW + timedelta(days=2),
         NOW + timedelta(days=3),
         NOW + timedelta(days=2, hours=1),
     )
@@ -206,7 +249,6 @@ async def test_initial_activation_preserves_first_connection_boundary_on_reautho
     repeated = await repository.activate_initial_watch(
         connector_id,
         gmail_watch("300", NOW + timedelta(days=21)),
-        NOW + timedelta(days=4),
         NOW + timedelta(days=5),
         NOW + timedelta(days=4, hours=1),
     )
@@ -294,6 +336,37 @@ async def test_complete_sync_advances_only_nonblank_nondecreasing_history_cursor
     assert lower is False and blank is False
     assert state is not None and state.history_id == "101"
     assert state.claim_id == next_claim.claim_id
+
+
+@pytest.mark.integration
+async def test_complete_recovery_commits_watch_cursor_and_scheduling_under_claim(
+    database: Database,
+) -> None:
+    """Fails if recovery exposes a cursor without the matching replacement-watch state."""
+    scope = await create_scope(database)
+    repository = ConnectorRepository(database)
+    connector_id = await reserve_active(repository, scope)
+    claim = await repository.claim_sync(connector_id, NOW, lease_seconds=300)
+    assert claim is not None
+    watch = gmail_watch("250", NOW + timedelta(days=7))
+
+    completed = await repository.complete_recovery(
+        claim,
+        watch,
+        NOW + timedelta(minutes=1),
+        NOW + timedelta(days=1),
+        NOW + timedelta(hours=1),
+    )
+    state = await repository.get_sync_state(connector_id)
+
+    assert completed is True
+    assert state is not None
+    assert state.history_id == "250"
+    assert state.watch_expiration == watch.expiration
+    assert state.next_watch_renewal_at == NOW + timedelta(days=1)
+    assert state.next_safety_sync_at == NOW + timedelta(hours=1)
+    assert state.last_successful_sync_at == NOW + timedelta(minutes=1)
+    assert state.claim_id is None and state.lease_expires_at is None
 
 
 @pytest.mark.integration
@@ -491,7 +564,6 @@ async def test_error_transition_is_sanitized_and_retry_reservation_restores_conn
     recovered = await repository.activate_initial_watch(
         connector_id,
         gmail_watch("new-watch-boundary", NOW + timedelta(days=8)),
-        NOW + timedelta(minutes=1),
         NOW + timedelta(days=1),
         NOW + timedelta(hours=1),
     )

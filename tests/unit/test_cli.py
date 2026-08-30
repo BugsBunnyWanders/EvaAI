@@ -170,6 +170,50 @@ def test_command_failure_has_one_fixed_content_free_error(
     assert captured.err == "eva: command failed\n"
 
 
+@pytest.mark.parametrize(
+    ("arguments", "failed_command"),
+    [
+        (
+            [
+                "gmail",
+                "connect",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+            ],
+            "gmail_connect",
+        ),
+        (["gmail", "sync", "--connector-id", str(CONNECTOR_ID)], "gmail_sync"),
+        (["gmail", "maintain"], "gmail_maintain"),
+    ],
+)
+def test_main_returns_nonzero_for_each_failed_one_shot_command(
+    arguments: list[str],
+    failed_command: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Fails if command-level truthful failures are converted back to zero exits."""
+    functions, commands = command_functions()
+
+    async def fail(*_: object) -> None:
+        raise CliValidationError("One-shot Gmail operation did not complete")
+
+    functions = CommandFunctions(
+        scope_create=functions.scope_create,
+        gmail_connect=fail if failed_command == "gmail_connect" else functions.gmail_connect,
+        gmail_sync=fail if failed_command == "gmail_sync" else functions.gmail_sync,
+        gmail_pull=functions.gmail_pull,
+        gmail_maintain=(fail if failed_command == "gmail_maintain" else functions.gmail_maintain),
+    )
+
+    assert main(arguments, command_functions=functions) == 1
+    assert commands[failed_command].calls == []
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "eva: command failed\n"
+
+
 class FakeSession:
     def __init__(self) -> None:
         self.added: list[object] = []
@@ -257,6 +301,7 @@ async def test_local_scope_inserts_one_user_and_workspace_in_one_transaction() -
 class FakeBootstrap:
     def __init__(self) -> None:
         self.commands: list[ConnectGmail] = []
+        self.status = ConnectorStatus.ACTIVE
 
     async def connect(self, command: ConnectGmail) -> ConnectorRecord:
         self.commands.append(command)
@@ -267,7 +312,7 @@ class FakeBootstrap:
             provider="gmail",
             account_identity=command.expected_identity,
             granted_scopes=("https://www.googleapis.com/auth/gmail.readonly",),
-            status=ConnectorStatus.ACTIVE,
+            status=self.status,
             secret_reference="projects/eva/secrets/synthetic",
             connected_at=NOW,
         )
@@ -276,22 +321,25 @@ class FakeBootstrap:
 class FakeSync:
     def __init__(self) -> None:
         self.connector_ids: list[UUID] = []
+        self.status = SyncStatus.SYNCED
 
     async def sync_connector(self, connector_id: UUID) -> SyncResult:
         self.connector_ids.append(connector_id)
-        return SyncResult(SyncStatus.SYNCED, connector_id, 0, "100")
+        result_connector_id = None if self.status is SyncStatus.UNKNOWN_ACCOUNT else connector_id
+        return SyncResult(self.status, result_connector_id, 0, "100")
 
 
 class FakeMaintenance:
     def __init__(self) -> None:
         self.calls: list[datetime] = []
         self.failure: BaseException | None = None
+        self.summary = MaintenanceSummary(renewed=0, safety_synced=0, failed=0)
 
     async def run_due(self, now: datetime) -> MaintenanceSummary:
         self.calls.append(now)
         if self.failure is not None:
             raise self.failure
-        return MaintenanceSummary(renewed=0, safety_synced=0, failed=0)
+        return self.summary
 
 
 class FakeWorker:
@@ -345,6 +393,11 @@ async def test_builder_wires_every_non_default_runtime_setting() -> None:
             gmail_pull_timeout_seconds=13,
             gmail_watch_renewal_hours=7,
             gmail_safety_sync_minutes=19,
+            gmail_request_timeout_seconds=11.5,
+            gmail_retry_attempts=5,
+            gmail_retry_initial_backoff_seconds=0.75,
+            gmail_retry_max_backoff_seconds=6.0,
+            gmail_retry_jitter_ratio=0.1,
         )
     )
 
@@ -357,12 +410,18 @@ async def test_builder_wires_every_non_default_runtime_setting() -> None:
     assert dependencies.worker._pull_timeout_seconds == 13
     assert dependencies.bootstrap._watch_renewal_interval == timedelta(hours=7)
     assert dependencies.maintenance._watch_renewal_interval == timedelta(hours=7)
+    assert dependencies.sync_service._recovery_service._watch_renewal_interval == timedelta(hours=7)
     assert dependencies.bootstrap._safety_sync_interval == timedelta(minutes=19)
     assert dependencies.sync_service._safety_sync_interval == timedelta(minutes=19)
     assert dependencies.sync_service._recovery_service._safety_sync_interval == timedelta(
         minutes=19
     )
     assert dependencies.maintenance._safety_sync_interval == timedelta(minutes=19)
+    assert dependencies.client_factory._request_timeout_seconds == 11.5
+    assert dependencies.client_factory._retry_attempts == 5
+    assert dependencies.client_factory._retry_initial_backoff_seconds == 0.75
+    assert dependencies.client_factory._retry_max_backoff_seconds == 6.0
+    assert dependencies.client_factory._retry_jitter_ratio == 0.1
     assert dependencies.sync_service._recovery_service._topic_name == (
         "projects/settings-project/topics/settings-gmail-topic"
     )
@@ -511,6 +570,47 @@ async def test_connect_uses_fully_qualified_topic_and_prints_only_connector_uuid
     assert database.close_calls == 1
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        ConnectorStatus.CONNECTING,
+        ConnectorStatus.REAUTHORIZATION_REQUIRED,
+        ConnectorStatus.DISABLED,
+        ConnectorStatus.ERROR,
+    ],
+)
+async def test_connect_rejects_every_non_active_result_after_cleanup(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    status: ConnectorStatus,
+) -> None:
+    """Fails if a persisted non-active connector produces a zero exit command."""
+    client_file = tmp_path / "client.json"
+    client_file.write_text("synthetic-not-parsed", encoding="utf-8")
+    database = FakeDatabase()
+    dependencies = FakeDependencies()
+    dependencies.bootstrap.status = status
+
+    async def valid_scope(_: Database, __: UUID, ___: UUID) -> bool:
+        return True
+
+    with pytest.raises(CliValidationError) as raised:
+        await gmail_connect_command(
+            USER_ID,
+            WORKSPACE_ID,
+            settings=configured_settings(client_file),
+            database_factory=lambda _: cast(Database, database),
+            scope_validator=valid_scope,
+            dependency_builder=lambda *_: cast(GmailDependencies, dependencies),
+        )
+
+    assert str(raised.value) == "Gmail connection did not become active"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert capsys.readouterr().out == ""
+    assert dependencies.close_calls == 1
+
+
 async def test_scope_create_prints_only_ids_and_closes_database(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -547,6 +647,34 @@ async def test_sync_is_one_stored_cursor_attempt_and_closes_all_resources() -> N
     assert dependencies.close_calls == 1
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        SyncStatus.ALREADY_COVERED,
+        SyncStatus.BUSY,
+        SyncStatus.CONNECTING,
+        SyncStatus.REAUTHORIZATION_REQUIRED,
+        SyncStatus.UNKNOWN_ACCOUNT,
+    ],
+)
+async def test_sync_rejects_every_non_synced_result_after_cleanup(status: SyncStatus) -> None:
+    """Fails if a one-shot sync reports success without completing synchronization."""
+    dependencies = FakeDependencies()
+    dependencies.sync_service.status = status
+
+    with pytest.raises(CliValidationError) as raised:
+        await gmail_sync_command(
+            CONNECTOR_ID,
+            settings=Settings(_env_file=None, pubsub_project_id="eva-project"),
+            dependency_builder=lambda *_: cast(GmailDependencies, dependencies),
+        )
+
+    assert str(raised.value) == "Gmail synchronization did not complete"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert dependencies.close_calls == 1
+
+
 async def test_maintain_runs_one_due_pass_with_injected_clock() -> None:
     """Fails if maintain loops or ignores the command's deterministic current time."""
     dependencies = FakeDependencies()
@@ -558,6 +686,24 @@ async def test_maintain_runs_one_due_pass_with_injected_clock() -> None:
     )
 
     assert dependencies.maintenance.calls == [NOW]
+    assert dependencies.close_calls == 1
+
+
+async def test_maintain_rejects_summary_with_failures_after_cleanup() -> None:
+    """Fails if counted maintenance failures still produce a zero exit command."""
+    dependencies = FakeDependencies()
+    dependencies.maintenance.summary = MaintenanceSummary(renewed=1, safety_synced=2, failed=1)
+
+    with pytest.raises(CliValidationError) as raised:
+        await gmail_maintain_command(
+            settings=Settings(_env_file=None, pubsub_project_id="eva-project"),
+            dependency_builder=lambda *_: cast(GmailDependencies, dependencies),
+            clock=lambda: NOW,
+        )
+
+    assert str(raised.value) == "Gmail maintenance reported failures"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
     assert dependencies.close_calls == 1
 
 
