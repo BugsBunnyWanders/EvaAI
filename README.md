@@ -1,6 +1,6 @@
 # Eva AI
 
-Eva is a proactive, event-driven personal AI operator. The repository currently contains the Milestone 0 application foundation.
+Eva is a proactive, event-driven personal AI operator. The repository contains the application foundation, durable Event backbone, and local Gmail ingestion worker.
 
 ## Requirements
 
@@ -27,6 +27,22 @@ curl http://127.0.0.1:8000/health/ready
 ```
 
 Both endpoints return HTTP 200 when the application and database are ready.
+
+## Gmail ingestion
+
+Milestone 2 adds Desktop OAuth bootstrap, Gmail watch/history synchronization, a Google Pub/Sub pull subscriber, persisted watch maintenance, and expired-cursor recovery. Setup requires manual Google Auth Platform configuration and local GCP resources; follow the [Gmail ingestion operator guide](docs/gmail-setup.md) before running the worker.
+
+The local command surface is:
+
+```bash
+uv run eva scope create --display-name "Saswat Ray" --workspace-name personal
+uv run eva gmail connect --user-id USER_UUID --workspace-id WORKSPACE_UUID
+uv run eva gmail sync --connector-id CONNECTOR_UUID
+uv run eva gmail pull
+uv run eva gmail maintain
+```
+
+There is no public Gmail webhook or HTTP ingestion endpoint. Gmail notifications are consumed from the configured pull subscription.
 
 ## Verification
 
@@ -68,6 +84,4 @@ uses Application Default Credentials and requires `EVA_PUBSUB_PROJECT_ID`; this 
 does not create any GCP resources. Publication is at-least-once, so event handling remains
 idempotent across redelivery.
 
-Milestone 1 provides one-pass composition helpers only. It does not add a subscriber,
-long-running worker loop, or public endpoint. Telegram and Gmail behavior are deferred to
-later milestones.
+Milestone 1's Event and Outbox reliability boundary is reused by the Milestone 2 Gmail subscriber. Telegram behavior remains deferred.

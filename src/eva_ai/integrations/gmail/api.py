@@ -70,6 +70,8 @@ class UsersResource(Protocol):
 class GmailService(Protocol):
     def users(self) -> UsersResource: ...
 
+    def close(self) -> None: ...
+
 
 class BuildService(Protocol):
     def __call__(
@@ -114,6 +116,7 @@ class GoogleGmailClientFactory:
     ) -> None:
         self._credentials_factory = credentials_factory
         self._build_service = build_service
+        self._clients: list[GoogleGmailClient] = []
 
     async def create(self, authorized_user_json: str) -> GmailClient:
         def create_sync() -> GoogleGmailClient | _ClientCreationFailure:
@@ -144,12 +147,25 @@ class GoogleGmailClientFactory:
             raise InvalidAuthorizedUserCredentials("authorized-user credentials are invalid")
         if result is _ClientCreationFailure.PROVIDER:
             raise GmailProviderError("Gmail client construction failed")
+        self._clients.append(result)
         return result
+
+    async def close(self) -> None:
+        clients, self._clients = self._clients, []
+        for client in clients:
+            await client.close()
 
 
 class GoogleGmailClient:
     def __init__(self, service: object) -> None:
         self._service = cast(GmailService, service)
+        self._closed = False
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await asyncio.to_thread(self._service.close)
 
     async def get_profile(self) -> str:
         response = await self._execute(

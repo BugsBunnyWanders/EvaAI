@@ -29,6 +29,8 @@ class SecretManagerClient(Protocol):
         self, *, request: dict[str, object]
     ) -> AccessSecretVersionResponse: ...
 
+    def close(self) -> None: ...
+
 
 class GoogleSecretManagerCredentialStore:
     def __init__(self, project_id: str, client: SecretManagerClient | None = None) -> None:
@@ -86,6 +88,11 @@ class GoogleSecretManagerCredentialStore:
         if result is None:
             raise SecretManagerProviderError("Secret Manager credential read failed")
         return result
+
+    async def close(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            await asyncio.to_thread(client.close)
 
     async def _get_client(self) -> SecretManagerClient:
         if self._client is None:

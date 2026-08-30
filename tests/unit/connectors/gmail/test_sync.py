@@ -413,6 +413,29 @@ async def test_empty_history_still_durably_advances_to_provider_final_cursor() -
     assert harness.repository.state.history_id == "108"
 
 
+async def test_sync_uses_injected_safety_interval_for_next_due_time() -> None:
+    """Fails if the typed safety setting cannot control ordinary sync scheduling."""
+    harness = Harness()
+    harness.service = GmailSyncService(
+        repository=cast(ConnectorRepository, harness.repository),
+        credential_store=cast(CredentialStore, harness.credentials),
+        client_factory=cast(GmailClientFactory, harness.factory),
+        event_service=cast(EventService, harness.events),
+        clock=lambda: NOW,
+        lease_seconds=300,
+        recovery_service=harness.recovery,
+        safety_sync_interval=timedelta(minutes=17),
+    )
+    harness.gmail.pages = {
+        None: HistoryPage(message_ids=(), history_id="108", next_page_token=None)
+    }
+
+    await harness.handle(history_id="108")
+
+    assert harness.repository.state is not None
+    assert harness.repository.state.next_safety_sync_at == NOW + timedelta(minutes=17)
+
+
 async def test_already_covered_notification_uses_persisted_cursor_without_provider_work() -> None:
     """Fails if an old wake hint can move the cursor backward or start provider work."""
     harness = Harness(state=sync_record("500"))

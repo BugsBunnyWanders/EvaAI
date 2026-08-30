@@ -311,6 +311,28 @@ async def test_connect_runs_exact_bootstrap_sequence_and_activates_from_watch_cu
     assert harness.repository.history_id == WATCH.history_id
 
 
+async def test_connect_uses_injected_watch_and_safety_intervals() -> None:
+    """Fails if typed scheduling settings cannot change initial persisted due times."""
+    harness = Harness()
+    harness.service = GmailBootstrapService(
+        repository=cast(ConnectorRepository, harness.repository),
+        authorizer=cast(OAuthAuthorizer, harness.authorizer),
+        credential_store=cast(CredentialStore, harness.credential_store),
+        client_factory=cast(GmailClientFactory, harness.client_factory),
+        clock=lambda: NOW,
+        watch_renewal_interval=timedelta(hours=6),
+        safety_sync_interval=timedelta(minutes=17),
+    )
+
+    await harness.connect()
+
+    assert harness.repository.activation_arguments is not None
+    assert harness.repository.activation_arguments[3:] == (
+        NOW + timedelta(hours=6),
+        NOW + timedelta(minutes=17),
+    )
+
+
 async def test_connect_rejects_oauth_identity_mismatch_before_reserving_or_storing() -> None:
     """Fails if OAuth identity can select ownership or mismatches leave persisted state."""
     harness = Harness(identity="unexpected@example.com")

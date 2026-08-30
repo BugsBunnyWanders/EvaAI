@@ -41,12 +41,16 @@ class GmailBootstrapService:
         credential_store: CredentialStore,
         client_factory: GmailClientFactory,
         clock: Callable[[], datetime],
+        watch_renewal_interval: timedelta = _WATCH_RENEWAL_INTERVAL,
+        safety_sync_interval: timedelta = _SAFETY_SYNC_INTERVAL,
     ) -> None:
         self._repository = repository
         self._authorizer = authorizer
         self._credential_store = credential_store
         self._client_factory = client_factory
         self._clock = clock
+        self._watch_renewal_interval = watch_renewal_interval
+        self._safety_sync_interval = safety_sync_interval
 
     async def connect(self, command: ConnectGmail) -> ConnectorRecord:
         grant = await self._authorizer.authorize(command.client_file, _GMAIL_SCOPES)
@@ -75,8 +79,8 @@ class GmailBootstrapService:
                 connector.id,
                 watch,
                 now,
-                _renewal_due_at(watch, now),
-                now + _SAFETY_SYNC_INTERVAL,
+                _renewal_due_at(watch, now, self._watch_renewal_interval),
+                now + self._safety_sync_interval,
             )
         except Exception as error:
             await self._persist_failure_state(connector.id, error)
@@ -93,8 +97,12 @@ class GmailBootstrapService:
             error.add_note("connector failure state could not be persisted")
 
 
-def _renewal_due_at(watch: WatchResult, now: datetime) -> datetime:
+def _renewal_due_at(
+    watch: WatchResult,
+    now: datetime,
+    renewal_interval: timedelta = _WATCH_RENEWAL_INTERVAL,
+) -> datetime:
     return min(
-        now + _WATCH_RENEWAL_INTERVAL,
-        watch.expiration - _WATCH_RENEWAL_INTERVAL,
+        now + renewal_interval,
+        watch.expiration - renewal_interval,
     )

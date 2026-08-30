@@ -50,10 +50,12 @@ class GmailRecoveryService:
         repository: ConnectorRepository,
         event_service: EventService,
         topic_name: str,
+        safety_sync_interval: timedelta = _SAFETY_SYNC_INTERVAL,
     ) -> None:
         self._repository = repository
         self._event_service = event_service
         self._topic_name = topic_name
+        self._safety_sync_interval = safety_sync_interval
 
     async def recover(
         self,
@@ -94,7 +96,7 @@ class GmailRecoveryService:
             claim,
             watch.history_id,
             now,
-            now + _SAFETY_SYNC_INTERVAL,
+            now + self._safety_sync_interval,
         )
         if not completed:
             raise GmailSyncError("Gmail synchronization claim is no longer current")
@@ -116,6 +118,7 @@ class GmailSyncService:
         clock: Callable[[], datetime],
         lease_seconds: int,
         recovery_service: GmailRecoveryService,
+        safety_sync_interval: timedelta = _SAFETY_SYNC_INTERVAL,
     ) -> None:
         self._repository = repository
         self._credential_store = credential_store
@@ -124,6 +127,7 @@ class GmailSyncService:
         self._clock = clock
         self._lease_seconds = lease_seconds
         self._recovery_service = recovery_service
+        self._safety_sync_interval = safety_sync_interval
 
     async def handle(self, notification: GmailNotification) -> SyncResult:
         connector = await _await_repository(
@@ -243,7 +247,7 @@ class GmailSyncService:
                 claim,
                 final_history_id,
                 completed_at,
-                completed_at + _SAFETY_SYNC_INTERVAL,
+                completed_at + self._safety_sync_interval,
             )
             if not completed:
                 raise GmailSyncError("Gmail synchronization claim is no longer current")

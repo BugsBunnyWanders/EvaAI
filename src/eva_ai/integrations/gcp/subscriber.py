@@ -92,8 +92,10 @@ class GooglePullSubscriber:
         )
 
     async def close(self) -> None:
-        if self._client is not None:
-            await asyncio.to_thread(self._client.close)
+        client, self._client = self._client, None
+        self._subscription_path = None
+        if client is not None:
+            await asyncio.to_thread(client.close)
 
     async def _client_and_path(self) -> tuple[SubscriberClient, str]:
         if self._client is None:

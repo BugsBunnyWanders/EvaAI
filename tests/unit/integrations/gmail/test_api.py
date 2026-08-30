@@ -43,6 +43,7 @@ class GmailResources:
         self.calls: list[tuple[str, dict[str, object]]] = []
         self.results: dict[str, Mapping[str, object]] = {}
         self.errors: dict[str, Exception] = {}
+        self.close_calls = 0
 
     def users(self) -> GmailResources:
         return self
@@ -72,6 +73,10 @@ class GmailResources:
 
     def get(self, **kwargs: object) -> ExecutableRequest:
         return self._request("get_message", kwargs)
+
+    def close(self) -> None:
+        assert threading.get_ident() != self.main_thread_id
+        self.close_calls += 1
 
 
 @pytest.mark.asyncio
@@ -201,6 +206,31 @@ async def test_gmail_factory_constructs_credentials_and_service_off_the_event_lo
     ]
     assert build_calls == [("gmail", "v1", credentials_sentinel, False)]
     assert "factory-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_gmail_factory_closes_every_created_client_once_off_event_loop() -> None:
+    """Fails if command cleanup leaks Gmail HTTP clients or closes one twice."""
+    main_thread_id = threading.get_ident()
+    services = [GmailResources(main_thread_id), GmailResources(main_thread_id)]
+    remaining = list(services)
+
+    def build_service(*_: object, **__: object) -> GmailResources:
+        return remaining.pop(0)
+
+    factory = GoogleGmailClientFactory(
+        credentials_factory=lambda *_: object(),
+        build_service=build_service,
+    )
+    first = await factory.create("{}")
+    second = await factory.create("{}")
+
+    await factory.close()
+    await factory.close()
+
+    assert isinstance(first, GoogleGmailClient)
+    assert isinstance(second, GoogleGmailClient)
+    assert [service.close_calls for service in services] == [1, 1]
 
 
 @pytest.mark.asyncio

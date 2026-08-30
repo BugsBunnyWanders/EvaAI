@@ -255,6 +255,30 @@ async def test_startup_run_renews_due_watch_without_replacing_durable_cursor() -
     assert harness.factory.clients[0].watch_calls == [TOPIC_NAME]
 
 
+async def test_maintenance_uses_injected_renewal_and_silence_intervals() -> None:
+    """Fails if typed scheduling settings cannot control renewal and safety decisions."""
+    harness = Harness()
+    harness.service = GmailMaintenanceService(
+        repository=cast(ConnectorRepository, harness.repository),
+        credential_store=cast(CredentialStore, harness.credentials),
+        client_factory=cast(GmailClientFactory, harness.factory),
+        sync_service=cast(GmailSyncService, harness.sync),
+        topic_name=TOPIC_NAME,
+        lease_seconds=300,
+        watch_renewal_interval=timedelta(hours=6),
+        safety_sync_interval=timedelta(minutes=17),
+    )
+    harness.repository.states[CONNECTOR_ID] = sync_record(
+        renewal_at=NOW,
+        safety_at=NOW,
+    ).model_copy(update={"last_notification_at": NOW - timedelta(minutes=17)})
+
+    summary = await harness.service.run_due(NOW)
+
+    assert summary == MaintenanceSummary(renewed=1, safety_synced=1, failed=0)
+    assert harness.repository.states[CONNECTOR_ID].next_watch_renewal_at == NOW + timedelta(hours=6)
+
+
 async def test_run_due_rechecks_persisted_timestamps_and_does_no_early_work() -> None:
     """Fails if a stale due listing triggers provider work before persisted timestamps."""
     harness = Harness()

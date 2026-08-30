@@ -109,6 +109,21 @@ async def test_acknowledge_and_negative_acknowledge_map_ack_ids_exactly() -> Non
 
 
 @pytest.mark.asyncio
+async def test_close_is_idempotent_for_worker_and_command_cleanup() -> None:
+    """Fails if layered worker/command cleanup closes the Pub/Sub client twice."""
+    client = FakeSubscriberClient()
+    subscriber = GooglePullSubscriber("evaai-507018", "eva-gmail-ingestion-local", client)
+
+    await subscriber.close()
+    await subscriber.close()
+
+    assert client.calls == [
+        ("subscription_path", ("evaai-507018", "eva-gmail-ingestion-local")),
+        ("close", None),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_pull_deadline_returns_empty_but_other_failures_propagate() -> None:
     """Fails if an ordinary long poll timeout is retried or real failures are swallowed."""
     client = FakeSubscriberClient()

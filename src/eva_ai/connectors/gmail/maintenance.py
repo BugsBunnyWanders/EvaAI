@@ -32,6 +32,8 @@ class GmailMaintenanceService:
         sync_service: GmailSyncService,
         topic_name: str,
         lease_seconds: int,
+        watch_renewal_interval: timedelta = _WATCH_RENEWAL_INTERVAL,
+        safety_sync_interval: timedelta = _SAFETY_SYNC_INTERVAL,
     ) -> None:
         self._repository = repository
         self._credential_store = credential_store
@@ -39,6 +41,8 @@ class GmailMaintenanceService:
         self._sync_service = sync_service
         self._topic_name = topic_name
         self._lease_seconds = lease_seconds
+        self._watch_renewal_interval = watch_renewal_interval
+        self._safety_sync_interval = safety_sync_interval
 
     async def run_due(self, now: datetime) -> MaintenanceSummary:
         renewed = 0
@@ -67,7 +71,7 @@ class GmailMaintenanceService:
             if state is None:
                 failed += 1
                 continue
-            if _is_safety_due(state, now):
+            if _is_safety_due(state, now, self._safety_sync_interval):
                 try:
                     result = await self._sync_service.sync_connector(connector_id)
                 except asyncio.CancelledError:
@@ -120,8 +124,8 @@ class GmailMaintenanceService:
                 claim,
                 watch.expiration,
                 min(
-                    now + _WATCH_RENEWAL_INTERVAL,
-                    watch.expiration - _WATCH_RENEWAL_INTERVAL,
+                    now + self._watch_renewal_interval,
+                    watch.expiration - self._watch_renewal_interval,
                 ),
             )
             if not renewed:
@@ -184,7 +188,11 @@ def _is_due(due_at: datetime | None, now: datetime) -> bool:
     return due_at is not None and due_at <= now
 
 
-def _is_safety_due(state: GmailSyncRecord, now: datetime) -> bool:
+def _is_safety_due(
+    state: GmailSyncRecord,
+    now: datetime,
+    safety_sync_interval: timedelta = _SAFETY_SYNC_INTERVAL,
+) -> bool:
     notification_at = state.last_notification_at
-    silence_elapsed = notification_at is None or notification_at + _SAFETY_SYNC_INTERVAL <= now
+    silence_elapsed = notification_at is None or notification_at + safety_sync_interval <= now
     return _is_due(state.next_safety_sync_at, now) and silence_elapsed

@@ -28,6 +28,7 @@ class FakeSecretManagerClient:
         self.failure_operation = failure_operation
         self.create_race = create_race
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.close_calls = 0
 
     def _record(self, operation: str, request: dict[str, object]) -> None:
         assert threading.get_ident() != self.main_thread_id
@@ -59,6 +60,10 @@ class FakeSecretManagerClient:
             AccessSecretVersionResponse,
             SimpleNamespace(name=request["name"], payload=SimpleNamespace(data=self.stored_value)),
         )
+
+    def close(self) -> None:
+        assert threading.get_ident() != self.main_thread_id
+        self.close_calls += 1
 
 
 @pytest.mark.asyncio
@@ -118,6 +123,18 @@ async def test_get_loads_latest_secret_version_and_decodes_utf8() -> None:
             {"name": f"{reference}/versions/latest"},
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_close_releases_initialized_secret_manager_client_once() -> None:
+    """Fails if command cleanup leaks or double-closes the credential client."""
+    client = FakeSecretManagerClient(secret_exists=True)
+    store = GoogleSecretManagerCredentialStore("evaai-507018", client)
+
+    await store.close()
+    await store.close()
+
+    assert client.close_calls == 1
 
 
 @pytest.mark.asyncio
