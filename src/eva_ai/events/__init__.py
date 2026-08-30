@@ -18,18 +18,22 @@ from eva_ai.events.types import (
 )
 
 if TYPE_CHECKING:
+    from eva_ai.events.outbox import ClaimedOutboxMessage, OutboxRelay, PublishBatchResult
     from eva_ai.events.service import EventService, IngestResult
 
 __all__ = [
     "BackboneError",
+    "ClaimedOutboxMessage",
     "EventAvailableMessage",
     "EventService",
     "IngestResult",
     "NewEvent",
     "OutboundMessage",
+    "OutboxRelay",
     "OutboxState",
     "PrincipalType",
     "ProcessingStage",
+    "PublishBatchResult",
     "ScopeMismatchError",
     "StaleClaimError",
     "StoredError",
@@ -39,6 +43,14 @@ __all__ = [
 
 
 def __getattr__(name: str) -> object:
+    if name in {"ClaimedOutboxMessage", "OutboxRelay", "PublishBatchResult"}:
+        from eva_ai.events.outbox import ClaimedOutboxMessage, OutboxRelay, PublishBatchResult
+
+        return {
+            "ClaimedOutboxMessage": ClaimedOutboxMessage,
+            "OutboxRelay": OutboxRelay,
+            "PublishBatchResult": PublishBatchResult,
+        }[name]
     if name == "EventService":
         from eva_ai.events.service import EventService
 
