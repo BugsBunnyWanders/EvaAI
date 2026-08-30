@@ -43,7 +43,13 @@ class GoogleDesktopOAuthAuthorizer:
             credentials = flow.run_local_server(access_type="offline", prompt="consent")
             return AuthorizedUserGrant(authorized_user_json=credentials.to_json())
 
+        grant: AuthorizedUserGrant | None = None
+        failed = False
         try:
-            return await asyncio.to_thread(authorize_sync)
+            grant = await asyncio.to_thread(authorize_sync)
         except Exception:
-            raise OAuthAuthorizationError("Google OAuth authorization failed") from None
+            failed = True
+        if failed:
+            raise OAuthAuthorizationError("Google OAuth authorization failed")
+        assert grant is not None
+        return grant

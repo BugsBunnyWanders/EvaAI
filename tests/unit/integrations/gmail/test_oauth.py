@@ -99,3 +99,4 @@ async def test_authorize_maps_provider_failure_without_exposing_secret_text() ->
 
     assert str(raised.value) == "Google OAuth authorization failed"
     assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None

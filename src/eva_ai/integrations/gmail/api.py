@@ -2,6 +2,7 @@ import asyncio
 import json
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from enum import Enum, auto
 from typing import Protocol, cast
 
 from google.auth.exceptions import RefreshError
@@ -28,6 +29,18 @@ class GmailProviderError(RuntimeError):
 
 class InvalidAuthorizedUserCredentials(ValueError):
     """Authorized-user credential input is missing or malformed."""
+
+
+class _ClientCreationFailure(Enum):
+    INVALID_CREDENTIALS = auto()
+    PROVIDER = auto()
+
+
+class _RequestFailure(Enum):
+    AUTHORIZATION_REVOKED = auto()
+    AUTHORIZATION_REFRESH = auto()
+    HISTORY_EXPIRED = auto()
+    PROVIDER = auto()
 
 
 class ExecutableRequest(Protocol):
@@ -103,24 +116,18 @@ class GoogleGmailClientFactory:
         self._build_service = build_service
 
     async def create(self, authorized_user_json: str) -> GmailClient:
-        def create_sync() -> GoogleGmailClient:
+        def create_sync() -> GoogleGmailClient | _ClientCreationFailure:
             try:
                 decoded = json.loads(authorized_user_json)
             except json.JSONDecodeError, TypeError:
-                raise InvalidAuthorizedUserCredentials(
-                    "authorized-user credentials are invalid"
-                ) from None
+                return _ClientCreationFailure.INVALID_CREDENTIALS
             if not isinstance(decoded, dict):
-                raise InvalidAuthorizedUserCredentials(
-                    "authorized-user credentials are invalid"
-                ) from None
+                return _ClientCreationFailure.INVALID_CREDENTIALS
             info = cast(dict[str, object], decoded)
             try:
                 credentials = self._credentials_factory(info, _GMAIL_SCOPES)
             except ValueError:
-                raise InvalidAuthorizedUserCredentials(
-                    "authorized-user credentials are invalid"
-                ) from None
+                return _ClientCreationFailure.INVALID_CREDENTIALS
             try:
                 service = self._build_service(
                     "gmail",
@@ -129,10 +136,15 @@ class GoogleGmailClientFactory:
                     cache_discovery=False,
                 )
             except HttpError:
-                raise GmailProviderError("Gmail client construction failed") from None
+                return _ClientCreationFailure.PROVIDER
             return GoogleGmailClient(service)
 
-        return await asyncio.to_thread(create_sync)
+        result = await asyncio.to_thread(create_sync)
+        if result is _ClientCreationFailure.INVALID_CREDENTIALS:
+            raise InvalidAuthorizedUserCredentials("authorized-user credentials are invalid")
+        if result is _ClientCreationFailure.PROVIDER:
+            raise GmailProviderError("Gmail client construction failed")
+        return result
 
 
 class GoogleGmailClient:
@@ -165,10 +177,9 @@ class GoogleGmailClient:
         )
         history_id = _required_string(response, "historyId", "watch")
         expiration_millis = _required_string(response, "expiration", "watch")
-        try:
-            expiration = datetime.fromtimestamp(int(expiration_millis) / 1000, tz=UTC)
-        except OverflowError, ValueError:
-            raise GmailProviderError("Gmail API returned an invalid watch response") from None
+        expiration = _parse_expiration(expiration_millis)
+        if expiration is None:
+            raise GmailProviderError("Gmail API returned an invalid watch response")
         return WatchResult(history_id=history_id, expiration=expiration)
 
     async def list_history(self, start_history_id: str, page_token: str | None) -> HistoryPage:
@@ -222,17 +233,37 @@ class GoogleGmailClient:
         *,
         history_request: bool = False,
     ) -> Mapping[str, object]:
+        result: Mapping[str, object] | _RequestFailure
         try:
-            return await asyncio.to_thread(operation)
+            result = await asyncio.to_thread(operation)
         except RefreshError as error:
             details = " ".join(str(item) for item in error.args).lower()
             if "invalid_grant" in details:
-                raise AuthorizationRevoked("Google authorization has been revoked") from None
-            raise GmailProviderError("Gmail authorization refresh failed") from None
+                result = _RequestFailure.AUTHORIZATION_REVOKED
+            else:
+                result = _RequestFailure.AUTHORIZATION_REFRESH
         except HttpError as error:
             if history_request and getattr(error.resp, "status", None) == 404:
-                raise HistoryCursorExpired("Gmail history cursor expired") from None
-            raise GmailProviderError("Gmail API request failed") from None
+                result = _RequestFailure.HISTORY_EXPIRED
+            else:
+                result = _RequestFailure.PROVIDER
+
+        if result is _RequestFailure.AUTHORIZATION_REVOKED:
+            raise AuthorizationRevoked("Google authorization has been revoked")
+        if result is _RequestFailure.AUTHORIZATION_REFRESH:
+            raise GmailProviderError("Gmail authorization refresh failed")
+        if result is _RequestFailure.HISTORY_EXPIRED:
+            raise HistoryCursorExpired("Gmail history cursor expired")
+        if result is _RequestFailure.PROVIDER:
+            raise GmailProviderError("Gmail API request failed")
+        return result
+
+
+def _parse_expiration(expiration_millis: str) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(int(expiration_millis) / 1000, tz=UTC)
+    except OverflowError, ValueError:
+        return None
 
 
 def _required_string(response: Mapping[str, object], key: str, operation: str) -> str:

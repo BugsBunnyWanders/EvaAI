@@ -213,6 +213,7 @@ async def test_gmail_factory_rejects_malformed_credentials_without_exposing_them
 
     assert str(raised.value) == "authorized-user credentials are invalid"
     assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def http_error(status: int, private_body: bytes) -> HttpError:
@@ -230,6 +231,7 @@ async def test_history_404_maps_to_content_free_cursor_expiry() -> None:
 
     assert str(raised.value) == "Gmail history cursor expired"
     assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 @pytest.mark.asyncio
@@ -245,6 +247,7 @@ async def test_invalid_grant_maps_to_content_free_authorization_revoked() -> Non
 
     assert str(raised.value) == "Google authorization has been revoked"
     assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 @pytest.mark.asyncio
@@ -258,3 +261,4 @@ async def test_other_http_errors_remain_retryable_without_provider_body() -> Non
 
     assert str(raised.value) == "Gmail API request failed"
     assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
