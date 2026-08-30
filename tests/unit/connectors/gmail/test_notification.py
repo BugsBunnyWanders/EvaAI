@@ -14,6 +14,13 @@ def test_decode_notification_uses_client_decoded_bytes() -> None:
     assert notification.history_id == "12345"
 
 
+def test_decode_notification_normalizes_live_gmail_numeric_history_id() -> None:
+    """Accepts the JSON integer representation emitted by live Gmail delivery."""
+    notification = decode_notification(b'{"emailAddress":"mail@example.com","historyId":12345}')
+
+    assert notification.history_id == "12345"
+
+
 @pytest.mark.parametrize(
     "data",
     [
@@ -21,7 +28,9 @@ def test_decode_notification_uses_client_decoded_bytes() -> None:
         b"not-json",
         b"[]",
         b'{"historyId":"1"}',
-        b'{"emailAddress":"mail@example.com","historyId":1}',
+        b'{"emailAddress":"mail@example.com","historyId":true}',
+        b'{"emailAddress":"mail@example.com","historyId":-1}',
+        b'{"emailAddress":"mail@example.com","historyId":1.5}',
         b'{"emailAddress":"mail@example.com","historyId":"one"}',
     ],
 )
