@@ -17,9 +17,6 @@ dependencies = [
     "uvicorn[standard]>=0.35",
 ]
 
-[project.scripts]
-eva = "eva_ai.cli:main"
-
 [dependency-groups]
 dev = [
     "httpx2>=2.12",
