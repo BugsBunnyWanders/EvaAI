@@ -20,8 +20,14 @@ def safe_context() -> dict[str, UUID | str]:
         "user_id": uuid7(),
         "workspace_id": uuid7(),
         "outbox_message_id": uuid7(),
+        "connector_id": uuid7(),
+        "pubsub_message_id": "pubsub-message-1",
+        "gmail_message_id": "gmail-message-1",
+        "gmail_thread_id": "gmail-thread-1",
         "claim_id": uuid7(),
+        "operation": "gmail_pull",
         "outcome": "published",
+        "error_category": "provider_transient",
     }
 
 
@@ -69,6 +75,13 @@ def test_json_formatter_renders_only_allowlisted_context() -> None:
         | {
             "payload": SecretPayload(),
             "credentials": "credential-secret",
+            "account_identity": "recipient-private@example.com",
+            "subject": "subject-private",
+            "recipient": "to-private@example.com",
+            "body": "body-private",
+            "snippet": "snippet-private",
+            "token": "refresh-token-private",
+            "provider_response": "provider-response-private",
         }
     )
 
@@ -85,6 +98,13 @@ def test_json_formatter_renders_only_allowlisted_context() -> None:
     assert "payload-secret" not in rendered
     assert "credential-secret" not in rendered
     assert "top-secret" not in rendered
+    assert "recipient-private@example.com" not in rendered
+    assert "subject-private" not in rendered
+    assert "to-private@example.com" not in rendered
+    assert "body-private" not in rendered
+    assert "snippet-private" not in rendered
+    assert "refresh-token-private" not in rendered
+    assert "provider-response-private" not in rendered
 
 
 def test_console_formatter_renders_only_allowlisted_context() -> None:
@@ -99,6 +119,13 @@ def test_console_formatter_renders_only_allowlisted_context() -> None:
         | {
             "payload": SecretPayload(),
             "credentials": "credential-secret",
+            "account_identity": "recipient-private@example.com",
+            "subject": "subject-private",
+            "recipient": "to-private@example.com",
+            "body": "body-private",
+            "snippet": "snippet-private",
+            "token": "refresh-token-private",
+            "provider_response": "provider-response-private",
         },
         exc_info=secret_exception_info(),
     )
@@ -109,6 +136,42 @@ def test_console_formatter_renders_only_allowlisted_context() -> None:
     assert "payload-secret" not in rendered
     assert "credential-secret" not in rendered
     assert "top-secret" not in rendered
+    assert "recipient-private@example.com" not in rendered
+    assert "subject-private" not in rendered
+    assert "to-private@example.com" not in rendered
+    assert "body-private" not in rendered
+    assert "snippet-private" not in rendered
+    assert "refresh-token-private" not in rendered
+    assert "provider-response-private" not in rendered
+
+
+def test_formatter_omits_unavailable_allowlisted_identifiers() -> None:
+    """Fails if missing safe IDs are fabricated or serialized as null fields."""
+    record = logging.LogRecord(
+        name="eva.gmail.worker",
+        level=logging.WARNING,
+        pathname=__file__,
+        lineno=1,
+        msg="Gmail notification rejected",
+        args=(),
+        exc_info=None,
+    )
+    record.__dict__.update(
+        {
+            "connector_id": None,
+            "workspace_id": None,
+            "pubsub_message_id": "pubsub-message-1",
+            "operation": "notification_decode",
+            "outcome": "acknowledged",
+            "error_category": "malformed_notification",
+        }
+    )
+
+    payload = json.loads(JsonFormatter().format(record))
+
+    assert payload["pubsub_message_id"] == "pubsub-message-1"
+    assert "connector_id" not in payload
+    assert "workspace_id" not in payload
 
 
 def test_configure_logging_replaces_root_handlers() -> None:

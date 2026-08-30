@@ -13,13 +13,19 @@ _SAFE_CONTEXT_FIELDS = (
     "user_id",
     "workspace_id",
     "outbox_message_id",
+    "connector_id",
+    "pubsub_message_id",
+    "gmail_message_id",
+    "gmail_thread_id",
     "claim_id",
+    "operation",
     "outcome",
+    "error_category",
 )
 
 
-def _safe_context(record: logging.LogRecord) -> dict[str, str | None]:
-    context: dict[str, str | None] = {}
+def _safe_context(record: logging.LogRecord) -> dict[str, str]:
+    context: dict[str, str] = {}
     # LogRecord extras are arbitrary; only known identifiers and outcomes cross this boundary.
     for field in _SAFE_CONTEXT_FIELDS:
         value = getattr(record, field, None)
@@ -27,8 +33,6 @@ def _safe_context(record: logging.LogRecord) -> dict[str, str | None]:
             context[field] = value
         elif isinstance(value, UUID):
             context[field] = str(value)
-        elif value is None and hasattr(record, field):
-            context[field] = None
     return context
 
 
