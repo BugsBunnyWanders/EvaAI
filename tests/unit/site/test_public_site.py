@@ -45,11 +45,11 @@ class PageParser(HTMLParser):
             self._heading_level = int(tag[1])
             self._heading_parts = []
         elif tag == "meta" and attributes.get("name") == "description":
-            self.page.descriptions.append(attributes.get("content", ""))
+            self.page.descriptions.append(attributes.get("content") or "")
         elif tag == "link" and attributes.get("rel") == "canonical":
-            self.page.canonicals.append(attributes.get("href", ""))
+            self.page.canonicals.append(attributes.get("href") or "")
         elif tag == "a":
-            self.page.links.append(attributes.get("href", ""))
+            self.page.links.append(attributes.get("href") or "")
         elif tag in {"img", "script"} and attributes.get("src"):
             self.page.sources.append(attributes["src"] or "")
 

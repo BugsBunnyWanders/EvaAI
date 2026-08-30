@@ -1160,10 +1160,73 @@ h3 {
   }
 
   .signal-stage {
-    left: 50%;
-    width: 520px;
-    margin-left: -260px;
-    transform: scale(0.7);
+    left: auto;
+    width: 100%;
+    min-height: 410px;
+    margin-left: 0;
+    overflow: hidden;
+    transform: none;
+  }
+
+  .orbit-one {
+    width: 250px;
+    height: 250px;
+  }
+
+  .orbit-two {
+    width: 350px;
+    height: 350px;
+  }
+
+  .eva-core {
+    width: 126px;
+    height: 126px;
+  }
+
+  .core-mark {
+    width: 56px;
+    height: 56px;
+    border-radius: 20px;
+    font-size: 1.65rem;
+  }
+
+  .core-label {
+    top: calc(100% + 16px);
+    width: 160px;
+    font-size: 0.62rem;
+  }
+
+  .signal-card {
+    min-width: 0;
+    width: 184px;
+    padding: 10px 11px;
+  }
+
+  .signal-card::after {
+    display: none;
+  }
+
+  .signal-card strong {
+    font-size: 0.74rem;
+  }
+
+  .signal-kicker {
+    font-size: 0.56rem;
+  }
+
+  .signal-email {
+    top: 24px;
+    left: 0;
+  }
+
+  .signal-goal {
+    top: 105px;
+    right: 0;
+  }
+
+  .signal-action {
+    right: 8px;
+    bottom: 18px;
   }
 
   .policy-index ol {

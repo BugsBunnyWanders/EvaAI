@@ -444,7 +444,7 @@ jobs:
 Add a “Public website” README section with:
 
 ```bash
-python -m http.server 8080 --directory site
+uv run python -m http.server 8080 --directory site
 ```
 
 Document preview at `http://127.0.0.1:8080`, deployment through GitHub Actions, Pages source selection, custom-domain setup, the four official GitHub Pages apex `A` records, the `www` CNAME to `bugsbunnywanders.github.io`, preserving Hostinger MX/TXT records, HTTPS enablement, Search Console verification, Google Auth Platform URLs, production publishing, and Gmail connector reauthorization.
