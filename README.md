@@ -52,3 +52,22 @@ Migrations never run automatically during API startup.
 ## Architecture
 
 The product architecture is in `spec/2026-08-29-proactive-personal-ai-agent-design.md`. Milestone designs and implementation plans are stored under `docs/superpowers/`.
+
+### Milestone 1: Event backbone
+
+Milestone 1 adds a durable event backbone with this flow:
+
+```text
+NewEvent -> PostgreSQL transaction [Event + EventProcessing + OutboxMessage]
+         -> OutboxRelay claim -> Publisher acknowledgement
+         -> EventProcessor claim -> EventHandler -> HANDLED
+```
+
+Local tests use the in-memory publisher. When the Google Pub/Sub adapter is selected, it
+uses Application Default Credentials and requires `EVA_PUBSUB_PROJECT_ID`; this milestone
+does not create any GCP resources. Publication is at-least-once, so event handling remains
+idempotent across redelivery.
+
+Milestone 1 provides one-pass composition helpers only. It does not add a subscriber,
+long-running worker loop, or public endpoint. Telegram and Gmail behavior are deferred to
+later milestones.

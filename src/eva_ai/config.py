@@ -2,7 +2,7 @@ from enum import StrEnum
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import SecretStr, field_validator
+from pydantic import PositiveInt, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,12 +34,24 @@ class Settings(BaseSettings):
     log_level: LogLevel = "INFO"
     log_format: LogFormat = LogFormat.CONSOLE
     database_url: SecretStr = SecretStr("postgresql+psycopg://eva:eva@localhost:5432/eva")
+    pubsub_project_id: str | None = None
+    pubsub_topic_id: str = "eva-events"
+    outbox_batch_limit: PositiveInt = 100
+    outbox_lease_seconds: PositiveInt = 60
+    processing_lease_seconds: PositiveInt = 300
 
     @field_validator("log_level", mode="before")
     @classmethod
     def normalize_log_level(cls, value: object) -> object:
         if isinstance(value, str):
             return value.upper()
+        return value
+
+    @field_validator("pubsub_topic_id")
+    @classmethod
+    def reject_blank_pubsub_topic_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must not be blank")
         return value
 
 
