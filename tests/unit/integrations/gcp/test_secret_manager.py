@@ -1,3 +1,4 @@
+import asyncio
 import threading
 from types import SimpleNamespace
 from typing import cast
@@ -13,6 +14,41 @@ from eva_ai.integrations.gcp.secret_manager import (
 )
 
 
+class FakeSecretManagerTransport:
+    def __init__(
+        self,
+        main_thread_id: int,
+        close_failures: list[BaseException] | None = None,
+    ) -> None:
+        self.main_thread_id = main_thread_id
+        self.close_calls = 0
+        self.close_failures = close_failures or []
+
+    def close(self) -> None:
+        assert threading.get_ident() != self.main_thread_id
+        self.close_calls += 1
+        if self.close_failures:
+            raise self.close_failures.pop(0)
+
+
+class BlockingSecretManagerTransport:
+    def __init__(self, main_thread_id: int) -> None:
+        self.main_thread_id = main_thread_id
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.close_calls = 0
+
+    def close(self) -> None:
+        assert threading.get_ident() != self.main_thread_id
+        self.close_calls += 1
+        self.started.set()
+        try:
+            assert self.release.wait(timeout=2)
+        finally:
+            self.finished.set()
+
+
 class FakeSecretManagerClient:
     def __init__(
         self,
@@ -21,6 +57,7 @@ class FakeSecretManagerClient:
         stored_value: bytes = b"stored-secret",
         failure_operation: str | None = None,
         create_race: bool = False,
+        transport: FakeSecretManagerTransport | BlockingSecretManagerTransport | None = None,
     ) -> None:
         self.main_thread_id = threading.get_ident()
         self.secret_exists = secret_exists
@@ -28,7 +65,7 @@ class FakeSecretManagerClient:
         self.failure_operation = failure_operation
         self.create_race = create_race
         self.calls: list[tuple[str, dict[str, object]]] = []
-        self.close_calls = 0
+        self.transport = transport or FakeSecretManagerTransport(self.main_thread_id)
 
     def _record(self, operation: str, request: dict[str, object]) -> None:
         assert threading.get_ident() != self.main_thread_id
@@ -60,10 +97,6 @@ class FakeSecretManagerClient:
             AccessSecretVersionResponse,
             SimpleNamespace(name=request["name"], payload=SimpleNamespace(data=self.stored_value)),
         )
-
-    def close(self) -> None:
-        assert threading.get_ident() != self.main_thread_id
-        self.close_calls += 1
 
 
 @pytest.mark.asyncio
@@ -127,14 +160,54 @@ async def test_get_loads_latest_secret_version_and_decodes_utf8() -> None:
 
 @pytest.mark.asyncio
 async def test_close_releases_initialized_secret_manager_client_once() -> None:
-    """Fails if command cleanup leaks or double-closes the credential client."""
+    """Fails if cleanup calls a missing client close or double-closes its transport."""
     client = FakeSecretManagerClient(secret_exists=True)
     store = GoogleSecretManagerCredentialStore("evaai-507018", client)
 
     await store.close()
     await store.close()
 
-    assert client.close_calls == 1
+    assert client.transport.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_close_retries_transport_after_ordinary_failure() -> None:
+    """Fails if an ordinary close failure discards the adapter's retry ownership."""
+    transport = FakeSecretManagerTransport(
+        threading.get_ident(),
+        [RuntimeError("private-transport-close-marker")],
+    )
+    client = FakeSecretManagerClient(secret_exists=True, transport=transport)
+    store = GoogleSecretManagerCredentialStore("evaai-507018", client)
+
+    with pytest.raises(RuntimeError, match="private-transport-close-marker"):
+        await store.close()
+    await store.close()
+
+    assert transport.close_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_close_retries_transport_after_task_cancellation() -> None:
+    """Fails if task cancellation discards ownership while transport close finishes."""
+    transport = BlockingSecretManagerTransport(threading.get_ident())
+    client = FakeSecretManagerClient(secret_exists=True, transport=transport)
+    store = GoogleSecretManagerCredentialStore("evaai-507018", client)
+    close_task = asyncio.create_task(store.close())
+    assert await asyncio.wait_for(asyncio.to_thread(transport.started.wait), timeout=2)
+    cancellation_marker = object()
+
+    close_task.cancel(cancellation_marker)
+    transport.release.set()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await close_task
+    assert raised.value.args == (cancellation_marker,)
+    assert await asyncio.wait_for(asyncio.to_thread(transport.finished.wait), timeout=2)
+
+    await store.close()
+
+    assert transport.close_calls == 2
 
 
 @pytest.mark.asyncio

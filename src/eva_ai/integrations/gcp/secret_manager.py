@@ -18,7 +18,14 @@ class AccessSecretVersionResponse(Protocol):
     payload: SecretPayload
 
 
+class SecretManagerTransport(Protocol):
+    def close(self) -> None: ...
+
+
 class SecretManagerClient(Protocol):
+    @property
+    def transport(self) -> SecretManagerTransport: ...
+
     def get_secret(self, *, request: dict[str, object]) -> object: ...
 
     def create_secret(self, *, request: dict[str, object]) -> object: ...
@@ -28,8 +35,6 @@ class SecretManagerClient(Protocol):
     def access_secret_version(
         self, *, request: dict[str, object]
     ) -> AccessSecretVersionResponse: ...
-
-    def close(self) -> None: ...
 
 
 class GoogleSecretManagerCredentialStore:
@@ -90,9 +95,10 @@ class GoogleSecretManagerCredentialStore:
         return result
 
     async def close(self) -> None:
-        client, self._client = self._client, None
+        client = self._client
         if client is not None:
-            await asyncio.to_thread(client.close)
+            await asyncio.to_thread(client.transport.close)
+            self._client = None
 
     async def _get_client(self) -> SecretManagerClient:
         if self._client is None:
