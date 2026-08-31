@@ -1,3 +1,5 @@
+from typing import TYPE_CHECKING
+
 from eva_ai.situations.errors import (
     InvalidSituationTransitionError,
     SituationError,
@@ -23,6 +25,10 @@ from eva_ai.situations.types import (
     SituationType,
 )
 
+if TYPE_CHECKING:
+    from eva_ai.situations.repository import SituationRepository
+    from eva_ai.situations.service import SituationService
+
 __all__ = [
     "AttentionLevel",
     "CorrelationKeyKind",
@@ -37,11 +43,25 @@ __all__ = [
     "SituationLifecycle",
     "SituationNotFoundError",
     "SituationRecord",
+    "SituationRepository",
     "SituationResolution",
     "SituationResolutionError",
     "SituationScopeError",
+    "SituationService",
     "SituationSnapshotUpdate",
     "SituationType",
     "SituationVersionConflictError",
     "validate_situation_transition",
 ]
+
+
+def __getattr__(name: str) -> object:
+    if name == "SituationRepository":
+        from eva_ai.situations.repository import SituationRepository
+
+        return SituationRepository
+    if name == "SituationService":
+        from eva_ai.situations.service import SituationService
+
+        return SituationService
+    raise AttributeError(name)
