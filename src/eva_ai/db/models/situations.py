@@ -17,7 +17,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from eva_ai.db.base import Base
 from eva_ai.db.models.common import TimestampMixin, UUIDPrimaryKeyMixin
-from eva_ai.situations import (
+from eva_ai.situations.types import (
     AttentionLevel,
     CorrelationKeyKind,
     CorrelationMethod,

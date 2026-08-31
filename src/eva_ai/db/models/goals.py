@@ -17,7 +17,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from eva_ai.db.base import Base
 from eva_ai.db.models.common import TimestampMixin, UUIDPrimaryKeyMixin
-from eva_ai.goals import GoalMode, GoalSource, GoalStatus
+from eva_ai.goals.types import GoalMode, GoalSource, GoalStatus
 
 
 class Goal(UUIDPrimaryKeyMixin, TimestampMixin, Base):

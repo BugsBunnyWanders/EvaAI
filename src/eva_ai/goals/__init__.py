@@ -1,3 +1,5 @@
+from typing import TYPE_CHECKING
+
 from eva_ai.goals.errors import (
     GoalError,
     GoalNotFoundError,
@@ -18,6 +20,10 @@ from eva_ai.goals.types import (
     JsonObject,
 )
 
+if TYPE_CHECKING:
+    from eva_ai.goals.repository import GoalRepository
+    from eva_ai.goals.service import GoalService
+
 __all__ = [
     "SAFE_AUTONOMY_POLICY",
     "GoalDraft",
@@ -26,6 +32,8 @@ __all__ = [
     "GoalNotFoundError",
     "GoalParentError",
     "GoalRecord",
+    "GoalRepository",
+    "GoalService",
     "GoalScopeError",
     "GoalSource",
     "GoalStatus",
@@ -35,3 +43,15 @@ __all__ = [
     "JsonObject",
     "validate_goal_transition",
 ]
+
+
+def __getattr__(name: str) -> object:
+    if name == "GoalRepository":
+        from eva_ai.goals.repository import GoalRepository
+
+        return GoalRepository
+    if name == "GoalService":
+        from eva_ai.goals.service import GoalService
+
+        return GoalService
+    raise AttributeError(name)
