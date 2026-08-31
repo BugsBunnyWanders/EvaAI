@@ -1,6 +1,6 @@
 # Eva AI
 
-Eva is a proactive, event-driven personal AI operator. The repository contains the application foundation, durable Event backbone, and local Gmail ingestion worker.
+Eva is a proactive, event-driven personal AI operator. The repository contains the application foundation, durable Event backbone, local Gmail ingestion worker, and durable Goal and Situation domain.
 
 ## Requirements
 
@@ -142,3 +142,15 @@ does not create any GCP resources. Publication is at-least-once, so event handli
 idempotent across redelivery.
 
 Milestone 1's Event and Outbox reliability boundary is reused by the Milestone 2 Gmail subscriber. Telegram behavior remains deferred.
+
+### Milestone 3: Goals and Situations
+
+Milestone 3 adds scoped Goal and Situation persistence and services, lifecycle enforcement,
+optimistic Situation snapshots, explicit Event/Goal relationships, and deterministic
+Gmail-thread correlation. The local CLI can create, list, show, and update Goals and can list
+and inspect Situations with stable JSON output.
+
+Gmail ingestion does not automatically create Situations yet. Milestone 4 will evaluate Event
+relevance and invoke the resolver only for email that warrants operational attention. See the
+[Goal and Situation operator guide](docs/goal-situation-operator.md) for the mental model,
+command examples, lifecycle rules, and troubleshooting.
