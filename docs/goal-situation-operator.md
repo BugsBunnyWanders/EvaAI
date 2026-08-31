@@ -188,5 +188,5 @@ a service interface for later milestones and is not exposed by the Milestone 3 C
 - A Situation is absent after Gmail sync: this is expected until Milestone 4 relevance routing
   is implemented. Do not manually run the resolver for every email.
 - A list is rejected: `--limit` must be from 1 through 100 and filters must use the exact enum
-  values shown by `uv run eva goal --help` or `uv run eva situation --help`.
-
+  values shown by `uv run eva goal list --help` or
+  `uv run eva situation list --help`.

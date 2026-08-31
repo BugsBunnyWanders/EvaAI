@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -8,6 +9,7 @@ from uuid import UUID, uuid7
 
 import pytest
 
+import eva_ai.cli as cli_module
 from eva_ai.cli import (
     CleanupOutcome,
     CliResourceError,
@@ -334,6 +336,49 @@ def test_command_failure_has_one_fixed_content_free_error(
     assert main(["gmail", "sync", "--connector-id", str(CONNECTOR_ID)], functions) == 1
 
     captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "eva: command failed\n"
+
+
+def test_composed_command_failure_still_writes_only_one_operator_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Fails if configured application logging duplicates the CLI error on stderr."""
+    functions, _ = command_functions()
+
+    async def fail(_: UUID) -> None:
+        raise RuntimeError("private database and OAuth details")
+
+    failing_functions = CommandFunctions(
+        scope_create=functions.scope_create,
+        gmail_connect=functions.gmail_connect,
+        gmail_sync=fail,
+        gmail_pull=functions.gmail_pull,
+        gmail_maintain=functions.gmail_maintain,
+        goal_create=functions.goal_create,
+        goal_list=functions.goal_list,
+        goal_show=functions.goal_show,
+        goal_update=functions.goal_update,
+        situation_list=functions.situation_list,
+        situation_show=functions.situation_show,
+    )
+    monkeypatch.setattr(cli_module, "build_command_functions", lambda _: failing_functions)
+    root_logger = logging.getLogger()
+    original_handlers = root_logger.handlers[:]
+    original_level = root_logger.level
+    try:
+        exit_code = main(
+            ["gmail", "sync", "--connector-id", str(CONNECTOR_ID)],
+            settings_factory=lambda: Settings(_env_file=None),
+        )
+        captured = capsys.readouterr()
+    finally:
+        root_logger.handlers.clear()
+        root_logger.handlers.extend(original_handlers)
+        root_logger.setLevel(original_level)
+
+    assert exit_code == 1
     assert captured.out == ""
     assert captured.err == "eva: command failed\n"
 

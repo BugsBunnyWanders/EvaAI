@@ -564,10 +564,12 @@ def main(
     except KeyboardInterrupt:
         return 130
     except Exception as error:
-        # Only the exception type is logged; provider/database messages may contain secrets.
-        _LOGGER.warning(
-            "CLI command failed",
-            extra={"command_area": arguments.area, "error_type": type(error).__name__},
+        # Debug diagnostics use only parser-controlled context and the exception class;
+        # provider/database messages may contain secrets and are never rendered.
+        _LOGGER.debug(
+            "CLI command failed area=%s error_type=%s",
+            arguments.area,
+            type(error).__name__,
         )
         print("eva: command failed", file=sys.stderr)
         return 1
