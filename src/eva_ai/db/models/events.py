@@ -32,6 +32,7 @@ class Event(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "events"
     __table_args__ = (
         EVENT_SCOPE_FK,
+        UniqueConstraint("id", "workspace_id", "user_id", name="uq_events_id_workspace_user"),
         UniqueConstraint("workspace_id", "idempotency_key", name="uq_events_workspace_idempotency"),
         CheckConstraint("schema_version > 0", name="ck_events_schema_version_positive"),
         CheckConstraint(
