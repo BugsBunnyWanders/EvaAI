@@ -1,13 +1,19 @@
 import argparse
 import asyncio
+import json
+import logging
 import sys
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from enum import StrEnum
 from functools import partial
 from pathlib import Path
-from typing import TextIO
+from typing import TextIO, cast
 from uuid import UUID
+
+from pydantic import BaseModel
 
 from eva_ai.config import Settings, get_settings
 from eva_ai.connectors.gmail.bootstrap import ConnectGmail, GmailBootstrapService
@@ -22,22 +28,39 @@ from eva_ai.connectors.repository import ConnectorRepository
 from eva_ai.connectors.types import ConnectorStatus
 from eva_ai.db.session import Database
 from eva_ai.events.service import EventService
+from eva_ai.goals import (
+    GoalDraft,
+    GoalMode,
+    GoalRepository,
+    GoalService,
+    GoalStatus,
+    GoalUpdate,
+    JsonObject,
+)
 from eva_ai.integrations.gcp.secret_manager import GoogleSecretManagerCredentialStore
 from eva_ai.integrations.gcp.subscriber import GooglePullSubscriber
 from eva_ai.integrations.gmail.api import GoogleGmailClientFactory
 from eva_ai.integrations.gmail.oauth import GoogleDesktopOAuthAuthorizer
 from eva_ai.local_scope import LocalScope, create_local_scope, local_scope_exists
 from eva_ai.logging import configure_logging
+from eva_ai.situations import SituationLifecycle, SituationRepository, SituationService
 
 ScopeCreateCommand = Callable[[str, str], Awaitable[None]]
 GmailConnectCommand = Callable[[UUID, UUID], Awaitable[None]]
 GmailSyncCommand = Callable[[UUID], Awaitable[None]]
 NoArgumentCommand = Callable[[], Awaitable[None]]
+GoalCreateCommand = Callable[[GoalDraft], Awaitable[None]]
+GoalListCommand = Callable[[UUID, UUID, tuple[GoalStatus, ...], int], Awaitable[None]]
+GoalShowCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
+GoalUpdateCommand = Callable[[GoalUpdate], Awaitable[None]]
+SituationListCommand = Callable[[UUID, UUID, tuple[SituationLifecycle, ...], int], Awaitable[None]]
+SituationShowCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
 DatabaseFactory = Callable[[str], Database]
 DependencyBuilder = Callable[[Settings], "GmailDependencies"]
 ScopeCreator = Callable[..., Awaitable[LocalScope]]
 ScopeValidator = Callable[[Database, UUID, UUID], Awaitable[bool]]
 Clock = Callable[[], datetime]
+_LOGGER = logging.getLogger(__name__)
 
 
 class CliValidationError(ValueError):
@@ -61,6 +84,12 @@ class CommandFunctions:
     gmail_sync: GmailSyncCommand
     gmail_pull: NoArgumentCommand
     gmail_maintain: NoArgumentCommand
+    goal_create: GoalCreateCommand
+    goal_list: GoalListCommand
+    goal_show: GoalShowCommand
+    goal_update: GoalUpdateCommand
+    situation_list: SituationListCommand
+    situation_show: SituationShowCommand
 
 
 @dataclass(slots=True)
@@ -304,6 +333,131 @@ async def gmail_maintain_command(
         raise CliValidationError("Gmail maintenance reported failures")
 
 
+async def goal_create_command(
+    command: GoalDraft,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def create(database: Database) -> BaseModel:
+        return await GoalService(GoalRepository(database)).create_explicit(command)
+
+    _write_json(await _run_database_operation(settings, database_factory, create), stdout)
+
+
+async def goal_list_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    statuses: tuple[GoalStatus, ...],
+    limit: int,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def list_goals(database: Database) -> tuple[BaseModel, ...]:
+        return await GoalService(GoalRepository(database)).list(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            statuses=statuses,
+            limit=limit,
+        )
+
+    records = await _run_database_operation(settings, database_factory, list_goals)
+    _write_json({"count": len(records), "items": records}, stdout)
+
+
+async def goal_show_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    goal_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def show(database: Database) -> BaseModel:
+        return await GoalService(GoalRepository(database)).get(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            goal_id=goal_id,
+        )
+
+    _write_json(await _run_database_operation(settings, database_factory, show), stdout)
+
+
+async def goal_update_command(
+    command: GoalUpdate,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def update(database: Database) -> BaseModel:
+        return await GoalService(GoalRepository(database)).update(command)
+
+    _write_json(await _run_database_operation(settings, database_factory, update), stdout)
+
+
+async def situation_list_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    lifecycles: tuple[SituationLifecycle, ...],
+    limit: int,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def list_situations(database: Database) -> tuple[BaseModel, ...]:
+        return await SituationService(SituationRepository(database)).list(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            lifecycles=lifecycles,
+            limit=limit,
+        )
+
+    records = await _run_database_operation(settings, database_factory, list_situations)
+    _write_json({"count": len(records), "items": records}, stdout)
+
+
+async def situation_show_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    situation_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def show(database: Database) -> dict[str, object]:
+        repository = SituationRepository(database)
+        situation = await SituationService(repository).get(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            situation_id=situation_id,
+        )
+        # Projection records expose linkage metadata without leaking the raw Event payload.
+        event_links = await repository.list_events(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            situation_id=situation_id,
+        )
+        goal_links = await repository.list_goals(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            situation_id=situation_id,
+        )
+        return {
+            "event_links": event_links,
+            "goal_links": goal_links,
+            "situation": situation,
+        }
+
+    _write_json(await _run_database_operation(settings, database_factory, show), stdout)
+
+
 def build_command_functions(settings: Settings) -> CommandFunctions:
     return CommandFunctions(
         scope_create=partial(scope_create_command, settings=settings),
@@ -311,6 +465,12 @@ def build_command_functions(settings: Settings) -> CommandFunctions:
         gmail_sync=partial(gmail_sync_command, settings=settings),
         gmail_pull=partial(gmail_pull_command, settings=settings),
         gmail_maintain=partial(gmail_maintain_command, settings=settings),
+        goal_create=partial(goal_create_command, settings=settings),
+        goal_list=partial(goal_list_command, settings=settings),
+        goal_show=partial(goal_show_command, settings=settings),
+        goal_update=partial(goal_update_command, settings=settings),
+        situation_list=partial(situation_list_command, settings=settings),
+        situation_show=partial(situation_show_command, settings=settings),
     )
 
 
@@ -333,6 +493,58 @@ def build_parser() -> argparse.ArgumentParser:
     gmail_sync.add_argument("--connector-id", required=True, type=_parse_uuid)
     gmail_commands.add_parser("pull")
     gmail_commands.add_parser("maintain")
+
+    goal = commands.add_parser("goal")
+    goal_commands = goal.add_subparsers(dest="goal_command", required=True)
+    goal_create = goal_commands.add_parser("create")
+    _add_scope_arguments(goal_create)
+    goal_create.add_argument("--title", required=True)
+    goal_create.add_argument("--objective", required=True)
+    goal_create.add_argument("--domain", required=True)
+    goal_create.add_argument("--mode", required=True, type=GoalMode, choices=list(GoalMode))
+    goal_create.add_argument("--priority", type=int, default=50, choices=range(0, 101))
+    goal_create.add_argument("--success-criterion", action="append", default=[])
+    goal_create.add_argument("--constraints-json", type=_parse_json_object, default={})
+    goal_create.add_argument("--parent-goal-id", type=_parse_uuid)
+
+    goal_list = goal_commands.add_parser("list")
+    _add_scope_arguments(goal_list)
+    goal_list.add_argument("--status", action="append", type=GoalStatus, default=[])
+    goal_list.add_argument("--limit", type=_parse_limit, default=50)
+
+    goal_show = goal_commands.add_parser("show")
+    _add_scope_arguments(goal_show)
+    goal_show.add_argument("--goal-id", required=True, type=_parse_uuid)
+
+    goal_update = goal_commands.add_parser("update")
+    _add_scope_arguments(goal_update)
+    goal_update.add_argument("--goal-id", required=True, type=_parse_uuid)
+    goal_update.add_argument("--title")
+    goal_update.add_argument("--objective")
+    goal_update.add_argument("--domain")
+    goal_update.add_argument("--mode", type=GoalMode, choices=list(GoalMode))
+    goal_update.add_argument("--priority", type=int, choices=range(0, 101))
+    goal_update.add_argument("--success-criterion", action="append")
+    goal_update.add_argument("--constraints-json", type=_parse_json_object)
+    parent = goal_update.add_mutually_exclusive_group()
+    parent.add_argument("--parent-goal-id", type=_parse_uuid)
+    parent.add_argument("--clear-parent", action="store_true")
+    goal_update.add_argument("--status", type=GoalStatus, choices=list(GoalStatus))
+
+    situation = commands.add_parser("situation")
+    situation_commands = situation.add_subparsers(dest="situation_command", required=True)
+    situation_list = situation_commands.add_parser("list")
+    _add_scope_arguments(situation_list)
+    situation_list.add_argument(
+        "--lifecycle",
+        action="append",
+        type=SituationLifecycle,
+        default=[],
+    )
+    situation_list.add_argument("--limit", type=_parse_limit, default=50)
+    situation_show = situation_commands.add_parser("show")
+    _add_scope_arguments(situation_show)
+    situation_show.add_argument("--situation-id", required=True, type=_parse_uuid)
     return parser
 
 
@@ -351,7 +563,14 @@ def main(
         asyncio.run(_dispatch(arguments, command_functions))
     except KeyboardInterrupt:
         return 130
-    except Exception:
+    except Exception as error:
+        # Debug diagnostics use only parser-controlled context and the exception class;
+        # provider/database messages may contain secrets and are never rendered.
+        _LOGGER.debug(
+            "CLI command failed area=%s error_type=%s",
+            arguments.area,
+            type(error).__name__,
+        )
         print("eva: command failed", file=sys.stderr)
         return 1
     return 0
@@ -368,6 +587,65 @@ async def _dispatch(arguments: argparse.Namespace, commands: CommandFunctions) -
         await commands.gmail_pull()
     elif arguments.area == "gmail" and arguments.gmail_command == "maintain":
         await commands.gmail_maintain()
+    elif arguments.area == "goal" and arguments.goal_command == "create":
+        await commands.goal_create(
+            GoalDraft(
+                user_id=arguments.user_id,
+                workspace_id=arguments.workspace_id,
+                title=arguments.title,
+                objective=arguments.objective,
+                domain=arguments.domain,
+                mode=arguments.mode,
+                priority=arguments.priority,
+                success_criteria=tuple(arguments.success_criterion),
+                constraints=arguments.constraints_json,
+                parent_goal_id=arguments.parent_goal_id,
+            )
+        )
+    elif arguments.area == "goal" and arguments.goal_command == "list":
+        await commands.goal_list(
+            arguments.user_id,
+            arguments.workspace_id,
+            tuple(arguments.status),
+            arguments.limit,
+        )
+    elif arguments.area == "goal" and arguments.goal_command == "show":
+        await commands.goal_show(arguments.user_id, arguments.workspace_id, arguments.goal_id)
+    elif arguments.area == "goal" and arguments.goal_command == "update":
+        await commands.goal_update(
+            GoalUpdate(
+                user_id=arguments.user_id,
+                workspace_id=arguments.workspace_id,
+                goal_id=arguments.goal_id,
+                title=arguments.title,
+                objective=arguments.objective,
+                domain=arguments.domain,
+                mode=arguments.mode,
+                priority=arguments.priority,
+                success_criteria=(
+                    tuple(arguments.success_criterion)
+                    if arguments.success_criterion is not None
+                    else None
+                ),
+                constraints=arguments.constraints_json,
+                parent_goal_id=arguments.parent_goal_id,
+                clear_parent=arguments.clear_parent,
+                status=arguments.status,
+            )
+        )
+    elif arguments.area == "situation" and arguments.situation_command == "list":
+        await commands.situation_list(
+            arguments.user_id,
+            arguments.workspace_id,
+            tuple(arguments.lifecycle),
+            arguments.limit,
+        )
+    elif arguments.area == "situation" and arguments.situation_command == "show":
+        await commands.situation_show(
+            arguments.user_id,
+            arguments.workspace_id,
+            arguments.situation_id,
+        )
     else:
         raise CliValidationError("Command is unavailable")
 
@@ -377,6 +655,31 @@ def _parse_uuid(value: str) -> UUID:
         return UUID(value)
     except ValueError:
         raise argparse.ArgumentTypeError("invalid UUID") from None
+
+
+def _parse_json_object(value: str) -> JsonObject:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        raise argparse.ArgumentTypeError("invalid JSON object") from None
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("invalid JSON object")
+    return cast(JsonObject, parsed)
+
+
+def _parse_limit(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("limit must be an integer") from None
+    if not 1 <= parsed <= 100:
+        raise argparse.ArgumentTypeError("limit must be between 1 and 100")
+    return parsed
+
+
+def _add_scope_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--user-id", required=True, type=_parse_uuid)
+    parser.add_argument("--workspace-id", required=True, type=_parse_uuid)
 
 
 def _connect_configuration(settings: Settings) -> tuple[str, str, Path]:
@@ -439,6 +742,58 @@ async def _close_database(database: Database) -> CleanupOutcome:
     except BaseException as error:
         return CleanupOutcome(interruption=error)
     return CleanupOutcome()
+
+
+async def _run_database_operation[T](
+    settings: Settings,
+    database_factory: DatabaseFactory,
+    operation: Callable[[Database], Awaitable[T]],
+) -> T:
+    database = database_factory(settings.database_url.get_secret_value())
+    primary_failure: BaseException | None = None
+    missing = object()
+    result: T | object = missing
+    try:
+        result = await operation(database)
+    except BaseException as error:
+        primary_failure = error
+    cleanup_failed = await _close_database(database)
+    _raise_after_cleanup(primary_failure, cleanup_failed)
+    if result is missing:
+        raise CliResourceError("Command did not produce a result")
+    return cast(T, result)
+
+
+def _write_json(document: object, stdout: TextIO | None) -> None:
+    print(
+        json.dumps(
+            _json_compatible(document),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        file=stdout or sys.stdout,
+    )
+
+
+def _json_compatible(value: object) -> object:
+    if isinstance(value, BaseModel):
+        # Python-mode dumping lets this single serializer normalize equivalent Decimals
+        # identically whether a record is freshly created or read back from PostgreSQL.
+        return _json_compatible(value.model_dump(mode="python"))
+    if isinstance(value, dict):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, StrEnum):
+        return value.value
+    if isinstance(value, Decimal):
+        return format(value.normalize(), "f")
+    if isinstance(value, datetime):
+        return value.isoformat().replace("+00:00", "Z")
+    return value
 
 
 def _raise_after_cleanup(

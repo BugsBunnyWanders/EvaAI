@@ -1,13 +1,15 @@
 import asyncio
+import logging
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import cast
-from uuid import UUID
+from uuid import UUID, uuid7
 
 import pytest
 
+import eva_ai.cli as cli_module
 from eva_ai.cli import (
     CleanupOutcome,
     CliResourceError,
@@ -30,14 +32,18 @@ from eva_ai.connectors.gmail.worker import GmailPullWorker
 from eva_ai.connectors.types import ConnectorRecord, ConnectorStatus
 from eva_ai.db.models import User, Workspace
 from eva_ai.db.session import Database
+from eva_ai.goals import GoalDraft, GoalMode, GoalStatus, GoalUpdate
 from eva_ai.integrations.gcp.secret_manager import GoogleSecretManagerCredentialStore
 from eva_ai.integrations.gcp.subscriber import GooglePullSubscriber
 from eva_ai.integrations.gmail.api import GoogleGmailClientFactory
 from eva_ai.local_scope import LocalScope, create_local_scope
+from eva_ai.situations import SituationLifecycle
 
 USER_ID = UUID("0191cafe-7b00-7000-8000-000000000001")
 WORKSPACE_ID = UUID("0191cafe-7b00-7000-8000-000000000002")
 CONNECTOR_ID = UUID("0191cafe-7b00-7000-8000-000000000003")
+GOAL_ID = UUID("0191cafe-7b00-7000-8000-000000000004")
+SITUATION_ID = UUID("0191cafe-7b00-7000-8000-000000000005")
 NOW = datetime(2030, 1, 1, 12, tzinfo=UTC)
 
 
@@ -56,6 +62,12 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
         "gmail_sync": RecordingCommand(),
         "gmail_pull": RecordingCommand(),
         "gmail_maintain": RecordingCommand(),
+        "goal_create": RecordingCommand(),
+        "goal_list": RecordingCommand(),
+        "goal_show": RecordingCommand(),
+        "goal_update": RecordingCommand(),
+        "situation_list": RecordingCommand(),
+        "situation_show": RecordingCommand(),
     }
     return (
         CommandFunctions(
@@ -64,6 +76,12 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
             gmail_sync=commands["gmail_sync"],
             gmail_pull=commands["gmail_pull"],
             gmail_maintain=commands["gmail_maintain"],
+            goal_create=commands["goal_create"],
+            goal_list=commands["goal_list"],
+            goal_show=commands["goal_show"],
+            goal_update=commands["goal_update"],
+            situation_list=commands["situation_list"],
+            situation_show=commands["situation_show"],
         ),
         commands,
     )
@@ -96,6 +114,139 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
         ),
         (["gmail", "pull"], "gmail_pull", ()),
         (["gmail", "maintain"], "gmail_maintain", ()),
+        (
+            [
+                "goal",
+                "create",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--title",
+                "Book trip",
+                "--objective",
+                "Take a break",
+                "--domain",
+                "personal",
+                "--mode",
+                "ACHIEVE",
+                "--priority",
+                "80",
+                "--success-criterion",
+                "Flights booked",
+                "--success-criterion",
+                "Hotel booked",
+                "--constraints-json",
+                '{"budget":"bounded"}',
+            ],
+            "goal_create",
+            (
+                GoalDraft(
+                    user_id=USER_ID,
+                    workspace_id=WORKSPACE_ID,
+                    title="Book trip",
+                    objective="Take a break",
+                    domain="personal",
+                    mode=GoalMode.ACHIEVE,
+                    priority=80,
+                    success_criteria=("Flights booked", "Hotel booked"),
+                    constraints={"budget": "bounded"},
+                ),
+            ),
+        ),
+        (
+            [
+                "goal",
+                "list",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--status",
+                "ACTIVE",
+                "--status",
+                "PAUSED",
+                "--limit",
+                "10",
+            ],
+            "goal_list",
+            (USER_ID, WORKSPACE_ID, (GoalStatus.ACTIVE, GoalStatus.PAUSED), 10),
+        ),
+        (
+            [
+                "goal",
+                "show",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--goal-id",
+                str(GOAL_ID),
+            ],
+            "goal_show",
+            (USER_ID, WORKSPACE_ID, GOAL_ID),
+        ),
+        (
+            [
+                "goal",
+                "update",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--goal-id",
+                str(GOAL_ID),
+                "--title",
+                "Updated",
+                "--status",
+                "PAUSED",
+            ],
+            "goal_update",
+            (
+                GoalUpdate(
+                    user_id=USER_ID,
+                    workspace_id=WORKSPACE_ID,
+                    goal_id=GOAL_ID,
+                    title="Updated",
+                    status=GoalStatus.PAUSED,
+                ),
+            ),
+        ),
+        (
+            [
+                "situation",
+                "list",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--lifecycle",
+                "WAITING_EXTERNAL",
+                "--lifecycle",
+                "ACTIVE",
+            ],
+            "situation_list",
+            (
+                USER_ID,
+                WORKSPACE_ID,
+                (SituationLifecycle.WAITING_EXTERNAL, SituationLifecycle.ACTIVE),
+                50,
+            ),
+        ),
+        (
+            [
+                "situation",
+                "show",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--situation-id",
+                str(SITUATION_ID),
+            ],
+            "situation_show",
+            (USER_ID, WORKSPACE_ID, SITUATION_ID),
+        ),
     ],
 )
 def test_main_dispatches_exact_command_arguments(
@@ -118,6 +269,16 @@ def test_main_dispatches_exact_command_arguments(
         ["scope", "create", "--display-name", "Saswat Ray"],
         ["gmail", "connect", "--user-id", str(USER_ID)],
         ["gmail", "sync"],
+        ["goal", "create", "--user-id", str(USER_ID)],
+        ["goal", "show", "--user-id", str(USER_ID), "--workspace-id", str(WORKSPACE_ID)],
+        [
+            "situation",
+            "show",
+            "--user-id",
+            str(USER_ID),
+            "--workspace-id",
+            str(WORKSPACE_ID),
+        ],
     ],
 )
 def test_parser_rejects_missing_required_arguments_before_dispatch(arguments: list[str]) -> None:
@@ -131,7 +292,10 @@ def test_parser_rejects_missing_required_arguments_before_dispatch(arguments: li
     assert all(not command.calls for command in commands.values())
 
 
-@pytest.mark.parametrize("arguments", [["--help"], ["gmail", "--help"]])
+@pytest.mark.parametrize(
+    "arguments",
+    [["--help"], ["gmail", "--help"], ["goal", "--help"], ["situation", "--help"]],
+)
 def test_help_never_loads_settings_or_constructs_dependencies(arguments: list[str]) -> None:
     """Fails if help can initialize OAuth, Google clients, or database composition."""
 
@@ -161,11 +325,60 @@ def test_command_failure_has_one_fixed_content_free_error(
         gmail_sync=fail,
         gmail_pull=functions.gmail_pull,
         gmail_maintain=functions.gmail_maintain,
+        goal_create=functions.goal_create,
+        goal_list=functions.goal_list,
+        goal_show=functions.goal_show,
+        goal_update=functions.goal_update,
+        situation_list=functions.situation_list,
+        situation_show=functions.situation_show,
     )
 
     assert main(["gmail", "sync", "--connector-id", str(CONNECTOR_ID)], functions) == 1
 
     captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "eva: command failed\n"
+
+
+def test_composed_command_failure_still_writes_only_one_operator_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Fails if configured application logging duplicates the CLI error on stderr."""
+    functions, _ = command_functions()
+
+    async def fail(_: UUID) -> None:
+        raise RuntimeError("private database and OAuth details")
+
+    failing_functions = CommandFunctions(
+        scope_create=functions.scope_create,
+        gmail_connect=functions.gmail_connect,
+        gmail_sync=fail,
+        gmail_pull=functions.gmail_pull,
+        gmail_maintain=functions.gmail_maintain,
+        goal_create=functions.goal_create,
+        goal_list=functions.goal_list,
+        goal_show=functions.goal_show,
+        goal_update=functions.goal_update,
+        situation_list=functions.situation_list,
+        situation_show=functions.situation_show,
+    )
+    monkeypatch.setattr(cli_module, "build_command_functions", lambda _: failing_functions)
+    root_logger = logging.getLogger()
+    original_handlers = root_logger.handlers[:]
+    original_level = root_logger.level
+    try:
+        exit_code = main(
+            ["gmail", "sync", "--connector-id", str(CONNECTOR_ID)],
+            settings_factory=lambda: Settings(_env_file=None),
+        )
+        captured = capsys.readouterr()
+    finally:
+        root_logger.handlers.clear()
+        root_logger.handlers.extend(original_handlers)
+        root_logger.setLevel(original_level)
+
+    assert exit_code == 1
     assert captured.out == ""
     assert captured.err == "eva: command failed\n"
 
@@ -205,6 +418,12 @@ def test_main_returns_nonzero_for_each_failed_one_shot_command(
         gmail_sync=fail if failed_command == "gmail_sync" else functions.gmail_sync,
         gmail_pull=functions.gmail_pull,
         gmail_maintain=(fail if failed_command == "gmail_maintain" else functions.gmail_maintain),
+        goal_create=functions.goal_create,
+        goal_list=functions.goal_list,
+        goal_show=functions.goal_show,
+        goal_update=functions.goal_update,
+        situation_list=functions.situation_list,
+        situation_show=functions.situation_show,
     )
 
     assert main(arguments, command_functions=functions) == 1
@@ -212,6 +431,98 @@ def test_main_returns_nonzero_for_each_failed_one_shot_command(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "eva: command failed\n"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [
+            "goal",
+            "create",
+            "--user-id",
+            str(USER_ID),
+            "--workspace-id",
+            str(WORKSPACE_ID),
+            "--title",
+            "Title",
+            "--objective",
+            "Objective",
+            "--domain",
+            "work",
+            "--mode",
+            "ACHIEVE",
+            "--constraints-json",
+            "[]",
+        ],
+        [
+            "goal",
+            "list",
+            "--user-id",
+            str(USER_ID),
+            "--workspace-id",
+            str(WORKSPACE_ID),
+            "--limit",
+            "101",
+        ],
+        [
+            "goal",
+            "list",
+            "--user-id",
+            str(USER_ID),
+            "--workspace-id",
+            str(WORKSPACE_ID),
+            "--status",
+            "UNKNOWN",
+        ],
+        [
+            "goal",
+            "update",
+            "--user-id",
+            str(USER_ID),
+            "--workspace-id",
+            str(WORKSPACE_ID),
+            "--goal-id",
+            str(GOAL_ID),
+            "--parent-goal-id",
+            str(uuid7()),
+            "--clear-parent",
+        ],
+    ],
+)
+def test_parser_rejects_invalid_domain_arguments_before_dispatch(arguments: list[str]) -> None:
+    functions, commands = command_functions()
+
+    with pytest.raises(SystemExit) as raised:
+        main(arguments, command_functions=functions)
+
+    assert raised.value.code == 2
+    assert all(not command.calls for command in commands.values())
+
+
+def test_goal_update_without_changes_fails_safely_before_dispatch(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    functions, commands = command_functions()
+
+    assert (
+        main(
+            [
+                "goal",
+                "update",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--goal-id",
+                str(GOAL_ID),
+            ],
+            command_functions=functions,
+        )
+        == 1
+    )
+
+    assert commands["goal_update"].calls == []
+    assert capsys.readouterr().err == "eva: command failed\n"
 
 
 class FakeSession:
