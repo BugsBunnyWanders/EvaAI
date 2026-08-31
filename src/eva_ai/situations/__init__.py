@@ -27,6 +27,7 @@ from eva_ai.situations.types import (
 
 if TYPE_CHECKING:
     from eva_ai.situations.repository import SituationRepository
+    from eva_ai.situations.resolver import SituationResolver
     from eva_ai.situations.service import SituationService
 
 __all__ = [
@@ -44,6 +45,7 @@ __all__ = [
     "SituationNotFoundError",
     "SituationRecord",
     "SituationRepository",
+    "SituationResolver",
     "SituationResolution",
     "SituationResolutionError",
     "SituationScopeError",
@@ -60,6 +62,10 @@ def __getattr__(name: str) -> object:
         from eva_ai.situations.repository import SituationRepository
 
         return SituationRepository
+    if name == "SituationResolver":
+        from eva_ai.situations.resolver import SituationResolver
+
+        return SituationResolver
     if name == "SituationService":
         from eva_ai.situations.service import SituationService
 
