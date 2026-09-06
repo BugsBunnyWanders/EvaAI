@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID, uuid5
 
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,7 +15,7 @@ from eva_ai.events.processor import EventCommit, StoredEvent
 from eva_ai.events.types import ProcessingStage
 from eva_ai.relevance.classifier import ClassifierRunRequest, RelevanceClassifierRunner
 from eva_ai.relevance.context import RelevanceContextBuilder, context_digest
-from eva_ai.relevance.errors import RelevanceConflictError, RelevanceScopeError
+from eva_ai.relevance.errors import RelevanceConflictError, RelevanceError, RelevanceScopeError
 from eva_ai.relevance.filters import (
     RelevanceRuleProvider,
     RelevanceRuleSet,
@@ -51,6 +52,15 @@ def initial_evaluation_key(event_id: UUID) -> UUID:
 
 def backfill_evaluation_key(event_id: UUID) -> UUID:
     return uuid5(_EVALUATION_NAMESPACE, f"backfill:{event_id}")
+
+
+class BackfillSummary(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    selected: int
+    succeeded: int
+    failed: int
+    signal_ids: tuple[UUID, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,23 +278,7 @@ class RelevanceService:
             operator_reason=command.reason,
             requested_at=command.requested_at,
         )
-        async with self._database.session() as session:
-            async with session.begin():
-                processing = await session.scalar(
-                    select(EventProcessing)
-                    .where(EventProcessing.event_id == command.event_id)
-                    .with_for_update()
-                )
-                if processing is None:
-                    raise RelevanceScopeError("Event processing state not found")
-                if processing.stage != ProcessingStage.HANDLED and processing.claim_id is not None:
-                    raise RelevanceConflictError("Event has an active processing claim")
-                await prepared.apply(session, command.requested_at)
-                if processing.stage != ProcessingStage.HANDLED:
-                    processing.stage = ProcessingStage.HANDLED
-                    processing.processed_at = command.requested_at
-                    processing.claim_id = None
-                    processing.lease_expires_at = None
+        await self._apply_direct(command.event_id, prepared, command.requested_at)
         result = await self._repository.get_by_evaluation_key(
             event_id=command.event_id,
             user_id=command.user_id,
@@ -294,6 +288,65 @@ class RelevanceService:
         if result is None:
             raise RelevanceScopeError("re-evaluation did not create a Signal")
         return result
+
+    async def backfill(self, *, user_id: UUID, workspace_id: UUID, limit: int) -> BackfillSummary:
+        event_ids = await self._repository.list_unevaluated_event_ids(
+            user_id=user_id, workspace_id=workspace_id, limit=limit
+        )
+        signal_ids: list[UUID] = []
+        failed = 0
+        for event_id in event_ids:
+            try:
+                event = await self._repository.get_stored_event(
+                    event_id=event_id, user_id=user_id, workspace_id=workspace_id
+                )
+                key = backfill_evaluation_key(event_id)
+                prepared = await self._handler.prepare_evaluation(
+                    event,
+                    evaluation_key=key,
+                    trigger=EvaluationTrigger.BACKFILL,
+                    operator_reason=None,
+                    requested_at=datetime.now(UTC),
+                )
+                await self._apply_direct(event_id, prepared, datetime.now(UTC))
+                signal = await self._repository.get_by_evaluation_key(
+                    event_id=event_id,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    evaluation_key=key,
+                )
+                if signal is None:
+                    raise RelevanceScopeError("backfill did not create a Signal")
+                signal_ids.append(signal.id)
+            except RelevanceError:
+                failed += 1
+        return BackfillSummary(
+            selected=len(event_ids),
+            succeeded=len(signal_ids),
+            failed=failed,
+            signal_ids=tuple(signal_ids),
+        )
+
+    async def _apply_direct(
+        self, event_id: UUID, prepared: EventCommit, committed_at: datetime
+    ) -> None:
+        async with self._database.session() as session:
+            async with session.begin():
+                processing = await session.scalar(
+                    select(EventProcessing)
+                    .where(EventProcessing.event_id == event_id)
+                    .with_for_update()
+                )
+                if processing is None:
+                    raise RelevanceScopeError("Event processing state not found")
+                if processing.stage != ProcessingStage.HANDLED and processing.claim_id is not None:
+                    raise RelevanceConflictError("Event has an active processing claim")
+                await prepared.apply(session, committed_at)
+                if processing.stage != ProcessingStage.HANDLED:
+                    processing.stage = ProcessingStage.HANDLED
+                    processing.processed_at = committed_at
+                    processing.claim_id = None
+                    processing.lease_expires_at = None
 
 
 def _deterministic_digest(
