@@ -2,12 +2,14 @@ import asyncio
 import logging
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import TracebackType
 from typing import cast
 from uuid import UUID, uuid7
 
 import pytest
+from pydantic import BaseModel
 
 import eva_ai.cli as cli_module
 from eva_ai.cli import (
@@ -37,6 +39,15 @@ from eva_ai.integrations.gcp.secret_manager import GoogleSecretManagerCredential
 from eva_ai.integrations.gcp.subscriber import GooglePullSubscriber
 from eva_ai.integrations.gmail.api import GoogleGmailClientFactory
 from eva_ai.local_scope import LocalScope, create_local_scope
+from eva_ai.memory.types import (
+    EpisodicMemoryDraft,
+    EpisodicMemoryStatus,
+    MemoryEpisodeType,
+    MemoryFactDraft,
+    MemoryFactStatus,
+    MemoryScopeType,
+    MemorySourceType,
+)
 from eva_ai.situations import SituationLifecycle
 
 USER_ID = UUID("0191cafe-7b00-7000-8000-000000000001")
@@ -45,6 +56,7 @@ CONNECTOR_ID = UUID("0191cafe-7b00-7000-8000-000000000003")
 GOAL_ID = UUID("0191cafe-7b00-7000-8000-000000000004")
 SITUATION_ID = UUID("0191cafe-7b00-7000-8000-000000000005")
 EVALUATION_KEY = UUID("0191cafe-7b00-7000-8000-000000000006")
+MEMORY_ID = UUID("0191cafe-7b00-7000-8000-000000000007")
 NOW = datetime(2030, 1, 1, 12, tzinfo=UTC)
 
 
@@ -75,6 +87,16 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
         "relevance_history": RecordingCommand(),
         "relevance_reevaluate": RecordingCommand(),
         "relevance_backfill": RecordingCommand(),
+        "memory_fact_put": RecordingCommand(),
+        "memory_fact_list": RecordingCommand(),
+        "memory_fact_show": RecordingCommand(),
+        "memory_fact_retract": RecordingCommand(),
+        "memory_episode_create": RecordingCommand(),
+        "memory_episode_list": RecordingCommand(),
+        "memory_episode_show": RecordingCommand(),
+        "memory_episode_retract": RecordingCommand(),
+        "memory_episode_search": RecordingCommand(),
+        "context_build": RecordingCommand(),
     }
     return (
         CommandFunctions(
@@ -95,6 +117,16 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
             relevance_history=commands["relevance_history"],
             relevance_reevaluate=commands["relevance_reevaluate"],
             relevance_backfill=commands["relevance_backfill"],
+            memory_fact_put=commands["memory_fact_put"],
+            memory_fact_list=commands["memory_fact_list"],
+            memory_fact_show=commands["memory_fact_show"],
+            memory_fact_retract=commands["memory_fact_retract"],
+            memory_episode_create=commands["memory_episode_create"],
+            memory_episode_list=commands["memory_episode_list"],
+            memory_episode_show=commands["memory_episode_show"],
+            memory_episode_retract=commands["memory_episode_retract"],
+            memory_episode_search=commands["memory_episode_search"],
+            context_build=commands["context_build"],
         ),
         commands,
     )
@@ -320,6 +352,221 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
             "situation_show",
             (USER_ID, WORKSPACE_ID, SITUATION_ID),
         ),
+        (
+            [
+                "memory",
+                "fact",
+                "put",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--namespace",
+                "Preferences",
+                "--key",
+                "Communication.Style",
+                "--value-json",
+                '"concise"',
+                "--scope-type",
+                "WORKSPACE",
+                "--scope-id",
+                str(WORKSPACE_ID),
+                "--source-ref",
+                "telegram:message:42",
+                "--confidence",
+                "1",
+                "--idempotency-key",
+                "fact-42",
+                "--valid-from",
+                NOW.isoformat(),
+            ],
+            "memory_fact_put",
+            (
+                MemoryFactDraft(
+                    user_id=USER_ID,
+                    workspace_id=WORKSPACE_ID,
+                    namespace="preferences",
+                    key="communication.style",
+                    value_json="concise",
+                    scope_type=MemoryScopeType.WORKSPACE,
+                    scope_id=WORKSPACE_ID,
+                    source_type=MemorySourceType.USER_EXPLICIT,
+                    source_ref="telegram:message:42",
+                    confidence=Decimal("1"),
+                    idempotency_key="fact-42",
+                    valid_from=NOW,
+                ),
+            ),
+        ),
+        (
+            [
+                "memory",
+                "fact",
+                "list",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--status",
+                "ACTIVE",
+            ],
+            "memory_fact_list",
+            (USER_ID, WORKSPACE_ID, (MemoryFactStatus.ACTIVE,), 50),
+        ),
+        (
+            [
+                "memory",
+                "fact",
+                "show",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--memory-id",
+                str(MEMORY_ID),
+            ],
+            "memory_fact_show",
+            (USER_ID, WORKSPACE_ID, MEMORY_ID),
+        ),
+        (
+            [
+                "memory",
+                "fact",
+                "retract",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--memory-id",
+                str(MEMORY_ID),
+            ],
+            "memory_fact_retract",
+            (USER_ID, WORKSPACE_ID, MEMORY_ID),
+        ),
+        (
+            [
+                "memory",
+                "episode",
+                "create",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--type",
+                "DECISION",
+                "--summary",
+                "Chose the morning flight.",
+                "--entity",
+                "Travel",
+                "--goal-id",
+                str(GOAL_ID),
+                "--importance",
+                "0.8",
+                "--confidence",
+                "1",
+                "--source-ref",
+                "telegram:message:84",
+                "--idempotency-key",
+                "episode-84",
+                "--occurred-at",
+                NOW.isoformat(),
+            ],
+            "memory_episode_create",
+            (
+                EpisodicMemoryDraft(
+                    user_id=USER_ID,
+                    workspace_id=WORKSPACE_ID,
+                    type=MemoryEpisodeType.DECISION,
+                    summary="Chose the morning flight.",
+                    entities=("travel",),
+                    goal_ids=(GOAL_ID,),
+                    importance=Decimal("0.8"),
+                    confidence=Decimal("1"),
+                    source_type=MemorySourceType.USER_EXPLICIT,
+                    source_ref="telegram:message:84",
+                    idempotency_key="episode-84",
+                    occurred_at=NOW,
+                ),
+            ),
+        ),
+        (
+            [
+                "memory",
+                "episode",
+                "list",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--status",
+                "RETRACTED",
+                "--limit",
+                "5",
+            ],
+            "memory_episode_list",
+            (USER_ID, WORKSPACE_ID, (EpisodicMemoryStatus.RETRACTED,), 5),
+        ),
+        (
+            [
+                "memory",
+                "episode",
+                "show",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--memory-id",
+                str(MEMORY_ID),
+            ],
+            "memory_episode_show",
+            (USER_ID, WORKSPACE_ID, MEMORY_ID),
+        ),
+        (
+            [
+                "memory",
+                "episode",
+                "retract",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--memory-id",
+                str(MEMORY_ID),
+            ],
+            "memory_episode_retract",
+            (USER_ID, WORKSPACE_ID, MEMORY_ID),
+        ),
+        (
+            [
+                "memory",
+                "episode",
+                "search",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--query",
+                "travel preference",
+            ],
+            "memory_episode_search",
+            (USER_ID, WORKSPACE_ID, "travel preference", 8),
+        ),
+        (
+            [
+                "context",
+                "build",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--situation-id",
+                str(SITUATION_ID),
+                "--focus",
+                "What should happen next?",
+            ],
+            "context_build",
+            (USER_ID, WORKSPACE_ID, SITUATION_ID, "What should happen next?"),
+        ),
     ],
 )
 def test_main_dispatches_exact_command_arguments(
@@ -332,7 +579,12 @@ def test_main_dispatches_exact_command_arguments(
 
     assert main(arguments, command_functions=functions) == 0
 
-    assert commands[called].calls == [expected]
+    if called in {"memory_fact_put", "memory_episode_create"}:
+        actual_draft = cast(BaseModel, commands[called].calls[0][0])
+        expected_draft = cast(BaseModel, expected[0])
+        assert actual_draft.model_dump(exclude={"id"}) == expected_draft.model_dump(exclude={"id"})
+    else:
+        assert commands[called].calls == [expected]
     assert sum(len(command.calls) for command in commands.values()) == 1
 
 
@@ -347,6 +599,23 @@ def test_main_dispatches_exact_command_arguments(
         [
             "situation",
             "show",
+            "--user-id",
+            str(USER_ID),
+            "--workspace-id",
+            str(WORKSPACE_ID),
+        ],
+        [
+            "memory",
+            "fact",
+            "show",
+            "--user-id",
+            str(USER_ID),
+            "--workspace-id",
+            str(WORKSPACE_ID),
+        ],
+        [
+            "context",
+            "build",
             "--user-id",
             str(USER_ID),
             "--workspace-id",
@@ -367,7 +636,14 @@ def test_parser_rejects_missing_required_arguments_before_dispatch(arguments: li
 
 @pytest.mark.parametrize(
     "arguments",
-    [["--help"], ["gmail", "--help"], ["goal", "--help"], ["situation", "--help"]],
+    [
+        ["--help"],
+        ["gmail", "--help"],
+        ["goal", "--help"],
+        ["situation", "--help"],
+        ["memory", "--help"],
+        ["context", "--help"],
+    ],
 )
 def test_help_never_loads_settings_or_constructs_dependencies(arguments: list[str]) -> None:
     """Fails if help can initialize OAuth, Google clients, or database composition."""
