@@ -112,3 +112,58 @@ def test_gmail_sync_target_dry_run_never_expands_operator_value(
     assert not marker.exists()
     assert connector_value not in completed.stdout
     assert '"${EVA_GMAIL_CONNECTOR_ID}"' in completed.stdout
+
+
+def test_relevance_reevaluate_forwards_all_operator_values_as_literal_arguments(
+    tmp_path: Path,
+) -> None:
+    bin_dir, capture_file = _fake_uv(tmp_path)
+    marker = tmp_path / "relevance-injected"
+    malicious = f'$(shell touch {marker})"; touch {marker}; $HOME\nsecond-line'
+    environment = _make_environment(bin_dir, capture_file)
+    environment.update(
+        EVA_USER_ID="user-id",
+        EVA_WORKSPACE_ID="workspace-id",
+        EVA_EVENT_ID="event-id",
+        EVA_RELEVANCE_REASON=malicious,
+        EVA_RELEVANCE_IDEMPOTENCY_KEY="evaluation-id",
+    )
+
+    completed = subprocess.run(
+        ["make", "--no-print-directory", "relevance-reevaluate"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert not marker.exists()
+    assert json.loads(capture_file.read_text(encoding="utf-8")) == [
+        "run",
+        "eva",
+        "relevance",
+        "reevaluate",
+        "--user-id",
+        "user-id",
+        "--workspace-id",
+        "workspace-id",
+        "--event-id",
+        "event-id",
+        "--reason",
+        malicious,
+        "--idempotency-key",
+        "evaluation-id",
+    ]
+
+
+def test_relevance_documentation_and_safe_defaults_are_present() -> None:
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert "docs/relevance-operator.md" in readme
+    assert "EVA_RELEVANCE_ENABLED=false" in example
+    assert "EVA_OPENAI_API_KEY=\n" in example
+    assert "EVA_OUTBOX_RELAY_POLL_SECONDS=1" in example
+    assert "EVA_RELEVANCE_MODEL=gpt-5.6-luna" in example

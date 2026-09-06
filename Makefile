@@ -2,9 +2,12 @@
 override EVA_USER_ID := $(value EVA_USER_ID)
 override EVA_WORKSPACE_ID := $(value EVA_WORKSPACE_ID)
 override EVA_GMAIL_CONNECTOR_ID := $(value EVA_GMAIL_CONNECTOR_ID)
-export EVA_USER_ID EVA_WORKSPACE_ID EVA_GMAIL_CONNECTOR_ID
+override EVA_EVENT_ID := $(value EVA_EVENT_ID)
+override EVA_RELEVANCE_REASON := $(value EVA_RELEVANCE_REASON)
+override EVA_RELEVANCE_IDEMPOTENCY_KEY := $(value EVA_RELEVANCE_IDEMPOTENCY_KEY)
+export EVA_USER_ID EVA_WORKSPACE_ID EVA_GMAIL_CONNECTOR_ID EVA_EVENT_ID EVA_RELEVANCE_REASON EVA_RELEVANCE_IDEMPOTENCY_KEY
 
-.PHONY: setup db-up db-down migrate run gmail-connect gmail-sync gmail-pull gmail-maintain test lint format typecheck verify
+.PHONY: setup db-up db-down migrate run gmail-connect gmail-sync gmail-pull gmail-maintain events-relay relevance-pull relevance-show relevance-history relevance-reevaluate relevance-backfill test lint format typecheck verify
 
 setup:
 	uv sync --all-groups
@@ -32,6 +35,24 @@ gmail-pull:
 
 gmail-maintain:
 	uv run eva gmail maintain
+
+events-relay:
+	uv run eva events relay
+
+relevance-pull:
+	uv run eva relevance pull
+
+relevance-show:
+	uv run eva relevance show --user-id "$${EVA_USER_ID}" --workspace-id "$${EVA_WORKSPACE_ID}" --event-id "$${EVA_EVENT_ID}"
+
+relevance-history:
+	uv run eva relevance history --user-id "$${EVA_USER_ID}" --workspace-id "$${EVA_WORKSPACE_ID}" --event-id "$${EVA_EVENT_ID}"
+
+relevance-reevaluate:
+	uv run eva relevance reevaluate --user-id "$${EVA_USER_ID}" --workspace-id "$${EVA_WORKSPACE_ID}" --event-id "$${EVA_EVENT_ID}" --reason "$${EVA_RELEVANCE_REASON}" --idempotency-key "$${EVA_RELEVANCE_IDEMPOTENCY_KEY}"
+
+relevance-backfill:
+	uv run eva relevance backfill --user-id "$${EVA_USER_ID}" --workspace-id "$${EVA_WORKSPACE_ID}"
 
 test:
 	uv run pytest -v
