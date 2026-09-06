@@ -136,6 +136,7 @@ class CommandFunctions:
     relevance_history: RelevanceHistoryCommand = _unavailable_command
     relevance_reevaluate: RelevanceReevaluateCommand = _unavailable_command
     relevance_backfill: RelevanceBackfillCommand = _unavailable_command
+    worker_run: NoArgumentCommand = _unavailable_command
     memory_fact_put: MemoryFactPutCommand = _unavailable_command
     memory_fact_list: MemoryFactListCommand = _unavailable_command
     memory_fact_show: MemoryRecordCommand = _unavailable_command
@@ -542,6 +543,16 @@ async def relevance_pull_command(*, settings: Settings) -> None:
     )
 
 
+async def worker_run_command(*, settings: Settings) -> None:
+    """Run every continuous consumer as one Cloud Run worker-pool process."""
+    # A failure in any loop cancels its siblings. Their command-level cleanup handlers then
+    # release database and Google clients before Cloud Run restarts the worker instance.
+    async with asyncio.TaskGroup() as group:
+        group.create_task(gmail_pull_command(settings=settings), name="gmail-pull")
+        group.create_task(events_relay_command(settings=settings), name="event-relay")
+        group.create_task(relevance_pull_command(settings=settings), name="relevance-pull")
+
+
 async def relevance_show_command(
     user_id: UUID,
     workspace_id: UUID,
@@ -864,6 +875,7 @@ def build_command_functions(settings: Settings) -> CommandFunctions:
         relevance_history=partial(relevance_history_command, settings=settings),
         relevance_reevaluate=partial(relevance_reevaluate_command, settings=settings),
         relevance_backfill=partial(relevance_backfill_command, settings=settings),
+        worker_run=partial(worker_run_command, settings=settings),
         memory_fact_put=partial(memory_fact_put_command, settings=settings),
         memory_fact_list=partial(memory_fact_list_command, settings=settings),
         memory_fact_show=partial(memory_fact_show_command, settings=settings),
@@ -880,6 +892,10 @@ def build_command_functions(settings: Settings) -> CommandFunctions:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="eva")
     commands = parser.add_subparsers(dest="area", required=True)
+
+    worker = commands.add_parser("worker")
+    worker_commands = worker.add_subparsers(dest="worker_command", required=True)
+    worker_commands.add_parser("run")
 
     scope = commands.add_parser("scope")
     scope_commands = scope.add_subparsers(dest="scope_command", required=True)
@@ -1080,7 +1096,9 @@ def main(
 
 
 async def _dispatch(arguments: argparse.Namespace, commands: CommandFunctions) -> None:
-    if arguments.area == "scope" and arguments.scope_command == "create":
+    if arguments.area == "worker" and arguments.worker_command == "run":
+        await commands.worker_run()
+    elif arguments.area == "scope" and arguments.scope_command == "create":
         await commands.scope_create(arguments.display_name, arguments.workspace_name)
     elif arguments.area == "gmail" and arguments.gmail_command == "connect":
         await commands.gmail_connect(arguments.user_id, arguments.workspace_id)

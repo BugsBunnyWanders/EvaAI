@@ -30,6 +30,15 @@ curl http://127.0.0.1:8000/health/ready
 
 Both endpoints return HTTP 200 when the application and database are ready.
 
+## GCP deployment
+
+Milestone 5.5 packages the API and continuous worker into one immutable image and provisions the
+production runtime with Terraform. Pull requests receive no Google credential; after CI succeeds on
+`main`, GitHub Actions authenticates through Workload Identity Federation, applies Terraform with
+workers paused, runs migrations, restores the configured worker count, and checks API readiness.
+The one-time bootstrap and first Gmail activation steps are in the
+[GCP deployment guide](docs/deployment.md).
+
 ## Public website
 
 Eva's dependency-free public website lives in `site/`. It provides the product homepage and the stable policy URLs used by Google OAuth:

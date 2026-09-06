@@ -25,6 +25,7 @@ from eva_ai.cli import (
     gmail_sync_command,
     main,
     scope_create_command,
+    worker_run_command,
 )
 from eva_ai.config import Settings
 from eva_ai.connectors.gmail.bootstrap import ConnectGmail, GmailBootstrapService
@@ -87,6 +88,7 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
         "relevance_history": RecordingCommand(),
         "relevance_reevaluate": RecordingCommand(),
         "relevance_backfill": RecordingCommand(),
+        "worker_run": RecordingCommand(),
         "memory_fact_put": RecordingCommand(),
         "memory_fact_list": RecordingCommand(),
         "memory_fact_show": RecordingCommand(),
@@ -117,6 +119,7 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
             relevance_history=commands["relevance_history"],
             relevance_reevaluate=commands["relevance_reevaluate"],
             relevance_backfill=commands["relevance_backfill"],
+            worker_run=commands["worker_run"],
             memory_fact_put=commands["memory_fact_put"],
             memory_fact_list=commands["memory_fact_list"],
             memory_fact_show=commands["memory_fact_show"],
@@ -161,6 +164,7 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
         (["gmail", "maintain"], "gmail_maintain", ()),
         (["events", "relay"], "events_relay", ()),
         (["relevance", "pull"], "relevance_pull", ()),
+        (["worker", "run"], "worker_run", ()),
         (
             [
                 "relevance",
@@ -1382,6 +1386,44 @@ async def test_pull_runs_continuously_and_cleans_up_on_cancellation() -> None:
     assert raised.value is cancellation
     assert dependencies.worker.calls == 1
     assert dependencies.close_calls == 1
+
+
+async def test_worker_run_supervises_every_continuous_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fails if the Cloud Run worker entrypoint omits a required continuous consumer."""
+    started: set[str] = set()
+    all_started = asyncio.Event()
+
+    async def run(component: str, *, settings: Settings) -> None:
+        assert settings.environment.value == "test"
+        started.add(component)
+        if len(started) == 3:
+            all_started.set()
+        await asyncio.Future()
+
+    async def gmail(*, settings: Settings) -> None:
+        await run("gmail", settings=settings)
+
+    async def relay(*, settings: Settings) -> None:
+        await run("relay", settings=settings)
+
+    async def relevance(*, settings: Settings) -> None:
+        await run("relevance", settings=settings)
+
+    monkeypatch.setattr(cli_module, "gmail_pull_command", gmail)
+    monkeypatch.setattr(cli_module, "events_relay_command", relay)
+    monkeypatch.setattr(cli_module, "relevance_pull_command", relevance)
+    task = asyncio.create_task(
+        worker_run_command(settings=Settings(_env_file=None, environment="test"))
+    )
+
+    await asyncio.wait_for(all_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert started == {"gmail", "relay", "relevance"}
 
 
 class RecordingCloseResource:

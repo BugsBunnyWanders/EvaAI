@@ -1,0 +1,197 @@
+name: Deploy Eva to GCP
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/deploy.yml"
+      - ".dockerignore"
+      - "Dockerfile"
+      - "terraform/**"
+  workflow_dispatch:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eva-production
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: "1.16.1"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  terraform-checks:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Check Terraform formatting
+        run: terraform fmt -check -recursive terraform
+
+      - name: Initialize bootstrap configuration
+        run: terraform -chdir=terraform/bootstrap init -backend=false
+
+      - name: Validate bootstrap configuration
+        run: terraform -chdir=terraform/bootstrap validate
+
+      - name: Initialize production configuration
+        run: terraform -chdir=terraform/environments/production init -backend=false
+
+      - name: Validate production configuration
+        run: terraform -chdir=terraform/environments/production validate
+
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out trusted main revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || 'main' }}
+
+      - name: Detect deployable changes
+        id: changes
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          elif git diff --quiet HEAD^ HEAD -- \
+            src migrations pyproject.toml uv.lock Dockerfile .dockerignore terraform \
+            .github/workflows/deploy.yml; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check deployment configuration
+        if: steps.changes.outputs.deploy == 'true'
+        shell: bash
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          DEPLOYER: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+        run: |
+          for value in PROJECT_ID REGION STATE_BUCKET WIF_PROVIDER DEPLOYER; do
+            if [[ -z "${!value}" ]]; then
+              echo "Missing required production repository variable: ${value}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Authenticate to Google Cloud
+        if: steps.changes.outputs.deploy == 'true'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Install Google Cloud CLI
+        if: steps.changes.outputs.deploy == 'true'
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Install Terraform
+        if: steps.changes.outputs.deploy == 'true'
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Build and push immutable image
+        if: steps.changes.outputs.deploy == 'true'
+        id: image
+        shell: bash
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+        run: |
+          registry="${REGION}-docker.pkg.dev"
+          release_sha="$(git rev-parse HEAD)"
+          tag="${registry}/${PROJECT_ID}/eva/eva:${release_sha}"
+          gcloud auth configure-docker "${registry}" --quiet
+          docker build --pull --tag "${tag}" .
+          docker push "${tag}"
+          digest="$(gcloud artifacts docker images describe "${tag}" --format='value(image_summary.digest)')"
+          echo "uri=${registry}/${PROJECT_ID}/eva/eva@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Initialize production state
+        if: steps.changes.outputs.deploy == 'true'
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: >-
+          terraform -chdir=terraform/environments/production init
+          -backend-config="bucket=${STATE_BUCKET}"
+
+      - name: Apply infrastructure with workers paused
+        if: steps.changes.outputs.deploy == 'true'
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          IMAGE: ${{ steps.image.outputs.uri }}
+        run: |
+          terraform -chdir=terraform/environments/production plan \
+            -out=paused.tfplan \
+            -var="project_id=${PROJECT_ID}" \
+            -var="region=${REGION}" \
+            -var="image=${IMAGE}" \
+            -var="worker_instance_count=0"
+          terraform -chdir=terraform/environments/production apply -auto-approve paused.tfplan
+
+      - name: Run database migrations
+        if: steps.changes.outputs.deploy == 'true'
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+        run: >-
+          gcloud run jobs execute eva-migrate
+          --project="${PROJECT_ID}"
+          --region="${REGION}"
+          --wait
+
+      - name: Apply desired worker count
+        if: steps.changes.outputs.deploy == 'true'
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          IMAGE: ${{ steps.image.outputs.uri }}
+          WORKER_COUNT: ${{ vars.EVA_WORKER_INSTANCE_COUNT || '0' }}
+        run: |
+          terraform -chdir=terraform/environments/production plan \
+            -out=running.tfplan \
+            -var="project_id=${PROJECT_ID}" \
+            -var="region=${REGION}" \
+            -var="image=${IMAGE}" \
+            -var="worker_instance_count=${WORKER_COUNT}"
+          terraform -chdir=terraform/environments/production apply -auto-approve running.tfplan
+
+      - name: Verify API health
+        if: steps.changes.outputs.deploy == 'true'
+        shell: bash
+        run: |
+          api_url="$(terraform -chdir=terraform/environments/production output -raw api_url)"
+          curl --fail --show-error --silent --retry 8 --retry-all-errors \
+            --retry-delay 5 "${api_url}/health/ready"
