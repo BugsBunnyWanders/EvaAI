@@ -6,6 +6,8 @@ from typing import Annotated, Literal, Self
 from pydantic import Field, PositiveFloat, PositiveInt, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from eva_ai.relevance.types import RelevanceProvider as RelevanceProvider
+
 
 class AppEnvironment(StrEnum):
     LOCAL = "local"
@@ -54,6 +56,37 @@ class Settings(BaseSettings):
     outbox_batch_limit: PositiveInt = 100
     outbox_lease_seconds: PositiveInt = 60
     processing_lease_seconds: PositiveInt = 300
+    outbox_relay_poll_seconds: PositiveFloat = 1.0
+    relevance_enabled: bool = False
+    relevance_provider: RelevanceProvider = RelevanceProvider.OPENAI
+    openai_api_key: SecretStr | None = None
+    relevance_model: str = "gpt-5.6-luna"
+    relevance_subscription_id: str = "eva-relevance-local"
+    relevance_pull_timeout_seconds: PositiveInt = 30
+    relevance_classifier_version: str = "relevance-v1"
+    relevance_policy_version: str = "relevance-policy-v1"
+    relevance_body_max_chars: int = Field(default=4000, ge=1, le=8000)
+    relevance_goal_limit: int = Field(default=20, ge=1, le=20)
+    relevance_goal_max_chars: int = Field(default=500, ge=1, le=1000)
+    relevance_goal_total_chars: int = Field(default=8000, ge=1, le=10000)
+    relevance_situation_limit: int = Field(default=5, ge=1, le=5)
+    relevance_situation_max_chars: int = Field(default=500, ge=1, le=1000)
+    relevance_situation_total_chars: int = Field(default=2500, ge=1, le=5000)
+    relevance_notify_relevance: UnitInterval = 0.75
+    relevance_notify_confidence: UnitInterval = 0.70
+    relevance_notify_importance_or_urgency: UnitInterval = 0.65
+    relevance_investigate_relevance: UnitInterval = 0.60
+    relevance_investigate_confidence: UnitInterval = 0.65
+    relevance_ignore_relevance: UnitInterval = 0.20
+    relevance_ignore_confidence: UnitInterval = 0.80
+    relevance_retry_attempts: PositiveInt = 3
+    relevance_retry_initial_backoff_seconds: PositiveFloat = 2.0
+    relevance_retry_max_backoff_seconds: PositiveFloat = 30.0
+    relevance_retry_jitter_ratio: UnitInterval = 0.2
+    relevance_ignored_sources: tuple[str, ...] = ()
+    relevance_ignored_event_types: tuple[str, ...] = ()
+    relevance_ignored_senders: tuple[str, ...] = ()
+    relevance_ignored_labels: tuple[str, ...] = ()
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -62,7 +95,15 @@ class Settings(BaseSettings):
             return value.upper()
         return value
 
-    @field_validator("pubsub_topic_id", "gmail_topic_id", "gmail_subscription_id")
+    @field_validator(
+        "pubsub_topic_id",
+        "gmail_topic_id",
+        "gmail_subscription_id",
+        "relevance_model",
+        "relevance_subscription_id",
+        "relevance_classifier_version",
+        "relevance_policy_version",
+    )
     @classmethod
     def reject_blank_topic_id(cls, value: str) -> str:
         if not value.strip():
@@ -76,10 +117,29 @@ class Settings(BaseSettings):
             raise ValueError("must not be blank")
         return value
 
+    @field_validator(
+        "relevance_ignored_sources",
+        "relevance_ignored_event_types",
+        "relevance_ignored_senders",
+        "relevance_ignored_labels",
+    )
+    @classmethod
+    def normalize_relevance_rules(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(sorted({value.strip().casefold() for value in values if value.strip()}))
+
     @model_validator(mode="after")
     def validate_gmail_retry_bounds(self) -> Self:
         if self.gmail_retry_max_backoff_seconds < self.gmail_retry_initial_backoff_seconds:
             raise ValueError("Gmail retry maximum must not be below its initial backoff")
+        if self.relevance_retry_max_backoff_seconds < self.relevance_retry_initial_backoff_seconds:
+            raise ValueError("relevance retry maximum must not be below its initial backoff")
+        if self.relevance_goal_total_chars < self.relevance_goal_max_chars:
+            raise ValueError("Goal total bound must not be below per-item bound")
+        if self.relevance_situation_total_chars < self.relevance_situation_max_chars:
+            raise ValueError("Situation total bound must not be below per-item bound")
+        if self.relevance_enabled and self.relevance_provider is RelevanceProvider.OPENAI:
+            if self.openai_api_key is None or not self.openai_api_key.get_secret_value().strip():
+                raise ValueError("OpenAI API key is required when relevance processing is enabled")
         return self
 
 

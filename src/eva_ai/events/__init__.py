@@ -20,6 +20,7 @@ from eva_ai.events.types import (
 if TYPE_CHECKING:
     from eva_ai.events.outbox import ClaimedOutboxMessage, OutboxRelay, PublishBatchResult
     from eva_ai.events.processor import (
+        EventCommit,
         EventHandler,
         EventProcessor,
         ProcessOutcome,
@@ -33,6 +34,7 @@ __all__ = [
     "ClaimedOutboxMessage",
     "EventAvailableMessage",
     "EventHandler",
+    "EventCommit",
     "EventProcessor",
     "EventService",
     "IngestResult",
@@ -65,12 +67,14 @@ def __getattr__(name: str) -> object:
         }[name]
     if name in {
         "EventHandler",
+        "EventCommit",
         "EventProcessor",
         "ProcessOutcome",
         "ProcessResult",
         "StoredEvent",
     }:
         from eva_ai.events.processor import (
+            EventCommit,
             EventHandler,
             EventProcessor,
             ProcessOutcome,
@@ -80,6 +84,7 @@ def __getattr__(name: str) -> object:
 
         return {
             "EventHandler": EventHandler,
+            "EventCommit": EventCommit,
             "EventProcessor": EventProcessor,
             "ProcessOutcome": ProcessOutcome,
             "ProcessResult": ProcessResult,

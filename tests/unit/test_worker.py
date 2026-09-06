@@ -15,10 +15,12 @@ from eva_ai.events.processor import (
 )
 from eva_ai.events.publisher import InMemoryPublisher, Publisher
 from eva_ai.events.types import EventAvailableMessage
+from eva_ai.relevance.classifier import ScriptedRelevanceClassifier
 from eva_ai.worker import (
     build_event_processor,
     build_outbox_relay,
     build_publisher,
+    build_relevance_dependencies,
     dispatch_event,
 )
 
@@ -40,7 +42,7 @@ class RecordingProcessor:
 
 
 class UnexpectedHandler:
-    async def handle(self, event: StoredEvent) -> None:
+    async def prepare(self, event: StoredEvent) -> Never:
         raise AssertionError(f"worker unexpectedly invoked handler for {event.id}")
 
 
@@ -79,6 +81,26 @@ def test_google_composition_requires_project_id() -> None:
 
     with pytest.raises(ValueError, match="EVA_PUBSUB_PROJECT_ID"):
         build_publisher(settings, use_google=True)
+
+
+def test_disabled_relevance_refuses_composition() -> None:
+    with pytest.raises(ValueError, match="relevance processing is disabled"):
+        build_relevance_dependencies(Settings(_env_file=None), include_pull_worker=False)
+
+
+async def test_injected_classifier_builds_database_only_relevance_runtime() -> None:
+    settings = Settings(_env_file=None).model_copy(update={"relevance_enabled": True})
+
+    dependencies = build_relevance_dependencies(
+        settings,
+        include_pull_worker=False,
+        classifier=ScriptedRelevanceClassifier(()),
+    )
+
+    assert dependencies.openai_client is None
+    assert dependencies.subscriber is None
+    assert dependencies.worker is None
+    await dependencies.close()
 
 
 @pytest.mark.parametrize("project_id", ["", "   "])

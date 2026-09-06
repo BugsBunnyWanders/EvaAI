@@ -1,7 +1,7 @@
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from eva_ai.config import AppEnvironment, LogFormat, Settings
+from eva_ai.config import AppEnvironment, LogFormat, RelevanceProvider, Settings
 
 
 def test_settings_have_safe_local_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -86,4 +86,38 @@ def test_gmail_settings_reject_retry_maximum_below_initial_backoff() -> None:
             _env_file=None,
             gmail_retry_initial_backoff_seconds=2.0,
             gmail_retry_max_backoff_seconds=1.0,
+        )
+
+
+def test_relevance_settings_have_safe_disabled_defaults() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.relevance_enabled is False
+    assert settings.relevance_provider is RelevanceProvider.OPENAI
+    assert settings.relevance_model == "gpt-5.6-luna"
+    assert settings.relevance_body_max_chars == 4000
+    assert settings.relevance_goal_limit == 20
+    assert settings.relevance_situation_limit == 5
+    assert settings.relevance_retry_attempts == 3
+    assert settings.outbox_relay_poll_seconds == 1.0
+    assert settings.openai_api_key is None
+
+
+def test_enabled_openai_relevance_requires_secret() -> None:
+    with pytest.raises(ValidationError, match="OpenAI API key"):
+        Settings(_env_file=None, relevance_enabled=True, openai_api_key=None)
+
+
+@pytest.mark.parametrize("poll_seconds", [0, -1])
+def test_relevance_settings_reject_non_positive_relay_poll(poll_seconds: float) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, outbox_relay_poll_seconds=poll_seconds)
+
+
+def test_relevance_settings_reject_incoherent_retry_bounds() -> None:
+    with pytest.raises(ValidationError, match="relevance retry maximum"):
+        Settings(
+            _env_file=None,
+            relevance_retry_initial_backoff_seconds=5,
+            relevance_retry_max_backoff_seconds=2,
         )

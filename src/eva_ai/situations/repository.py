@@ -322,184 +322,197 @@ class SituationRepository:
     ) -> SituationResolution:
         async with self._database.session() as session:
             async with session.begin():
-                event = await session.scalar(
-                    select(Event).where(
-                        Event.id == command.event_id,
-                        Event.user_id == command.user_id,
-                        Event.workspace_id == command.workspace_id,
-                    )
+                return await self.resolve_gmail_event_in_session(
+                    session,
+                    command=command,
+                    correlation_key=correlation_key,
+                    initial_snapshot=initial_snapshot,
                 )
-                if event is None:
-                    raise SituationScopeError
-                supported_keys = tuple(
-                    key
-                    for key in event.correlation_keys
-                    if key.startswith(_GMAIL_THREAD_PREFIX)
-                    and key.removeprefix(_GMAIL_THREAD_PREFIX).strip()
-                )
-                if (
-                    event.source != "gmail"
-                    or event.event_type != "email.received"
-                    or supported_keys != (correlation_key,)
-                ):
-                    from eva_ai.situations.errors import SituationResolutionError
 
-                    raise SituationResolutionError
+    async def resolve_gmail_event_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        command: ResolveEvent,
+        correlation_key: str,
+        initial_snapshot: InitialSituationSnapshot,
+    ) -> SituationResolution:
+        event = await session.scalar(
+            select(Event).where(
+                Event.id == command.event_id,
+                Event.user_id == command.user_id,
+                Event.workspace_id == command.workspace_id,
+            )
+        )
+        if event is None:
+            raise SituationScopeError
+        supported_keys = tuple(
+            key
+            for key in event.correlation_keys
+            if key.startswith(_GMAIL_THREAD_PREFIX)
+            and key.removeprefix(_GMAIL_THREAD_PREFIX).strip()
+        )
+        if (
+            event.source != "gmail"
+            or event.event_type != "email.received"
+            or supported_keys != (correlation_key,)
+        ):
+            from eva_ai.situations.errors import SituationResolutionError
 
-                if command.goal_ids:
-                    existing_goal_ids = set(
-                        (
-                            await session.scalars(
-                                select(Goal.id).where(
-                                    Goal.id.in_(command.goal_ids),
-                                    Goal.user_id == command.user_id,
-                                    Goal.workspace_id == command.workspace_id,
-                                )
-                            )
-                        ).all()
+            raise SituationResolutionError
+
+        if command.goal_ids:
+            existing_goal_ids = set(
+                (
+                    await session.scalars(
+                        select(Goal.id).where(
+                            Goal.id.in_(command.goal_ids),
+                            Goal.user_id == command.user_id,
+                            Goal.workspace_id == command.workspace_id,
+                        )
                     )
-                    if existing_goal_ids != set(command.goal_ids):
-                        raise SituationScopeError
+                ).all()
+            )
+            if existing_goal_ids != set(command.goal_ids):
+                raise SituationScopeError
 
+        correlation = await session.scalar(
+            select(SituationCorrelationKey)
+            .where(
+                SituationCorrelationKey.workspace_id == command.workspace_id,
+                SituationCorrelationKey.correlation_key == correlation_key,
+            )
+            .with_for_update()
+        )
+        situation_created = False
+        if correlation is None:
+            candidate = Situation(
+                id=uuid7(),
+                user_id=command.user_id,
+                workspace_id=command.workspace_id,
+                type=initial_snapshot.type,
+                title=initial_snapshot.title,
+                lifecycle=initial_snapshot.lifecycle,
+                attention=initial_snapshot.attention,
+                summary=initial_snapshot.summary,
+                current_state=initial_snapshot.current_state,
+                next_action=initial_snapshot.next_action,
+                next_expected=initial_snapshot.next_expected,
+                version=1,
+                last_activity_at=initial_snapshot.last_activity_at,
+                created_at=command.resolved_at,
+                updated_at=command.resolved_at,
+            )
+            session.add(candidate)
+            await session.flush()
+            reserved_situation_id = await session.scalar(
+                insert(SituationCorrelationKey)
+                .values(
+                    workspace_id=command.workspace_id,
+                    correlation_key=correlation_key,
+                    user_id=command.user_id,
+                    situation_id=candidate.id,
+                    kind=CorrelationKeyKind.GMAIL_THREAD,
+                    created_at=command.resolved_at,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        SituationCorrelationKey.workspace_id,
+                        SituationCorrelationKey.correlation_key,
+                    ]
+                )
+                .returning(SituationCorrelationKey.situation_id)
+            )
+            if reserved_situation_id is not None:
+                situation = candidate
+                situation_created = True
+            else:
+                # A racing transaction may have reserved the provider key first.
+                await session.delete(candidate)
                 correlation = await session.scalar(
-                    select(SituationCorrelationKey)
-                    .where(
+                    select(SituationCorrelationKey).where(
                         SituationCorrelationKey.workspace_id == command.workspace_id,
                         SituationCorrelationKey.correlation_key == correlation_key,
                     )
-                    .with_for_update()
                 )
-                situation_created = False
-                if correlation is None:
-                    candidate = Situation(
-                        id=uuid7(),
-                        user_id=command.user_id,
-                        workspace_id=command.workspace_id,
-                        type=initial_snapshot.type,
-                        title=initial_snapshot.title,
-                        lifecycle=initial_snapshot.lifecycle,
-                        attention=initial_snapshot.attention,
-                        summary=initial_snapshot.summary,
-                        current_state=initial_snapshot.current_state,
-                        next_action=initial_snapshot.next_action,
-                        next_expected=initial_snapshot.next_expected,
-                        version=1,
-                        last_activity_at=initial_snapshot.last_activity_at,
-                        created_at=command.resolved_at,
-                        updated_at=command.resolved_at,
-                    )
-                    session.add(candidate)
-                    await session.flush()
-                    reserved_situation_id = await session.scalar(
-                        insert(SituationCorrelationKey)
-                        .values(
-                            workspace_id=command.workspace_id,
-                            correlation_key=correlation_key,
-                            user_id=command.user_id,
-                            situation_id=candidate.id,
-                            kind=CorrelationKeyKind.GMAIL_THREAD,
-                            created_at=command.resolved_at,
-                        )
-                        .on_conflict_do_nothing(
-                            index_elements=[
-                                SituationCorrelationKey.workspace_id,
-                                SituationCorrelationKey.correlation_key,
-                            ]
-                        )
-                        .returning(SituationCorrelationKey.situation_id)
-                    )
-                    if reserved_situation_id is not None:
-                        situation = candidate
-                        situation_created = True
-                    else:
-                        # Another transaction reserved the provider key while this candidate
-                        # was being built. Removing it here prevents an uncorrelated orphan.
-                        await session.delete(candidate)
-                        correlation = await session.scalar(
-                            select(SituationCorrelationKey).where(
-                                SituationCorrelationKey.workspace_id == command.workspace_id,
-                                SituationCorrelationKey.correlation_key == correlation_key,
+                if correlation is None or correlation.user_id != command.user_id:
+                    raise SituationScopeError
+                situation = await _locked_situation(
+                    session,
+                    command.user_id,
+                    command.workspace_id,
+                    correlation.situation_id,
+                )
+        else:
+            if correlation.user_id != command.user_id:
+                raise SituationScopeError
+            situation = await _locked_situation(
+                session,
+                command.user_id,
+                command.workspace_id,
+                correlation.situation_id,
+            )
+
+        inserted_event_id = await session.scalar(
+            insert(SituationEvent)
+            .values(
+                situation_id=situation.id,
+                event_id=event.id,
+                workspace_id=command.workspace_id,
+                user_id=command.user_id,
+                correlation_method=CorrelationMethod.DETERMINISTIC_KEY,
+                correlation_key=correlation_key,
+                linked_at=command.resolved_at,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[SituationEvent.situation_id, SituationEvent.event_id]
+            )
+            .returning(SituationEvent.event_id)
+        )
+        inserted_goal_ids: tuple[UUID, ...] = ()
+        if command.goal_ids:
+            inserted_goal_ids = tuple(
+                sorted(
+                    (
+                        await session.scalars(
+                            insert(SituationGoal)
+                            .values(
+                                [
+                                    {
+                                        "situation_id": situation.id,
+                                        "goal_id": goal_id,
+                                        "workspace_id": command.workspace_id,
+                                        "user_id": command.user_id,
+                                        "relevance": Decimal("1.000"),
+                                        "contribution": GoalContribution.CONTEXT,
+                                        "reasoning": _RESOLVER_REASONING,
+                                        "linked_at": command.resolved_at,
+                                    }
+                                    for goal_id in command.goal_ids
+                                ]
                             )
+                            .on_conflict_do_nothing(
+                                index_elements=[
+                                    SituationGoal.situation_id,
+                                    SituationGoal.goal_id,
+                                ]
+                            )
+                            .returning(SituationGoal.goal_id)
                         )
-                        if correlation is None or correlation.user_id != command.user_id:
-                            raise SituationScopeError
-                        situation = await _locked_situation(
-                            session,
-                            command.user_id,
-                            command.workspace_id,
-                            correlation.situation_id,
-                        )
-                else:
-                    if correlation.user_id != command.user_id:
-                        raise SituationScopeError
-                    situation = await _locked_situation(
-                        session,
-                        command.user_id,
-                        command.workspace_id,
-                        correlation.situation_id,
-                    )
-
-                inserted_event_id = await session.scalar(
-                    insert(SituationEvent)
-                    .values(
-                        situation_id=situation.id,
-                        event_id=event.id,
-                        workspace_id=command.workspace_id,
-                        user_id=command.user_id,
-                        correlation_method=CorrelationMethod.DETERMINISTIC_KEY,
-                        correlation_key=correlation_key,
-                        linked_at=command.resolved_at,
-                    )
-                    .on_conflict_do_nothing(
-                        index_elements=[SituationEvent.situation_id, SituationEvent.event_id]
-                    )
-                    .returning(SituationEvent.event_id)
+                    ).all()
                 )
+            )
 
-                inserted_goal_ids: tuple[UUID, ...] = ()
-                if command.goal_ids:
-                    inserted_goal_ids = tuple(
-                        sorted(
-                            (
-                                await session.scalars(
-                                    insert(SituationGoal)
-                                    .values(
-                                        [
-                                            {
-                                                "situation_id": situation.id,
-                                                "goal_id": goal_id,
-                                                "workspace_id": command.workspace_id,
-                                                "user_id": command.user_id,
-                                                "relevance": Decimal("1.000"),
-                                                "contribution": GoalContribution.CONTEXT,
-                                                "reasoning": _RESOLVER_REASONING,
-                                                "linked_at": command.resolved_at,
-                                            }
-                                            for goal_id in command.goal_ids
-                                        ]
-                                    )
-                                    .on_conflict_do_nothing(
-                                        index_elements=[
-                                            SituationGoal.situation_id,
-                                            SituationGoal.goal_id,
-                                        ]
-                                    )
-                                    .returning(SituationGoal.goal_id)
-                                )
-                            ).all()
-                        )
-                    )
-
-                if event.occurred_at > situation.last_activity_at:
-                    situation.last_activity_at = event.occurred_at
-                    situation.updated_at = command.resolved_at
-                await session.flush()
-                return SituationResolution(
-                    situation=_situation_record(situation),
-                    situation_created=situation_created,
-                    event_link_created=inserted_event_id is not None,
-                    linked_goal_ids=inserted_goal_ids,
-                )
+        if event.occurred_at > situation.last_activity_at:
+            situation.last_activity_at = event.occurred_at
+            situation.updated_at = command.resolved_at
+        await session.flush()
+        return SituationResolution(
+            situation=_situation_record(situation),
+            situation_created=situation_created,
+            event_link_created=inserted_event_id is not None,
+            linked_goal_ids=inserted_goal_ids,
+        )
 
 
 def _situation_record(situation: Situation) -> SituationRecord:

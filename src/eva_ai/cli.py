@@ -11,7 +11,7 @@ from enum import StrEnum
 from functools import partial
 from pathlib import Path
 from typing import TextIO, cast
-from uuid import UUID
+from uuid import UUID, uuid7
 
 from pydantic import BaseModel
 
@@ -43,7 +43,10 @@ from eva_ai.integrations.gmail.api import GoogleGmailClientFactory
 from eva_ai.integrations.gmail.oauth import GoogleDesktopOAuthAuthorizer
 from eva_ai.local_scope import LocalScope, create_local_scope, local_scope_exists
 from eva_ai.logging import configure_logging
+from eva_ai.relevance.repository import RelevanceRepository
+from eva_ai.relevance.types import ReevaluateEvent
 from eva_ai.situations import SituationLifecycle, SituationRepository, SituationService
+from eva_ai.worker import build_event_relay_dependencies, build_relevance_dependencies
 
 ScopeCreateCommand = Callable[[str, str], Awaitable[None]]
 GmailConnectCommand = Callable[[UUID, UUID], Awaitable[None]]
@@ -55,6 +58,10 @@ GoalShowCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
 GoalUpdateCommand = Callable[[GoalUpdate], Awaitable[None]]
 SituationListCommand = Callable[[UUID, UUID, tuple[SituationLifecycle, ...], int], Awaitable[None]]
 SituationShowCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
+RelevanceShowCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
+RelevanceHistoryCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
+RelevanceReevaluateCommand = Callable[[UUID, UUID, UUID, str, UUID], Awaitable[None]]
+RelevanceBackfillCommand = Callable[[UUID, UUID, int], Awaitable[None]]
 DatabaseFactory = Callable[[str], Database]
 DependencyBuilder = Callable[[Settings], "GmailDependencies"]
 ScopeCreator = Callable[..., Awaitable[LocalScope]]
@@ -77,6 +84,10 @@ class CleanupOutcome:
     ordinary_failure: bool = False
 
 
+async def _unavailable_command(*arguments: object) -> None:
+    raise CliValidationError("Command is unavailable")
+
+
 @dataclass(frozen=True, slots=True)
 class CommandFunctions:
     scope_create: ScopeCreateCommand
@@ -90,6 +101,12 @@ class CommandFunctions:
     goal_update: GoalUpdateCommand
     situation_list: SituationListCommand
     situation_show: SituationShowCommand
+    events_relay: NoArgumentCommand = _unavailable_command
+    relevance_pull: NoArgumentCommand = _unavailable_command
+    relevance_show: RelevanceShowCommand = _unavailable_command
+    relevance_history: RelevanceHistoryCommand = _unavailable_command
+    relevance_reevaluate: RelevanceReevaluateCommand = _unavailable_command
+    relevance_backfill: RelevanceBackfillCommand = _unavailable_command
 
 
 @dataclass(slots=True)
@@ -458,6 +475,139 @@ async def situation_show_command(
     _write_json(await _run_database_operation(settings, database_factory, show), stdout)
 
 
+async def events_relay_command(*, settings: Settings) -> None:
+    dependencies = build_event_relay_dependencies(settings)
+    primary_failure: BaseException | None = None
+    try:
+        await dependencies.worker.run_forever()
+    except BaseException as error:
+        primary_failure = error
+    cleanup = await dependencies.close()
+    _raise_after_cleanup(
+        primary_failure, CleanupOutcome(cleanup.interruption, cleanup.ordinary_failure)
+    )
+
+
+async def relevance_pull_command(*, settings: Settings) -> None:
+    dependencies = build_relevance_dependencies(settings, include_pull_worker=True)
+    if dependencies.worker is None:
+        raise CliResourceError("Relevance pull worker is unavailable")
+    primary_failure: BaseException | None = None
+    try:
+        await dependencies.worker.run_forever()
+    except BaseException as error:
+        primary_failure = error
+    cleanup = await dependencies.close()
+    _raise_after_cleanup(
+        primary_failure, CleanupOutcome(cleanup.interruption, cleanup.ordinary_failure)
+    )
+
+
+async def relevance_show_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    event_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def show(database: Database) -> BaseModel | None:
+        return await RelevanceRepository(database).get_current(
+            event_id=event_id, user_id=user_id, workspace_id=workspace_id
+        )
+
+    _write_json(await _run_database_operation(settings, database_factory, show), stdout)
+
+
+async def relevance_history_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    event_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def history(database: Database) -> dict[str, object]:
+        repository = RelevanceRepository(database)
+        signals = await repository.history(
+            event_id=event_id, user_id=user_id, workspace_id=workspace_id
+        )
+        attempts = await repository.list_attempts(
+            event_id=event_id, user_id=user_id, workspace_id=workspace_id
+        )
+        current = next((item for item in reversed(signals) if item.is_current), None)
+        return {
+            "attempts": attempts,
+            "current_signal_id": current.id if current is not None else None,
+            "signals": signals,
+        }
+
+    _write_json(await _run_database_operation(settings, database_factory, history), stdout)
+
+
+async def relevance_reevaluate_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    event_id: UUID,
+    reason: str,
+    evaluation_key: UUID,
+    *,
+    settings: Settings,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+) -> None:
+    print(f"eva: relevance evaluation {evaluation_key}", file=stderr or sys.stderr)
+    dependencies = build_relevance_dependencies(settings, include_pull_worker=False)
+    primary_failure: BaseException | None = None
+    result = None
+    try:
+        result = await dependencies.service.reevaluate(
+            ReevaluateEvent(
+                event_id=event_id,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                evaluation_key=evaluation_key,
+                reason=reason,
+                requested_at=_utc_now(),
+            )
+        )
+    except BaseException as error:
+        primary_failure = error
+    cleanup = await dependencies.close()
+    _raise_after_cleanup(
+        primary_failure, CleanupOutcome(cleanup.interruption, cleanup.ordinary_failure)
+    )
+    assert result is not None
+    _write_json(result, stdout)
+
+
+async def relevance_backfill_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    limit: int,
+    *,
+    settings: Settings,
+    stdout: TextIO | None = None,
+) -> None:
+    dependencies = build_relevance_dependencies(settings, include_pull_worker=False)
+    primary_failure: BaseException | None = None
+    result = None
+    try:
+        result = await dependencies.service.backfill(
+            user_id=user_id, workspace_id=workspace_id, limit=limit
+        )
+    except BaseException as error:
+        primary_failure = error
+    cleanup = await dependencies.close()
+    _raise_after_cleanup(
+        primary_failure, CleanupOutcome(cleanup.interruption, cleanup.ordinary_failure)
+    )
+    assert result is not None
+    _write_json(result, stdout)
+
+
 def build_command_functions(settings: Settings) -> CommandFunctions:
     return CommandFunctions(
         scope_create=partial(scope_create_command, settings=settings),
@@ -471,6 +621,12 @@ def build_command_functions(settings: Settings) -> CommandFunctions:
         goal_update=partial(goal_update_command, settings=settings),
         situation_list=partial(situation_list_command, settings=settings),
         situation_show=partial(situation_show_command, settings=settings),
+        events_relay=partial(events_relay_command, settings=settings),
+        relevance_pull=partial(relevance_pull_command, settings=settings),
+        relevance_show=partial(relevance_show_command, settings=settings),
+        relevance_history=partial(relevance_history_command, settings=settings),
+        relevance_reevaluate=partial(relevance_reevaluate_command, settings=settings),
+        relevance_backfill=partial(relevance_backfill_command, settings=settings),
     )
 
 
@@ -493,6 +649,28 @@ def build_parser() -> argparse.ArgumentParser:
     gmail_sync.add_argument("--connector-id", required=True, type=_parse_uuid)
     gmail_commands.add_parser("pull")
     gmail_commands.add_parser("maintain")
+
+    events = commands.add_parser("events")
+    events_commands = events.add_subparsers(dest="events_command", required=True)
+    events_commands.add_parser("relay")
+
+    relevance = commands.add_parser("relevance")
+    relevance_commands = relevance.add_subparsers(dest="relevance_command", required=True)
+    relevance_commands.add_parser("pull")
+    relevance_show = relevance_commands.add_parser("show")
+    _add_scope_arguments(relevance_show)
+    relevance_show.add_argument("--event-id", required=True, type=_parse_uuid)
+    relevance_history = relevance_commands.add_parser("history")
+    _add_scope_arguments(relevance_history)
+    relevance_history.add_argument("--event-id", required=True, type=_parse_uuid)
+    relevance_reevaluate = relevance_commands.add_parser("reevaluate")
+    _add_scope_arguments(relevance_reevaluate)
+    relevance_reevaluate.add_argument("--event-id", required=True, type=_parse_uuid)
+    relevance_reevaluate.add_argument("--reason", required=True)
+    relevance_reevaluate.add_argument("--idempotency-key", type=_parse_uuid, default=None)
+    relevance_backfill = relevance_commands.add_parser("backfill")
+    _add_scope_arguments(relevance_backfill)
+    relevance_backfill.add_argument("--limit", type=_parse_limit, default=50)
 
     goal = commands.add_parser("goal")
     goal_commands = goal.add_subparsers(dest="goal_command", required=True)
@@ -587,6 +765,28 @@ async def _dispatch(arguments: argparse.Namespace, commands: CommandFunctions) -
         await commands.gmail_pull()
     elif arguments.area == "gmail" and arguments.gmail_command == "maintain":
         await commands.gmail_maintain()
+    elif arguments.area == "events" and arguments.events_command == "relay":
+        await commands.events_relay()
+    elif arguments.area == "relevance" and arguments.relevance_command == "pull":
+        await commands.relevance_pull()
+    elif arguments.area == "relevance" and arguments.relevance_command == "show":
+        await commands.relevance_show(arguments.user_id, arguments.workspace_id, arguments.event_id)
+    elif arguments.area == "relevance" and arguments.relevance_command == "history":
+        await commands.relevance_history(
+            arguments.user_id, arguments.workspace_id, arguments.event_id
+        )
+    elif arguments.area == "relevance" and arguments.relevance_command == "reevaluate":
+        await commands.relevance_reevaluate(
+            arguments.user_id,
+            arguments.workspace_id,
+            arguments.event_id,
+            arguments.reason,
+            arguments.idempotency_key or uuid7(),
+        )
+    elif arguments.area == "relevance" and arguments.relevance_command == "backfill":
+        await commands.relevance_backfill(
+            arguments.user_id, arguments.workspace_id, arguments.limit
+        )
     elif arguments.area == "goal" and arguments.goal_command == "create":
         await commands.goal_create(
             GoalDraft(

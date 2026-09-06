@@ -8,6 +8,7 @@ from uuid import UUID, uuid7
 from pydantic import JsonValue
 from sqlalchemy import select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from eva_ai.db.models import Event, EventProcessing
 from eva_ai.db.session import Database
@@ -41,13 +42,19 @@ class StoredEvent:
     workspace_id: UUID
     source: str
     event_type: str
+    external_id: str | None
+    occurred_at: datetime
     payload: dict[str, JsonValue]
+    correlation_keys: tuple[str, ...]
     schema_version: int
 
 
+class EventCommit(Protocol):
+    async def apply(self, session: AsyncSession, committed_at: datetime) -> ProcessingStage: ...
+
+
 class EventHandler(Protocol):
-    async def handle(self, event: StoredEvent) -> None:
-        raise NotImplementedError
+    async def prepare(self, event: StoredEvent) -> EventCommit: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,14 +111,49 @@ class EventProcessor:
                     workspace_id=event.workspace_id,
                     source=event.source,
                     event_type=event.event_type,
+                    external_id=event.external_id,
+                    occurred_at=event.occurred_at,
                     payload=dict(event.payload),
+                    correlation_keys=tuple(event.correlation_keys),
                     schema_version=event.schema_version,
                 )
 
         # Handler code receives detached data only after the claim transaction is committed.
         return _ClaimedEvent(stored_event, claim_id)
 
+    async def _commit(
+        self,
+        event_id: UUID,
+        claim_id: UUID,
+        prepared: EventCommit,
+        committed_at: datetime,
+    ) -> None:
+        async with self._database.session() as session:
+            async with session.begin():
+                processing = await session.scalar(
+                    select(EventProcessing)
+                    .where(
+                        EventProcessing.event_id == event_id,
+                        EventProcessing.claim_id == claim_id,
+                        EventProcessing.stage != ProcessingStage.HANDLED,
+                    )
+                    .with_for_update()
+                )
+                if processing is None:
+                    raise StaleClaimError("event processing claim is no longer current")
+
+                stage = await prepared.apply(session, committed_at)
+                if stage not in (ProcessingStage.CLASSIFIED, ProcessingStage.CORRELATED):
+                    raise ValueError("Event commit returned an invalid processing stage")
+                processing.stage = ProcessingStage.HANDLED
+                processing.processed_at = committed_at
+                processing.claim_id = None
+                processing.lease_expires_at = None
+                processing.last_error_type = None
+                processing.last_error_summary = None
+
     async def _complete(self, event_id: UUID, claim_id: UUID) -> None:
+        """Retained for scoped stale-claim diagnostics used by existing operators/tests."""
         statement = (
             update(EventProcessing)
             .where(
@@ -188,11 +230,16 @@ class EventProcessor:
         if isinstance(claim, ProcessResult):
             return claim
         try:
-            await handler.handle(claim.event)
+            prepared = await handler.prepare(claim.event)
+            await self._commit(
+                claim.event.id,
+                claim.claim_id,
+                prepared,
+                now or datetime.now(UTC),
+            )
         except Exception as error:
             await self._release(claim.event.id, claim.claim_id, error)
             self._log(message, claim.claim_id, "failed")
             raise
-        await self._complete(claim.event.id, claim.claim_id)
         self._log(message, claim.claim_id, "handled")
         return ProcessResult(claim.event.id, ProcessOutcome.HANDLED)

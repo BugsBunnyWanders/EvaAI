@@ -150,7 +150,24 @@ optimistic Situation snapshots, explicit Event/Goal relationships, and determini
 Gmail-thread correlation. The local CLI can create, list, show, and update Goals and can list
 and inspect Situations with stable JSON output.
 
-Gmail ingestion does not automatically create Situations yet. Milestone 4 will evaluate Event
-relevance and invoke the resolver only for email that warrants operational attention. See the
-[Goal and Situation operator guide](docs/goal-situation-operator.md) for the mental model,
-command examples, lifecycle rules, and troubleshooting.
+Gmail ingestion itself does not create Situations. The Milestone 4 relevance consumer invokes the
+resolver only for email that warrants operational attention. See the [Goal and Situation operator
+guide](docs/goal-situation-operator.md) for the mental model, command examples, lifecycle rules,
+and troubleshooting.
+
+### Milestone 4: Relevance engine
+
+Milestone 4 turns stored Events into durable, revisitable relevance decisions:
+
+```text
+Gmail -> Event + OutboxMessage -> continuous Event Relay -> eva-events
+      -> relevance consumer -> screening -> bounded AI context -> application policy
+      -> versioned Signal -> optional Gmail-thread Situation
+```
+
+The Event Relay and relevance consumer are independent long-running processes. `IGNORE` and
+`RECORD` decisions remain queryable and can be explicitly re-evaluated later; `NOTIFY` and
+`INVESTIGATE` create or reuse Situations but do not yet message the user or execute actions.
+Relevance is disabled by default and historical scans are always explicit. See the
+[Relevance operator guide](docs/relevance-operator.md) for GCP setup, privacy boundaries,
+configuration, commands, and recovery procedures.

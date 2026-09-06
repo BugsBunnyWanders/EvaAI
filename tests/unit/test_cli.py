@@ -44,6 +44,7 @@ WORKSPACE_ID = UUID("0191cafe-7b00-7000-8000-000000000002")
 CONNECTOR_ID = UUID("0191cafe-7b00-7000-8000-000000000003")
 GOAL_ID = UUID("0191cafe-7b00-7000-8000-000000000004")
 SITUATION_ID = UUID("0191cafe-7b00-7000-8000-000000000005")
+EVALUATION_KEY = UUID("0191cafe-7b00-7000-8000-000000000006")
 NOW = datetime(2030, 1, 1, 12, tzinfo=UTC)
 
 
@@ -68,6 +69,12 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
         "goal_update": RecordingCommand(),
         "situation_list": RecordingCommand(),
         "situation_show": RecordingCommand(),
+        "events_relay": RecordingCommand(),
+        "relevance_pull": RecordingCommand(),
+        "relevance_show": RecordingCommand(),
+        "relevance_history": RecordingCommand(),
+        "relevance_reevaluate": RecordingCommand(),
+        "relevance_backfill": RecordingCommand(),
     }
     return (
         CommandFunctions(
@@ -82,6 +89,12 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
             goal_update=commands["goal_update"],
             situation_list=commands["situation_list"],
             situation_show=commands["situation_show"],
+            events_relay=commands["events_relay"],
+            relevance_pull=commands["relevance_pull"],
+            relevance_show=commands["relevance_show"],
+            relevance_history=commands["relevance_history"],
+            relevance_reevaluate=commands["relevance_reevaluate"],
+            relevance_backfill=commands["relevance_backfill"],
         ),
         commands,
     )
@@ -114,6 +127,66 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
         ),
         (["gmail", "pull"], "gmail_pull", ()),
         (["gmail", "maintain"], "gmail_maintain", ()),
+        (["events", "relay"], "events_relay", ()),
+        (["relevance", "pull"], "relevance_pull", ()),
+        (
+            [
+                "relevance",
+                "show",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--event-id",
+                str(SITUATION_ID),
+            ],
+            "relevance_show",
+            (USER_ID, WORKSPACE_ID, SITUATION_ID),
+        ),
+        (
+            [
+                "relevance",
+                "history",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--event-id",
+                str(SITUATION_ID),
+            ],
+            "relevance_history",
+            (USER_ID, WORKSPACE_ID, SITUATION_ID),
+        ),
+        (
+            [
+                "relevance",
+                "reevaluate",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--event-id",
+                str(SITUATION_ID),
+                "--reason",
+                "New goal context",
+                "--idempotency-key",
+                str(EVALUATION_KEY),
+            ],
+            "relevance_reevaluate",
+            (USER_ID, WORKSPACE_ID, SITUATION_ID, "New goal context", EVALUATION_KEY),
+        ),
+        (
+            [
+                "relevance",
+                "backfill",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+            ],
+            "relevance_backfill",
+            (USER_ID, WORKSPACE_ID, 50),
+        ),
         (
             [
                 "goal",
