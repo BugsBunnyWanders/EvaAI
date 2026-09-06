@@ -4,12 +4,14 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid7
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from eva_ai.db import Database
 from eva_ai.db.models import EventProcessing, OutboxMessage
 from eva_ai.events import (
     EventAvailableMessage,
+    EventCommit,
     EventProcessor,
     EventService,
     ProcessOutcome,
@@ -24,12 +26,18 @@ from tests.integration.factories import create_scope
 FIXED_NOW = datetime(2030, 1, 1, tzinfo=UTC)
 
 
+class RecordingCommit:
+    async def apply(self, session: AsyncSession, committed_at: datetime) -> ProcessingStage:
+        return ProcessingStage.CLASSIFIED
+
+
 class RecordingHandler:
     def __init__(self) -> None:
         self.events: list[StoredEvent] = []
 
-    async def handle(self, event: StoredEvent) -> None:
+    async def prepare(self, event: StoredEvent) -> EventCommit:
         self.events.append(event)
+        return RecordingCommit()
 
 
 class LockingHandler:
@@ -38,7 +46,7 @@ class LockingHandler:
         self.claim_id: UUID | None = None
         self.attempt_count: int | None = None
 
-    async def handle(self, event: StoredEvent) -> None:
+    async def prepare(self, event: StoredEvent) -> EventCommit:
         async with self._database.session() as session:
             async with session.begin():
                 row = await session.scalar(
@@ -49,11 +57,30 @@ class LockingHandler:
                 assert row is not None
                 self.claim_id = row.claim_id
                 self.attempt_count = row.attempt_count
+        return RecordingCommit()
 
 
 class FailingHandler:
-    async def handle(self, event: StoredEvent) -> None:
+    async def prepare(self, event: StoredEvent) -> EventCommit:
         raise RuntimeError(f"handler-token payload-secret {event.id}")
+
+
+class FailingCommit:
+    async def apply(self, session: AsyncSession, committed_at: datetime) -> ProcessingStage:
+        await session.execute(
+            update(EventProcessing)
+            .where(EventProcessing.event_id == self.event_id)
+            .values(stage=ProcessingStage.CLASSIFIED)
+        )
+        raise RuntimeError("commit-token payload-secret")
+
+    def __init__(self, event_id: UUID) -> None:
+        self.event_id = event_id
+
+
+class FailingCommitHandler:
+    async def prepare(self, event: StoredEvent) -> EventCommit:
+        return FailingCommit(event.id)
 
 
 async def ingest_message(database: Database) -> EventAvailableMessage:
@@ -317,3 +344,20 @@ async def test_handler_failure_is_sanitized_and_next_delivery_can_succeed(
     assert [record.__dict__["outcome"] for record in records] == ["failed", "handled"]
     assert all(not hasattr(record, "payload") for record in records)
     assert all(not hasattr(record, "error") for record in records)
+
+
+@pytest.mark.integration
+async def test_prepared_commit_failure_rolls_back_handler_and_completion(
+    database: Database,
+) -> None:
+    message = await ingest_message(database)
+
+    with pytest.raises(RuntimeError, match="commit-token"):
+        await EventProcessor(database, 300).process(message, FailingCommitHandler(), FIXED_NOW)
+
+    row = await load_processing(database, message.event_id)
+    assert row.stage == ProcessingStage.RECEIVED
+    assert row.processed_at is None
+    assert row.claim_id is None
+    assert row.last_error_type == "RuntimeError"
+    assert row.last_error_summary == "operation failed"

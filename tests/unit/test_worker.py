@@ -40,7 +40,7 @@ class RecordingProcessor:
 
 
 class UnexpectedHandler:
-    async def handle(self, event: StoredEvent) -> None:
+    async def prepare(self, event: StoredEvent) -> Never:
         raise AssertionError(f"worker unexpectedly invoked handler for {event.id}")
 
 
