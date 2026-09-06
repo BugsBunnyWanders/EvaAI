@@ -4,7 +4,7 @@ from typing import Any, cast
 from uuid import UUID
 
 from pydantic import JsonValue, ValidationError
-from sqlalchemy import and_, exists, or_, select, update
+from sqlalchemy import and_, case, exists, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,9 +15,12 @@ from eva_ai.db.models import (
     Signal,
     SignalGoal,
     Situation,
+    SituationCorrelationKey,
+    SituationGoal,
 )
 from eva_ai.db.session import Database
 from eva_ai.events.processor import StoredEvent
+from eva_ai.goals.types import GoalStatus
 from eva_ai.relevance.errors import (
     RelevanceError,
     RelevanceNotFoundError,
@@ -27,10 +30,12 @@ from eva_ai.relevance.types import (
     EvaluationAttemptRecord,
     EvaluationAttemptStatus,
     FinishEvaluationAttempt,
+    GoalContext,
     GoalMatch,
     SignalDraft,
     SignalKind,
     SignalRecord,
+    SituationContext,
     StartEvaluationAttempt,
 )
 
@@ -418,6 +423,123 @@ class RelevanceRepository:
         )
         async with self._database.session() as session:
             return tuple((await session.scalars(statement)).all())
+
+    async def get_stored_event(
+        self, *, event_id: UUID, user_id: UUID, workspace_id: UUID
+    ) -> StoredEvent:
+        statement = select(Event).where(
+            Event.id == event_id,
+            Event.user_id == user_id,
+            Event.workspace_id == workspace_id,
+        )
+        async with self._database.session() as session:
+            row = await session.scalar(statement)
+        if row is None:
+            raise RelevanceNotFoundError("Event not found")
+        return StoredEvent(
+            id=row.id,
+            user_id=row.user_id,
+            workspace_id=row.workspace_id,
+            source=row.source,
+            event_type=row.event_type,
+            external_id=row.external_id,
+            occurred_at=row.occurred_at,
+            payload=dict(row.payload),
+            correlation_keys=tuple(row.correlation_keys),
+            schema_version=row.schema_version,
+        )
+
+    async def list_active_goal_contexts(
+        self, *, user_id: UUID, workspace_id: UUID, limit: int
+    ) -> tuple[GoalContext, ...]:
+        if not 1 <= limit <= 20:
+            raise ValueError("Goal limit must be between 1 and 20")
+        statement = (
+            select(Goal)
+            .where(
+                Goal.user_id == user_id,
+                Goal.workspace_id == workspace_id,
+                Goal.status == GoalStatus.ACTIVE,
+            )
+            .order_by(Goal.priority.desc(), Goal.created_at, Goal.id)
+            .limit(limit)
+        )
+        async with self._database.session() as session:
+            rows = (await session.scalars(statement)).all()
+        return tuple(
+            GoalContext(
+                id=row.id,
+                title=row.title,
+                summary=row.objective,
+                domain=row.domain,
+                priority=row.priority,
+            )
+            for row in rows
+        )
+
+    async def list_situation_contexts(
+        self,
+        *,
+        user_id: UUID,
+        workspace_id: UUID,
+        correlation_keys: tuple[str, ...],
+        goal_ids: tuple[UUID, ...],
+        limit: int,
+    ) -> tuple[SituationContext, ...]:
+        if not 1 <= limit <= 5:
+            raise ValueError("Situation limit must be between 1 and 5")
+
+        exact_match = exists(
+            select(SituationCorrelationKey.situation_id).where(
+                SituationCorrelationKey.situation_id == Situation.id,
+                SituationCorrelationKey.user_id == user_id,
+                SituationCorrelationKey.workspace_id == workspace_id,
+                SituationCorrelationKey.correlation_key.in_(correlation_keys or ("",)),
+            )
+        )
+        goal_match = exists(
+            select(SituationGoal.situation_id).where(
+                SituationGoal.situation_id == Situation.id,
+                SituationGoal.user_id == user_id,
+                SituationGoal.workspace_id == workspace_id,
+                SituationGoal.goal_id.in_(goal_ids or (UUID(int=0),)),
+            )
+        )
+        attention_rank = case(
+            (Situation.attention == "URGENT", 4),
+            (Situation.attention == "HIGH", 3),
+            (Situation.attention == "NORMAL", 2),
+            else_=1,
+        )
+        statement = (
+            select(Situation)
+            .where(
+                Situation.user_id == user_id,
+                Situation.workspace_id == workspace_id,
+                Situation.lifecycle.not_in(("RESOLVED", "ABANDONED")),
+                or_(exact_match, goal_match),
+            )
+            .order_by(
+                case((exact_match, 1), else_=0).desc(),
+                attention_rank.desc(),
+                Situation.last_activity_at.desc(),
+                Situation.id,
+            )
+            .limit(limit)
+        )
+        async with self._database.session() as session:
+            rows = (await session.scalars(statement)).all()
+        return tuple(
+            SituationContext(
+                id=row.id,
+                title=row.title,
+                summary=row.summary,
+                current_state=row.current_state,
+                attention=row.attention,
+                last_activity_at=row.last_activity_at,
+            )
+            for row in rows
+        )
 
 
 def _attempt_record(row: RelevanceEvaluationAttempt) -> EvaluationAttemptRecord:
