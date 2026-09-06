@@ -87,6 +87,14 @@ class Settings(BaseSettings):
     relevance_ignored_event_types: tuple[str, ...] = ()
     relevance_ignored_senders: tuple[str, ...] = ()
     relevance_ignored_labels: tuple[str, ...] = ()
+    memory_embedding_model: str = "text-embedding-3-small"
+    memory_embedding_dimensions: int = Field(default=1536, ge=1536, le=1536)
+    memory_embedding_input_max_chars: int = Field(default=4000, ge=1, le=8000)
+    memory_fact_limit: int = Field(default=20, ge=1, le=100)
+    memory_fact_total_chars: int = Field(default=8000, ge=1, le=16000)
+    memory_episode_candidate_limit: int = Field(default=50, ge=1, le=100)
+    memory_episode_limit: int = Field(default=8, ge=1, le=20)
+    memory_episode_total_chars: int = Field(default=6000, ge=1, le=12000)
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -103,6 +111,7 @@ class Settings(BaseSettings):
         "relevance_subscription_id",
         "relevance_classifier_version",
         "relevance_policy_version",
+        "memory_embedding_model",
     )
     @classmethod
     def reject_blank_topic_id(cls, value: str) -> str:
@@ -137,6 +146,8 @@ class Settings(BaseSettings):
             raise ValueError("Goal total bound must not be below per-item bound")
         if self.relevance_situation_total_chars < self.relevance_situation_max_chars:
             raise ValueError("Situation total bound must not be below per-item bound")
+        if self.memory_episode_candidate_limit < self.memory_episode_limit:
+            raise ValueError("memory candidate limit must not be below result limit")
         if self.relevance_enabled and self.relevance_provider is RelevanceProvider.OPENAI:
             if self.openai_api_key is None or not self.openai_api_key.get_secret_value().strip():
                 raise ValueError("OpenAI API key is required when relevance processing is enabled")

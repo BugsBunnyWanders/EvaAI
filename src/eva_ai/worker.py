@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import cast
 
 from openai import AsyncOpenAI
@@ -14,7 +15,14 @@ from eva_ai.events.relay_worker import OutboxRelayWorker
 from eva_ai.events.types import EventAvailableMessage
 from eva_ai.integrations.gcp.pubsub import GooglePubSubPublisher
 from eva_ai.integrations.gcp.subscriber import GooglePullSubscriber
+from eva_ai.integrations.openai.memory import OpenAIEmbeddingClient, OpenAIEmbeddingProvider
 from eva_ai.integrations.openai.relevance import OpenAIClient, OpenAIRelevanceClassifier
+from eva_ai.memory.context import ContextBounds as MemoryContextBounds
+from eva_ai.memory.context import MemoryContextBuilder
+from eva_ai.memory.embedding import EmbeddingService
+from eva_ai.memory.policy import MemoryPolicy
+from eva_ai.memory.repository import MemoryRepository
+from eva_ai.memory.service import MemoryService
 from eva_ai.relevance.classifier import RelevanceClassifier, RelevanceClassifierRunner
 from eva_ai.relevance.context import ContextBounds, RelevanceContextBuilder
 from eva_ai.relevance.filters import RelevanceRuleSet, StaticRelevanceRuleProvider
@@ -63,6 +71,30 @@ class RelevanceDependencies:
         close_functions = []
         if self.subscriber is not None:
             close_functions.append(self.subscriber.close)
+        if self.openai_client is not None:
+            close_functions.append(self.openai_client.close)
+        close_functions.append(self.database.close)
+        for close in close_functions:
+            try:
+                await close()
+            except asyncio.CancelledError as error:
+                interruption = interruption or error
+            except Exception:
+                ordinary_failure = True
+        return DependencyCleanupOutcome(interruption, ordinary_failure)
+
+
+@dataclass(slots=True)
+class MemoryDependencies:
+    database: Database
+    service: MemoryService
+    context_builder: MemoryContextBuilder | None
+    openai_client: AsyncOpenAI | None
+
+    async def close(self) -> DependencyCleanupOutcome:
+        interruption: BaseException | None = None
+        ordinary_failure = False
+        close_functions = []
         if self.openai_client is not None:
             close_functions.append(self.openai_client.close)
         close_functions.append(self.database.close)
@@ -206,8 +238,62 @@ def build_relevance_dependencies(
     return RelevanceDependencies(database, handler, service, subscriber, worker, openai_client)
 
 
+def build_memory_dependencies(settings: Settings, *, include_embedding: bool) -> MemoryDependencies:
+    api_key = settings.openai_api_key
+    if include_embedding and (api_key is None or not api_key.get_secret_value().strip()):
+        # Validate provider configuration before allocating resources that a failed build cannot
+        # return to its caller for cleanup.
+        raise ValueError("OpenAI configuration is incomplete")
+    database = Database(settings.database_url.get_secret_value())
+    repository = MemoryRepository(database)
+    openai_client = None
+    embedding = None
+    context_builder = None
+    if include_embedding:
+        assert api_key is not None
+        openai_client = AsyncOpenAI(api_key=api_key.get_secret_value())
+        provider = OpenAIEmbeddingProvider(
+            cast(OpenAIEmbeddingClient, openai_client),
+            settings.memory_embedding_model,
+            settings.memory_embedding_dimensions,
+        )
+        embedding = EmbeddingService(
+            provider,
+            settings.memory_embedding_model,
+            settings.memory_embedding_dimensions,
+            settings.memory_embedding_input_max_chars,
+            _utc_now,
+        )
+        context_builder = MemoryContextBuilder(
+            repository,
+            embedding,
+            MemoryContextBounds(
+                fact_limit=settings.memory_fact_limit,
+                fact_total_chars=settings.memory_fact_total_chars,
+                episode_candidate_limit=settings.memory_episode_candidate_limit,
+                episode_limit=settings.memory_episode_limit,
+                episode_total_chars=settings.memory_episode_total_chars,
+                query_max_chars=settings.memory_embedding_input_max_chars,
+            ),
+            _utc_now,
+        )
+    service = MemoryService(
+        repository,
+        MemoryPolicy(),
+        embedding,
+        episode_candidate_limit=settings.memory_episode_candidate_limit,
+        episode_limit=settings.memory_episode_limit,
+        clock=_utc_now,
+    )
+    return MemoryDependencies(database, service, context_builder, openai_client)
+
+
 def _required_pubsub_project(settings: Settings) -> str:
     project_id = settings.pubsub_project_id
     if project_id is None or not project_id.strip():
         raise ValueError("Pub/Sub project configuration is incomplete")
     return project_id.strip()
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)

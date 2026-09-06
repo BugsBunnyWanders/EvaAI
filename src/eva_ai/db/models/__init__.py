@@ -3,6 +3,7 @@ from eva_ai.db.models.connectors import ConnectorAccount, GmailSyncState
 from eva_ai.db.models.events import Event, EventProcessing, OutboxMessage
 from eva_ai.db.models.goals import Goal
 from eva_ai.db.models.identity import User, Workspace
+from eva_ai.db.models.memory import EpisodicMemory, EpisodicMemoryGoal, MemoryFact
 from eva_ai.db.models.relevance import RelevanceEvaluationAttempt, Signal, SignalGoal
 from eva_ai.db.models.situations import (
     Situation,
@@ -17,6 +18,9 @@ __all__ = [
     "EventProcessing",
     "GmailSyncState",
     "Goal",
+    "EpisodicMemory",
+    "EpisodicMemoryGoal",
+    "MemoryFact",
     "OutboxMessage",
     "RelevanceEvaluationAttempt",
     "Signal",

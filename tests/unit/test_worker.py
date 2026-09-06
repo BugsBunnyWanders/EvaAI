@@ -3,6 +3,7 @@ from typing import Never, cast
 from uuid import uuid7
 
 import pytest
+from pydantic import SecretStr
 
 from eva_ai.config import Settings
 from eva_ai.db.session import Database
@@ -18,6 +19,7 @@ from eva_ai.events.types import EventAvailableMessage
 from eva_ai.relevance.classifier import ScriptedRelevanceClassifier
 from eva_ai.worker import (
     build_event_processor,
+    build_memory_dependencies,
     build_outbox_relay,
     build_publisher,
     build_relevance_dependencies,
@@ -86,6 +88,34 @@ def test_google_composition_requires_project_id() -> None:
 def test_disabled_relevance_refuses_composition() -> None:
     with pytest.raises(ValueError, match="relevance processing is disabled"):
         build_relevance_dependencies(Settings(_env_file=None), include_pull_worker=False)
+
+
+async def test_memory_composition_without_embeddings_does_not_require_openai() -> None:
+    dependencies = build_memory_dependencies(
+        Settings(_env_file=None, openai_api_key=None), include_embedding=False
+    )
+
+    assert dependencies.openai_client is None
+    assert dependencies.context_builder is None
+    await dependencies.close()
+
+
+def test_embedding_memory_composition_requires_openai_key() -> None:
+    with pytest.raises(ValueError, match="OpenAI configuration is incomplete"):
+        build_memory_dependencies(
+            Settings(_env_file=None, openai_api_key=None), include_embedding=True
+        )
+
+
+async def test_embedding_memory_composition_builds_context_runtime() -> None:
+    dependencies = build_memory_dependencies(
+        Settings(_env_file=None, openai_api_key=SecretStr("test-key")),
+        include_embedding=True,
+    )
+
+    assert dependencies.openai_client is not None
+    assert dependencies.context_builder is not None
+    await dependencies.close()
 
 
 async def test_injected_classifier_builds_database_only_relevance_runtime() -> None:
