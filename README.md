@@ -1,6 +1,8 @@
 # Eva AI
 
-Eva is a proactive, event-driven personal AI operator. The repository contains the application foundation, durable Event backbone, local Gmail ingestion worker, and durable Goal and Situation domain.
+Eva is a proactive, event-driven personal AI operator. The repository contains the application
+foundation, durable Event backbone, local Gmail ingestion worker, Goal and Situation domain,
+relevance engine, and scoped long-term memory.
 
 ## Requirements
 
@@ -171,3 +173,19 @@ The Event Relay and relevance consumer are independent long-running processes. `
 Relevance is disabled by default and historical scans are always explicit. See the
 [Relevance operator guide](docs/relevance-operator.md) for GCP setup, privacy boundaries,
 configuration, commands, and recovery procedures.
+
+### Milestone 5: Memory and context
+
+Milestone 5 adds two provenance-rich memory layers and a bounded context assembly path:
+
+```text
+Explicit fact -> scoped versioned slot -> active structured context
+Explicit episode -> bounded OpenAI embedding -> pgvector candidate retrieval
+Situation + active Goals + facts + reranked episodes -> AgentWorkingContext
+```
+
+Facts preserve supersession and retraction history. Episodes are immutable summaries, support Goal
+and Situation links, and never expose their vectors through the service or CLI. Every operation is
+filtered by User and Workspace. Gmail and relevance events do not learn memory automatically in
+this milestone. See the [Memory and Context operator guide](docs/memory-operator.md) for lifecycle,
+safety boundaries, configuration, examples, and smoke testing.

@@ -121,3 +121,21 @@ def test_relevance_settings_reject_incoherent_retry_bounds() -> None:
             relevance_retry_initial_backoff_seconds=5,
             relevance_retry_max_backoff_seconds=2,
         )
+
+
+def test_memory_settings_have_bounded_defaults() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.memory_embedding_model == "text-embedding-3-small"
+    assert settings.memory_embedding_dimensions == 1536
+    assert settings.memory_embedding_input_max_chars == 4000
+    assert settings.memory_fact_limit == 20
+    assert settings.memory_episode_candidate_limit == 50
+    assert settings.memory_episode_limit == 8
+
+
+def test_memory_settings_reject_dimension_drift_and_incoherent_limits() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, memory_embedding_dimensions=512)
+    with pytest.raises(ValidationError, match="memory candidate limit"):
+        Settings(_env_file=None, memory_episode_candidate_limit=5, memory_episode_limit=8)

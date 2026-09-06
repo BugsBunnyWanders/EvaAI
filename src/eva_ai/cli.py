@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TextIO, cast
 from uuid import UUID, uuid7
 
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue
 
 from eva_ai.config import Settings, get_settings
 from eva_ai.connectors.gmail.bootstrap import ConnectGmail, GmailBootstrapService
@@ -43,10 +43,29 @@ from eva_ai.integrations.gmail.api import GoogleGmailClientFactory
 from eva_ai.integrations.gmail.oauth import GoogleDesktopOAuthAuthorizer
 from eva_ai.local_scope import LocalScope, create_local_scope, local_scope_exists
 from eva_ai.logging import configure_logging
+from eva_ai.memory.context import serialize_context
+from eva_ai.memory.policy import MemoryPolicy
+from eva_ai.memory.repository import MemoryRepository
+from eva_ai.memory.service import MemoryService
+from eva_ai.memory.types import (
+    AgentWorkingContext,
+    EpisodicMemoryDraft,
+    EpisodicMemoryStatus,
+    MemoryEpisodeType,
+    MemoryFactDraft,
+    MemoryFactStatus,
+    MemoryScopeType,
+    MemorySourceType,
+)
 from eva_ai.relevance.repository import RelevanceRepository
 from eva_ai.relevance.types import ReevaluateEvent
 from eva_ai.situations import SituationLifecycle, SituationRepository, SituationService
-from eva_ai.worker import build_event_relay_dependencies, build_relevance_dependencies
+from eva_ai.worker import (
+    MemoryDependencies,
+    build_event_relay_dependencies,
+    build_memory_dependencies,
+    build_relevance_dependencies,
+)
 
 ScopeCreateCommand = Callable[[str, str], Awaitable[None]]
 GmailConnectCommand = Callable[[UUID, UUID], Awaitable[None]]
@@ -62,8 +81,18 @@ RelevanceShowCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
 RelevanceHistoryCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
 RelevanceReevaluateCommand = Callable[[UUID, UUID, UUID, str, UUID], Awaitable[None]]
 RelevanceBackfillCommand = Callable[[UUID, UUID, int], Awaitable[None]]
+MemoryFactPutCommand = Callable[[MemoryFactDraft], Awaitable[None]]
+MemoryFactListCommand = Callable[[UUID, UUID, tuple[MemoryFactStatus, ...], int], Awaitable[None]]
+MemoryRecordCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
+MemoryEpisodeCreateCommand = Callable[[EpisodicMemoryDraft], Awaitable[None]]
+MemoryEpisodeListCommand = Callable[
+    [UUID, UUID, tuple[EpisodicMemoryStatus, ...], int], Awaitable[None]
+]
+MemoryEpisodeSearchCommand = Callable[[UUID, UUID, str, int], Awaitable[None]]
+ContextBuildCommand = Callable[[UUID, UUID, UUID, str | None], Awaitable[None]]
 DatabaseFactory = Callable[[str], Database]
 DependencyBuilder = Callable[[Settings], "GmailDependencies"]
+MemoryDependencyBuilder = Callable[..., MemoryDependencies]
 ScopeCreator = Callable[..., Awaitable[LocalScope]]
 ScopeValidator = Callable[[Database, UUID, UUID], Awaitable[bool]]
 Clock = Callable[[], datetime]
@@ -107,6 +136,16 @@ class CommandFunctions:
     relevance_history: RelevanceHistoryCommand = _unavailable_command
     relevance_reevaluate: RelevanceReevaluateCommand = _unavailable_command
     relevance_backfill: RelevanceBackfillCommand = _unavailable_command
+    memory_fact_put: MemoryFactPutCommand = _unavailable_command
+    memory_fact_list: MemoryFactListCommand = _unavailable_command
+    memory_fact_show: MemoryRecordCommand = _unavailable_command
+    memory_fact_retract: MemoryRecordCommand = _unavailable_command
+    memory_episode_create: MemoryEpisodeCreateCommand = _unavailable_command
+    memory_episode_list: MemoryEpisodeListCommand = _unavailable_command
+    memory_episode_show: MemoryRecordCommand = _unavailable_command
+    memory_episode_retract: MemoryRecordCommand = _unavailable_command
+    memory_episode_search: MemoryEpisodeSearchCommand = _unavailable_command
+    context_build: ContextBuildCommand = _unavailable_command
 
 
 @dataclass(slots=True)
@@ -608,6 +647,204 @@ async def relevance_backfill_command(
     _write_json(result, stdout)
 
 
+def _memory_service(database: Database) -> MemoryService:
+    return MemoryService(MemoryRepository(database), MemoryPolicy())
+
+
+async def memory_fact_put_command(
+    command: MemoryFactDraft,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def put(database: Database) -> BaseModel:
+        return await _memory_service(database).put_fact(command)
+
+    _write_json(await _run_database_operation(settings, database_factory, put), stdout)
+
+
+async def memory_fact_list_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    statuses: tuple[MemoryFactStatus, ...],
+    limit: int,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def list_facts(database: Database) -> tuple[BaseModel, ...]:
+        return await _memory_service(database).list_facts(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            statuses=statuses,
+            limit=limit,
+        )
+
+    records = await _run_database_operation(settings, database_factory, list_facts)
+    _write_json({"count": len(records), "items": records}, stdout)
+
+
+async def memory_fact_show_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    memory_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def show(database: Database) -> BaseModel:
+        return await _memory_service(database).get_fact(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            memory_id=memory_id,
+        )
+
+    _write_json(await _run_database_operation(settings, database_factory, show), stdout)
+
+
+async def memory_fact_retract_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    memory_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def retract(database: Database) -> BaseModel:
+        return await _memory_service(database).retract_fact(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            memory_id=memory_id,
+        )
+
+    _write_json(await _run_database_operation(settings, database_factory, retract), stdout)
+
+
+async def memory_episode_create_command(
+    command: EpisodicMemoryDraft,
+    *,
+    settings: Settings,
+    dependency_builder: MemoryDependencyBuilder = build_memory_dependencies,
+    stdout: TextIO | None = None,
+) -> None:
+    async def create(dependencies: MemoryDependencies) -> BaseModel:
+        return await dependencies.service.create_episode(command)
+
+    result = await _run_memory_operation(settings, dependency_builder, create)
+    _write_json(result, stdout)
+
+
+async def memory_episode_list_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    statuses: tuple[EpisodicMemoryStatus, ...],
+    limit: int,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def list_episodes(database: Database) -> tuple[BaseModel, ...]:
+        return await _memory_service(database).list_episodes(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            statuses=statuses,
+            limit=limit,
+        )
+
+    records = await _run_database_operation(settings, database_factory, list_episodes)
+    _write_json({"count": len(records), "items": records}, stdout)
+
+
+async def memory_episode_show_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    memory_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def show(database: Database) -> BaseModel:
+        return await _memory_service(database).get_episode(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            memory_id=memory_id,
+        )
+
+    _write_json(await _run_database_operation(settings, database_factory, show), stdout)
+
+
+async def memory_episode_retract_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    memory_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def retract(database: Database) -> BaseModel:
+        return await _memory_service(database).retract_episode(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            memory_id=memory_id,
+        )
+
+    _write_json(await _run_database_operation(settings, database_factory, retract), stdout)
+
+
+async def memory_episode_search_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    query: str,
+    limit: int,
+    *,
+    settings: Settings,
+    dependency_builder: MemoryDependencyBuilder = build_memory_dependencies,
+    stdout: TextIO | None = None,
+) -> None:
+    async def search(dependencies: MemoryDependencies) -> tuple[BaseModel, ...]:
+        return await dependencies.service.search_episodes(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            query=query,
+            limit=limit,
+        )
+
+    records = await _run_memory_operation(settings, dependency_builder, search)
+    _write_json({"count": len(records), "items": records}, stdout)
+
+
+async def context_build_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    situation_id: UUID,
+    focus: str | None,
+    *,
+    settings: Settings,
+    dependency_builder: MemoryDependencyBuilder = build_memory_dependencies,
+    stdout: TextIO | None = None,
+) -> None:
+    async def build(dependencies: MemoryDependencies) -> AgentWorkingContext:
+        if dependencies.context_builder is None:
+            raise CliResourceError("Memory context builder is unavailable")
+        return await dependencies.context_builder.build_for_situation(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            situation_id=situation_id,
+            focus=focus,
+        )
+
+    context = await _run_memory_operation(settings, dependency_builder, build)
+    # Context has a canonical serializer so its digest and rendered shape remain reproducible.
+    print(serialize_context(context), file=stdout or sys.stdout)
+
+
 def build_command_functions(settings: Settings) -> CommandFunctions:
     return CommandFunctions(
         scope_create=partial(scope_create_command, settings=settings),
@@ -627,6 +864,16 @@ def build_command_functions(settings: Settings) -> CommandFunctions:
         relevance_history=partial(relevance_history_command, settings=settings),
         relevance_reevaluate=partial(relevance_reevaluate_command, settings=settings),
         relevance_backfill=partial(relevance_backfill_command, settings=settings),
+        memory_fact_put=partial(memory_fact_put_command, settings=settings),
+        memory_fact_list=partial(memory_fact_list_command, settings=settings),
+        memory_fact_show=partial(memory_fact_show_command, settings=settings),
+        memory_fact_retract=partial(memory_fact_retract_command, settings=settings),
+        memory_episode_create=partial(memory_episode_create_command, settings=settings),
+        memory_episode_list=partial(memory_episode_list_command, settings=settings),
+        memory_episode_show=partial(memory_episode_show_command, settings=settings),
+        memory_episode_retract=partial(memory_episode_retract_command, settings=settings),
+        memory_episode_search=partial(memory_episode_search_command, settings=settings),
+        context_build=partial(context_build_command, settings=settings),
     )
 
 
@@ -723,6 +970,84 @@ def build_parser() -> argparse.ArgumentParser:
     situation_show = situation_commands.add_parser("show")
     _add_scope_arguments(situation_show)
     situation_show.add_argument("--situation-id", required=True, type=_parse_uuid)
+
+    memory = commands.add_parser("memory")
+    memory_kinds = memory.add_subparsers(dest="memory_kind", required=True)
+
+    fact = memory_kinds.add_parser("fact")
+    fact_commands = fact.add_subparsers(dest="memory_command", required=True)
+    fact_put = fact_commands.add_parser("put")
+    _add_scope_arguments(fact_put)
+    fact_put.add_argument("--namespace", required=True)
+    fact_put.add_argument("--key", required=True)
+    fact_put.add_argument("--value-json", required=True, type=_parse_json_value)
+    fact_put.add_argument(
+        "--scope-type", required=True, type=MemoryScopeType, choices=list(MemoryScopeType)
+    )
+    fact_put.add_argument("--scope-id", required=True, type=_parse_uuid)
+    fact_put.add_argument(
+        "--source-type",
+        type=MemorySourceType,
+        choices=list(MemorySourceType),
+        default=MemorySourceType.USER_EXPLICIT,
+    )
+    fact_put.add_argument("--source-ref", required=True)
+    fact_put.add_argument("--confidence", required=True, type=Decimal)
+    fact_put.add_argument("--idempotency-key", required=True)
+    fact_put.add_argument("--valid-from", type=_parse_datetime)
+    fact_put.add_argument("--valid-until", type=_parse_datetime)
+
+    fact_list = fact_commands.add_parser("list")
+    _add_scope_arguments(fact_list)
+    fact_list.add_argument("--status", action="append", type=MemoryFactStatus, default=[])
+    fact_list.add_argument("--limit", type=_parse_limit, default=50)
+    for command_name in ("show", "retract"):
+        fact_record = fact_commands.add_parser(command_name)
+        _add_scope_arguments(fact_record)
+        fact_record.add_argument("--memory-id", required=True, type=_parse_uuid)
+
+    episode = memory_kinds.add_parser("episode")
+    episode_commands = episode.add_subparsers(dest="memory_command", required=True)
+    episode_create = episode_commands.add_parser("create")
+    _add_scope_arguments(episode_create)
+    episode_create.add_argument(
+        "--type", required=True, type=MemoryEpisodeType, choices=list(MemoryEpisodeType)
+    )
+    episode_create.add_argument("--summary", required=True)
+    episode_create.add_argument("--entity", action="append", default=[])
+    episode_create.add_argument("--goal-id", action="append", type=_parse_uuid, default=[])
+    episode_create.add_argument("--situation-id", type=_parse_uuid)
+    episode_create.add_argument("--importance", required=True, type=Decimal)
+    episode_create.add_argument("--confidence", required=True, type=Decimal)
+    episode_create.add_argument(
+        "--source-type",
+        type=MemorySourceType,
+        choices=list(MemorySourceType),
+        default=MemorySourceType.USER_EXPLICIT,
+    )
+    episode_create.add_argument("--source-ref", required=True)
+    episode_create.add_argument("--idempotency-key", required=True)
+    episode_create.add_argument("--occurred-at", type=_parse_datetime)
+
+    episode_list = episode_commands.add_parser("list")
+    _add_scope_arguments(episode_list)
+    episode_list.add_argument("--status", action="append", type=EpisodicMemoryStatus, default=[])
+    episode_list.add_argument("--limit", type=_parse_limit, default=50)
+    for command_name in ("show", "retract"):
+        episode_record = episode_commands.add_parser(command_name)
+        _add_scope_arguments(episode_record)
+        episode_record.add_argument("--memory-id", required=True, type=_parse_uuid)
+    episode_search = episode_commands.add_parser("search")
+    _add_scope_arguments(episode_search)
+    episode_search.add_argument("--query", required=True)
+    episode_search.add_argument("--limit", type=_parse_limit, default=8)
+
+    context = commands.add_parser("context")
+    context_commands = context.add_subparsers(dest="context_command", required=True)
+    context_build = context_commands.add_parser("build")
+    _add_scope_arguments(context_build)
+    context_build.add_argument("--situation-id", required=True, type=_parse_uuid)
+    context_build.add_argument("--focus")
     return parser
 
 
@@ -846,6 +1171,106 @@ async def _dispatch(arguments: argparse.Namespace, commands: CommandFunctions) -
             arguments.workspace_id,
             arguments.situation_id,
         )
+    elif (
+        arguments.area == "memory"
+        and arguments.memory_kind == "fact"
+        and arguments.memory_command == "put"
+    ):
+        await commands.memory_fact_put(
+            MemoryFactDraft(
+                user_id=arguments.user_id,
+                workspace_id=arguments.workspace_id,
+                namespace=arguments.namespace,
+                key=arguments.key,
+                value_json=arguments.value_json,
+                scope_type=arguments.scope_type,
+                scope_id=arguments.scope_id,
+                source_type=arguments.source_type,
+                source_ref=arguments.source_ref,
+                confidence=arguments.confidence,
+                idempotency_key=arguments.idempotency_key,
+                valid_from=arguments.valid_from or _utc_now(),
+                valid_until=arguments.valid_until,
+            )
+        )
+    elif (
+        arguments.area == "memory"
+        and arguments.memory_kind == "fact"
+        and arguments.memory_command == "list"
+    ):
+        await commands.memory_fact_list(
+            arguments.user_id,
+            arguments.workspace_id,
+            tuple(arguments.status),
+            arguments.limit,
+        )
+    elif arguments.area == "memory" and arguments.memory_kind == "fact":
+        command = {
+            "show": commands.memory_fact_show,
+            "retract": commands.memory_fact_retract,
+        }.get(arguments.memory_command)
+        if command is None:
+            raise CliValidationError("Command is unavailable")
+        await command(arguments.user_id, arguments.workspace_id, arguments.memory_id)
+    elif (
+        arguments.area == "memory"
+        and arguments.memory_kind == "episode"
+        and arguments.memory_command == "create"
+    ):
+        await commands.memory_episode_create(
+            EpisodicMemoryDraft(
+                user_id=arguments.user_id,
+                workspace_id=arguments.workspace_id,
+                type=arguments.type,
+                summary=arguments.summary,
+                entities=tuple(arguments.entity),
+                goal_ids=tuple(arguments.goal_id),
+                situation_id=arguments.situation_id,
+                importance=arguments.importance,
+                confidence=arguments.confidence,
+                source_type=arguments.source_type,
+                source_ref=arguments.source_ref,
+                idempotency_key=arguments.idempotency_key,
+                occurred_at=arguments.occurred_at or _utc_now(),
+            )
+        )
+    elif (
+        arguments.area == "memory"
+        and arguments.memory_kind == "episode"
+        and arguments.memory_command == "list"
+    ):
+        await commands.memory_episode_list(
+            arguments.user_id,
+            arguments.workspace_id,
+            tuple(arguments.status),
+            arguments.limit,
+        )
+    elif (
+        arguments.area == "memory"
+        and arguments.memory_kind == "episode"
+        and arguments.memory_command == "search"
+    ):
+        await commands.memory_episode_search(
+            arguments.user_id,
+            arguments.workspace_id,
+            arguments.query,
+            arguments.limit,
+        )
+    elif arguments.area == "memory" and arguments.memory_kind == "episode":
+        command = {
+            "show": commands.memory_episode_show,
+            "retract": commands.memory_episode_retract,
+        }.get(arguments.memory_command)
+        if command is None:
+            raise CliValidationError("Command is unavailable")
+        await command(arguments.user_id, arguments.workspace_id, arguments.memory_id)
+    elif arguments.area == "context" and arguments.context_command == "build":
+        await commands.context_build(
+            arguments.user_id,
+            arguments.workspace_id,
+            arguments.situation_id,
+            arguments.focus,
+        )
     else:
         raise CliValidationError("Command is unavailable")
 
@@ -865,6 +1290,23 @@ def _parse_json_object(value: str) -> JsonObject:
     if not isinstance(parsed, dict):
         raise argparse.ArgumentTypeError("invalid JSON object")
     return cast(JsonObject, parsed)
+
+
+def _parse_json_value(value: str) -> JsonValue:
+    try:
+        return cast(JsonValue, json.loads(value))
+    except json.JSONDecodeError:
+        raise argparse.ArgumentTypeError("invalid JSON value") from None
+
+
+def _parse_datetime(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid ISO 8601 timestamp") from None
+    if parsed.utcoffset() is None:
+        raise argparse.ArgumentTypeError("timestamp must include a timezone")
+    return parsed
 
 
 def _parse_limit(value: str) -> int:
@@ -959,6 +1401,29 @@ async def _run_database_operation[T](
         primary_failure = error
     cleanup_failed = await _close_database(database)
     _raise_after_cleanup(primary_failure, cleanup_failed)
+    if result is missing:
+        raise CliResourceError("Command did not produce a result")
+    return cast(T, result)
+
+
+async def _run_memory_operation[T](
+    settings: Settings,
+    dependency_builder: MemoryDependencyBuilder,
+    operation: Callable[[MemoryDependencies], Awaitable[T]],
+) -> T:
+    dependencies = dependency_builder(settings, include_embedding=True)
+    primary_failure: BaseException | None = None
+    missing = object()
+    result: T | object = missing
+    try:
+        result = await operation(dependencies)
+    except BaseException as error:
+        primary_failure = error
+    cleanup = await dependencies.close()
+    _raise_after_cleanup(
+        primary_failure,
+        CleanupOutcome(cleanup.interruption, cleanup.ordinary_failure),
+    )
     if result is missing:
         raise CliResourceError("Command did not produce a result")
     return cast(T, result)
