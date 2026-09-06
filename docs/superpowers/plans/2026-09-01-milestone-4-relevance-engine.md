@@ -4,7 +4,7 @@
 
 **Goal:** Add Eva's durable, goal-aware relevance engine with conservative deterministic screening, structured OpenAI classification, versioned Signals, four application-owned dispositions, explicit re-evaluation, and bounded operator backfill.
 
-**Architecture:** Keep the current Event backbone as the delivery boundary. `RelevanceEventHandler.prepare()` performs screening and any external model call outside a database transaction, then returns an immutable commit object that the EventProcessor applies atomically with Signal, Goal, Situation, and processing-stage writes. Provider-neutral contracts isolate OpenAI; versioned policy code owns routing; immutable Events and append-only Signal history make decisions revisitable.
+**Architecture:** Keep the current Event backbone as the delivery boundary. A general `OutboxRelayWorker` continuously drains durable outbox rows into the internal Pub/Sub topic, while an independent `RelevancePullWorker` only consumes Event envelopes. `RelevanceEventHandler.prepare()` performs screening and any external model call outside a database transaction, then returns an immutable commit object that the EventProcessor applies atomically with Signal, Goal, Situation, and processing-stage writes. Provider-neutral contracts isolate OpenAI; versioned policy code owns routing; immutable Events and append-only Signal history make decisions revisitable.
 
 **Tech Stack:** Python `>=3.14,<3.15`, Pydantic 2, SQLAlchemy 2 async, PostgreSQL 17 with JSONB, Alembic, OpenAI Python SDK 2.x Responses API, argparse, pytest/pytest-asyncio, Ruff, strict mypy, uv.
 
@@ -26,6 +26,8 @@
 - Gmail category labels are classifier context, never built-in ignore rules.
 - Classifier failure creates neither Signal nor Situation and never becomes implicit `IGNORE`.
 - Relevance processing is disabled by default. No startup hook, migration, Goal change, model change, or policy change may launch a historical scan.
+- Run transactional-outbox publication as a general continuous Event Relay. The relevance consumer must never publish or scan outbox rows.
+- Milestone 4 uses the relay as the sole internal publication path. A direct post-commit publish may be added later as a latency optimization, but it must never replace the durable relay.
 - Backfill is explicit, tenant-scoped, ordered, defaults to 50 Events, and rejects limits above 100.
 - Milestone 4 creates or reuses Situations for `NOTIFY` and `INVESTIGATE`; it does not send Telegram messages, run an investigator, execute tools, or create inferred Goals.
 - Add comments only for non-obvious privacy, transaction, idempotency, concurrency, or supersession invariants.
@@ -45,13 +47,14 @@
 | `src/eva_ai/relevance/repository.py` | Scoped attempt, Signal, Goal-link, candidate-context, and backfill SQL |
 | `src/eva_ai/relevance/classifier.py` | Provider-neutral classifier and retry-runner protocols plus scripted fakes |
 | `src/eva_ai/relevance/service.py` | Initial evaluation, explicit re-evaluation, prepared atomic commit, and backfill use cases |
-| `src/eva_ai/relevance/worker.py` | Transactional-outbox relay, Pub/Sub Event pull, processing dispatch, and ACK/NACK policy |
+| `src/eva_ai/events/relay_worker.py` | Continuous, provider-neutral draining of pending transactional-outbox rows |
+| `src/eva_ai/relevance/worker.py` | Pub/Sub Event pull, processing dispatch, and ACK/NACK policy |
 | `src/eva_ai/integrations/openai/relevance.py` | OpenAI Responses API request, structured parsing, and provider error mapping |
 | `src/eva_ai/db/models/relevance.py` | Signal, SignalGoal, and RelevanceEvaluationAttempt ORM mappings |
 | `src/eva_ai/events/processor.py` | Claim, prepare-outside-transaction, atomic commit, release, and final processing stage |
 | `src/eva_ai/situations/repository.py` | Existing Situation SQL plus a same-session resolver entry point |
 | `src/eva_ai/worker.py` | Runtime composition for the relevance handler and OpenAI adapter |
-| `src/eva_ai/cli.py` | Relevance show/history/reevaluate/backfill commands and safe JSON output |
+| `src/eva_ai/cli.py` | Continuous Event-relay command plus relevance pull/show/history/reevaluate/backfill commands |
 | `docs/relevance-operator.md` | Configuration, privacy boundary, commands, retries, and troubleshooting |
 
 ## Stable Public Contracts
@@ -445,6 +448,7 @@ def test_relevance_settings_have_safe_disabled_defaults() -> None:
     assert settings.relevance_goal_limit == 20
     assert settings.relevance_situation_limit == 5
     assert settings.relevance_retry_attempts == 3
+    assert settings.outbox_relay_poll_seconds == 1.0
     assert settings.openai_api_key is None
 
 
@@ -453,8 +457,9 @@ def test_enabled_openai_relevance_requires_secret() -> None:
         Settings(_env_file=None, relevance_enabled=True, openai_api_key=None)
 ```
 
-Also test threshold bounds, `retry_max >= retry_initial`, non-blank model/version/provider values,
-limits of 20 Goals and five Situations, and exact ignored-rule tuple normalization.
+Also test threshold bounds, `retry_max >= retry_initial`, a strictly positive relay poll interval,
+non-blank model/version/provider values, limits of 20 Goals and five Situations, and exact
+ignored-rule tuple normalization.
 
 - [ ] **Step 3: Run the focused tests and verify expected import failures**
 
@@ -515,6 +520,7 @@ openai_api_key: SecretStr | None = None
 relevance_model: str = "gpt-5.6-luna"
 relevance_subscription_id: str = "eva-relevance-local"
 relevance_pull_timeout_seconds: PositiveInt = 30
+outbox_relay_poll_seconds: PositiveFloat = 1.0
 relevance_classifier_version: str = "relevance-v1"
 relevance_policy_version: str = "relevance-policy-v1"
 relevance_body_max_chars: int = Field(default=4000, ge=1, le=8000)
@@ -1717,12 +1723,14 @@ git commit -m "feat: route relevance signals into situations"
 
 ---
 
-### Task 10: Runtime Composition, Relevance CLI, and Bounded Backfill
+### Task 10: Continuous Event Relay, Relevance Runtime, CLI, and Bounded Backfill
 
 **Files:**
+- Create: `src/eva_ai/events/relay_worker.py`
 - Create: `src/eva_ai/relevance/worker.py`
 - Modify: `src/eva_ai/worker.py`
 - Modify: `src/eva_ai/cli.py`
+- Create: `tests/unit/events/test_relay_worker.py`
 - Create: `tests/unit/relevance/test_worker.py`
 - Modify: `tests/unit/test_worker.py`
 - Modify: `tests/unit/test_cli.py`
@@ -1730,11 +1738,11 @@ git commit -m "feat: route relevance signals into situations"
 
 **Interfaces:**
 - Consumes: `Settings`, `AsyncOpenAI`, `GooglePubSubPublisher`, `OutboxRelay`, `GooglePullSubscriber`, EventProcessor, relevance repository/context/runner/policy/service/handler.
-- Produces: `build_relevance_handler()`, `RelevanceWorker`, pull/show/history/reevaluate/backfill commands, bounded `BackfillSummary`.
+- Produces: independent `OutboxRelayWorker` and `RelevancePullWorker`, runtime builders, Event-relay/relevance CLI commands, and bounded `BackfillSummary`.
 
 - [ ] **Step 1: Write failing runtime-composition tests**
 
-Assert disabled relevance refuses mutation-handler construction without creating OpenAI client;
+Assert disabled relevance refuses relevance-handler construction without creating an OpenAI client;
 enabled OpenAI configuration passes the secret/model/versions/bounds/retries/thresholds/rules to
 the correct collaborators; API key never appears in repr or failure text; an injected fake
 classifier can build without a key for tests.
@@ -1745,61 +1753,81 @@ with pytest.raises(ValueError, match="relevance processing is disabled"):
 assert recording_openai_clients == []
 ```
 
-Also assert `include_worker=True` creates a `GooglePubSubPublisher`, `OutboxRelay`, and
-`GooglePullSubscriber` with `pubsub_project_id/relevance_subscription_id`, passes
-`outbox_batch_limit` and `relevance_pull_timeout_seconds` to the worker, and uses the existing
-`event_topic_id` as the outbox destination. With `include_worker=False`,
-re-evaluation/backfill constructs no publisher, relay, or subscriber and does not require Pub/Sub
-configuration. Close every constructed subscriber, OpenAI client, and database independently.
+Assert Event Relay composition independently creates `GooglePubSubPublisher`, `OutboxRelay`, and
+`OutboxRelayWorker` from `pubsub_project_id`, `outbox_batch_limit`, `outbox_lease_seconds`, and
+`outbox_relay_poll_seconds`. Assert Relevance composition with `include_pull_worker=True` creates
+only `GooglePullSubscriber` plus `RelevancePullWorker` from
+`pubsub_project_id/relevance_subscription_id/relevance_pull_timeout_seconds`; it must not construct a
+publisher or relay. With `include_pull_worker=False`, re-evaluation/backfill constructs no
+subscriber and does not require Pub/Sub configuration. Close every constructed subscriber, OpenAI
+client, and database independently.
 
-- [ ] **Step 2: Write failing combined outbox-relay/Event-pull worker tests**
+- [ ] **Step 2: Write failing continuous Event Relay tests**
+
+Use a scripted `OutboxRelay`, injected sleep, and explicit cancellation. Prove:
+
+- `run_once()` delegates exactly one bounded `publish_batch(outbox_batch_limit)` and returns its
+  `PublishBatchResult`;
+- `run_forever()` immediately drains another batch only when the previous batch was full and had no
+  failures;
+- an empty, partial, or failed batch waits exactly `outbox_relay_poll_seconds` before retrying, which
+  prevents both idle polling and a hot retry loop;
+- a batch-level database failure is logged without external error text, waits, and retries;
+- `CancelledError` propagates unchanged during publication or sleep;
+- logs contain only approved IDs/counts and categorical outcomes, never Event payloads, provider
+  exception text, database URLs, or credentials.
 
 ```python
-async def test_pull_worker_acknowledges_durable_and_poison_outcomes() -> None:
-    relay = ScriptedOutboxRelay(PublishBatchResult(claimed=2, published=2, failed=0))
+async def test_relay_worker_drains_full_successful_batches_without_sleeping() -> None:
+    relay = ScriptedOutboxRelay(
+        (
+            PublishBatchResult(claimed=10, published=10, failed=0),
+            PublishBatchResult(claimed=2, published=2, failed=0),
+        )
+    )
+    sleep = RecordingSleep(stop_after_calls=1)
+    worker = OutboxRelayWorker(relay, batch_limit=10, poll_seconds=1.5, sleep=sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker.run_forever()
+
+    assert relay.limits == [10, 10]
+    assert sleep.delays == [1.5]
+```
+
+- [ ] **Step 3: Write failing relevance pull worker ACK/NACK tests**
+
+```python
+async def test_relevance_pull_acknowledges_durable_and_poison_outcomes() -> None:
     subscriber = FakeSubscriber(
         messages=(valid_message(1), valid_message(2), malformed_message(3))
     )
     processor = ScriptedProcessor((HANDLED_RESULT, ALREADY_HANDLED_RESULT))
-    worker = RelevanceWorker(
-        relay,
-        subscriber,
-        processor,
-        HANDLER,
-        outbox_batch_limit=11,
-        pull_timeout_seconds=17,
-    )
+    worker = RelevancePullWorker(subscriber, processor, HANDLER, pull_timeout_seconds=17)
 
     result = await worker.run_once(max_messages=3)
 
-    assert result == RelevanceWorkerBatchResult(
-        outbox_claimed=2,
-        outbox_published=2,
-        outbox_failed=0,
+    assert result == RelevancePullBatchResult(
         pulled=3,
         acknowledged=3,
         negative_acknowledged=0,
     )
-    assert relay.limits == [11]
     assert subscriber.acknowledged == ("ack-1", "ack-2", "ack-3")
 ```
 
-Assert the relay runs before the pull so newly committed Gmail Events become available without a
-separate operator process. Add cases: individual relay publication failures are reported and do not
-skip pulling already available messages; a relay-level exception is retained until after available
-messages are classified and ACK/NACK calls finish; pull/ack failure takes precedence when both
-phases fail; `BUSY` negative-acknowledges; transient/internal processing failures
+Add cases: `BUSY` negative-acknowledges; transient/internal processing failures
 negative-acknowledge; `EvaluationReviewRequired` acknowledges so Pub/Sub does not loop while the
-attempt remains visible; one bad message does not skip later messages; acknowledgement and relay
-transport failures are content-free; cancellation propagates and closes the subscriber once; logs
-include only outbox/Pub/Sub/Event IDs and categorical outcomes, never message bytes or provider
-exception text.
+attempt remains visible; one bad message does not skip later messages; acknowledgement transport
+failure is content-free; cancellation propagates and closes the subscriber once. Assert the worker
+accepts no publisher/relay collaborator and logs only Pub/Sub/Event IDs and categorical outcomes,
+never message bytes or provider exception text.
 
-- [ ] **Step 3: Write failing parser and dispatch tests for exact command surface**
+- [ ] **Step 4: Write failing parser and dispatch tests for exact command surface**
 
 Add:
 
 ```text
+eva events relay
 eva relevance pull
 eva relevance show --user-id UUID --workspace-id UUID --event-id UUID
 eva relevance history --user-id UUID --workspace-id UUID --event-id UUID
@@ -1808,15 +1836,17 @@ eva relevance reevaluate --user-id UUID --workspace-id UUID --event-id UUID \
 eva relevance backfill --user-id UUID --workspace-id UUID [--limit 1..100]
 ```
 
-Extend `CommandFunctions` with exact callables and assert `_dispatch` calls pull with no arguments
-and passes typed UUIDs, required reason, generated/reused idempotency key, and default limit 50 to
-the other commands. Help must not load Settings.
+Extend `CommandFunctions` with exact callables and assert `_dispatch` calls both continuous commands
+with no arguments and passes typed UUIDs, required reason, generated/reused idempotency key, and
+default limit 50 to the other commands. Help must not load Settings.
 
-- [ ] **Step 4: Write failing CLI integration tests**
+- [ ] **Step 5: Write failing CLI integration tests**
 
-Assert `show` returns current Signal without Event payload; `history` returns Signals and attempts in
-deterministic order; `reevaluate` writes its generated key to stderr before provider work and emits
-one final JSON document to stdout; same key replays original; generic command failure contains no
+Assert the Event Relay command constructs the Google publisher and runs continuously until
+cancellation, without requiring relevance to be enabled or an OpenAI key. Assert `show` returns the
+current Signal without Event payload; `history` returns Signals and attempts in deterministic order;
+`reevaluate` writes its generated key to stderr before provider work and emits one final JSON
+document to stdout; same key replays original; generic command failure contains no
 email/model/API content.
 
 For backfill, create 55 unevaluated Events, current Signals, and another tenant. Run limit 50 and
@@ -1824,39 +1854,53 @@ assert exactly the oldest 50 scoped unevaluated Events are handled. Rerun and as
 five. A failed Event increments failed summary and does not stop later Events. Assert no limit above
 100 parses.
 
-- [ ] **Step 5: Run worker/CLI/composition tests and verify failures**
+- [ ] **Step 6: Run worker/CLI/composition tests and verify failures**
 
-Run: `uv run pytest tests/unit/relevance/test_worker.py tests/unit/test_worker.py tests/unit/test_cli.py tests/integration/test_relevance_cli.py -q`
+Run: `uv run pytest tests/unit/events/test_relay_worker.py tests/unit/relevance/test_worker.py tests/unit/test_worker.py tests/unit/test_cli.py tests/integration/test_relevance_cli.py -q`
 
-Expected: FAIL because composition and relevance commands do not exist.
+Expected: FAIL because the continuous relay, relevance consumer, composition, and commands do not
+exist.
 
-- [ ] **Step 6: Implement combined outbox relay and Event pull worker**
+- [ ] **Step 7: Implement the continuous general Event Relay**
 
-At the beginning of each `run_once`, call `OutboxRelay.publish_batch(outbox_batch_limit)` so the same
-long-running process moves freshly committed Gmail Event envelopes from PostgreSQL to the existing
-`eva-events` Pub/Sub topic. Then pull from the dedicated relevance subscription. Decode
-`PullMessage.data` with `EventAvailableMessage.model_validate_json()`. ACK malformed envelopes as
-poison messages. Dispatch valid envelopes through one EventProcessor/handler call. ACK `HANDLED`,
-`ALREADY_HANDLED`, and review-required outcomes; negative-acknowledge `BUSY` and retryable failures.
-Group ACK/NACK calls only after every pulled message is isolated and classified.
+`OutboxRelayWorker` owns only continuous scheduling around the existing provider-neutral
+`OutboxRelay.publish_batch()`. It never reads Gmail tables, creates Signals, or consumes Pub/Sub.
+Drain full successful batches immediately; sleep after empty/partial batches, any per-message
+publication failure, or a sanitized batch-level failure. Preserve cancellation exactly.
 
-Do not let a relay-level failure skip messages already waiting in Pub/Sub: record a content-free
-relay failure, finish pull/dispatch/ACK work, then raise it only if pull/ACK did not produce a primary
-failure. Individual failures returned in `PublishBatchResult.failed` remain visible in
-`RelevanceWorkerBatchResult` and the next loop retries their released rows. Match the Gmail worker's
+The relay is the sole internal-event publication path in this milestone. Do not publish from Gmail
+ingestion or the relevance consumer. An immediate post-commit attempt can be introduced later as a
+latency fast path, but the durable relay must remain because PostgreSQL and Pub/Sub do not share an
+atomic transaction.
+
+```python
+class OutboxRelayWorker:
+    def __init__(
+        self,
+        relay: OutboxRelay,
+        batch_limit: int,
+        poll_seconds: float,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        raise NotImplementedError
+
+    async def run_once(self) -> PublishBatchResult:
+        raise NotImplementedError
+
+    async def run_forever(self) -> None:
+        raise NotImplementedError
+```
+
+- [ ] **Step 8: Implement the relevance-only Event consumer**
+
+Pull from the dedicated relevance subscription and decode `PullMessage.data` with
+`EventAvailableMessage.model_validate_json()`. ACK malformed envelopes as poison messages. Dispatch
+valid envelopes through one EventProcessor/handler call. ACK `HANDLED`, `ALREADY_HANDLED`, and
+review-required outcomes; negative-acknowledge `BUSY` and retryable failures. Group ACK/NACK calls
+only after every pulled message is isolated and classified. Match the Gmail worker's
 cancellation-safe `run_forever()` and content-free logging patterns.
 
 ```python
-@dataclass(frozen=True, slots=True)
-class RelevanceWorkerBatchResult:
-    outbox_claimed: int
-    outbox_published: int
-    outbox_failed: int
-    pulled: int
-    acknowledged: int
-    negative_acknowledged: int
-
-
 _ACK_OUTCOMES = {ProcessOutcome.HANDLED, ProcessOutcome.ALREADY_HANDLED}
 
 async def _should_acknowledge(self, message: PullMessage) -> bool:
@@ -1874,38 +1918,53 @@ async def _should_acknowledge(self, message: PullMessage) -> bool:
     return result.outcome in _ACK_OUTCOMES
 ```
 
-- [ ] **Step 7: Implement runtime composition**
+- [ ] **Step 9: Implement independent runtime composition**
 
-Build one repository, context builder, policy, classifier runner, and handler from Settings. Construct
-`AsyncOpenAI(api_key=settings.openai_api_key.get_secret_value())` only after enabled/provider
-validation. Permit explicit classifier injection for tests. Keep client closure in the caller-owned
-dependency bundle.
+Build the Event Relay dependency bundle separately from relevance. It owns a database,
+`GooglePubSubPublisher`, `OutboxRelay`, and `OutboxRelayWorker`; it requires GCP project/topic
+configuration but no OpenAI or relevance setting.
+
+Build one relevance repository, context builder, policy, classifier runner, and handler from
+Settings. Construct `AsyncOpenAI(api_key=settings.openai_api_key.get_secret_value())` only after
+enabled/provider validation. Permit explicit classifier injection for tests. The relevance bundle
+owns no publisher or relay.
 
 ```python
+@dataclass(slots=True)
+class EventRelayDependencies:
+    database: Database
+    publisher: GooglePubSubPublisher
+    relay: OutboxRelay
+    worker: OutboxRelayWorker
+
+    async def close(self) -> CleanupOutcome:
+        raise NotImplementedError
+
+
 @dataclass(slots=True)
 class RelevanceDependencies:
     database: Database
     handler: RelevanceEventHandler
     service: RelevanceService
-    publisher: GooglePubSubPublisher | None
-    outbox_relay: OutboxRelay | None
     subscriber: GooglePullSubscriber | None
-    worker: RelevanceWorker | None
+    worker: RelevancePullWorker | None
     openai_client: AsyncOpenAI | None
 
     async def close(self) -> CleanupOutcome:
         raise NotImplementedError
 ```
 
-Close OpenAI client and database independently with the CLI's established cancellation/error
-precedence.
+Close subscriber, OpenAI client, and database independently with the CLI's established
+cancellation/error precedence.
 
-- [ ] **Step 8: Implement pull and operator commands with safe projections**
+- [ ] **Step 10: Implement continuous and operator commands with safe projections**
 
-`pull` validates relevance, project, topic, and subscription configuration and runs the combined
-relay/consumer worker forever with cancellation-safe cleanup. `show` and `history` use
-database-only repositories.
-`reevaluate` validates enabled runtime,
+`events relay` validates project/topic configuration and runs the general relay forever with
+cancellation-safe cleanup. `relevance pull` validates relevance, project, and subscription
+configuration and runs only the relevance consumer. In deployed environments the process manager
+must keep both commands running independently; local development runs them in separate terminals.
+
+`show` and `history` use database-only repositories. `reevaluate` validates enabled runtime,
 generates UUIDv7 when no key is supplied, writes only `eva: relevance evaluation <UUID>` to stderr
 before calling, and returns the Signal as stable JSON. `history` returns:
 
@@ -1919,7 +1978,7 @@ before calling, and returns the Signal as stable JSON. `history` returns:
 
 No projection includes Event payload, context JSON, prompts, raw response, or secrets.
 
-- [ ] **Step 9: Implement bounded backfill service and command**
+- [ ] **Step 11: Implement bounded backfill service and command**
 
 ```python
 class BackfillSummary(BaseModel):
@@ -1937,17 +1996,17 @@ cancellation/keyboard interruption. Do not scan beyond the selected batch and do
 empty. Each successful backfill locks its unclaimed EventProcessing row and marks it `HANDLED` in
 the same transaction as the Signal/Situation route; skip an Event with a live processing claim.
 
-- [ ] **Step 10: Run worker/CLI/composition tests and static checks**
+- [ ] **Step 12: Run worker/CLI/composition tests and static checks**
 
-Run: `uv run pytest tests/unit/relevance/test_worker.py tests/unit/test_worker.py tests/unit/test_cli.py tests/integration/test_relevance_cli.py -q && uv run ruff check src/eva_ai/relevance/worker.py src/eva_ai/worker.py src/eva_ai/cli.py tests/unit/relevance/test_worker.py tests/unit/test_worker.py tests/unit/test_cli.py tests/integration/test_relevance_cli.py && uv run mypy src/eva_ai/relevance/worker.py src/eva_ai/worker.py src/eva_ai/cli.py tests/unit/relevance/test_worker.py tests/unit/test_worker.py tests/unit/test_cli.py tests/integration/test_relevance_cli.py`
+Run: `uv run pytest tests/unit/events/test_relay_worker.py tests/unit/relevance/test_worker.py tests/unit/test_worker.py tests/unit/test_cli.py tests/integration/test_relevance_cli.py -q && uv run ruff check src/eva_ai/events/relay_worker.py src/eva_ai/relevance/worker.py src/eva_ai/worker.py src/eva_ai/cli.py tests/unit/events/test_relay_worker.py tests/unit/relevance/test_worker.py tests/unit/test_worker.py tests/unit/test_cli.py tests/integration/test_relevance_cli.py && uv run mypy src/eva_ai/events/relay_worker.py src/eva_ai/relevance/worker.py src/eva_ai/worker.py src/eva_ai/cli.py tests/unit/events/test_relay_worker.py tests/unit/relevance/test_worker.py tests/unit/test_worker.py tests/unit/test_cli.py tests/integration/test_relevance_cli.py`
 
 Expected: PASS.
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 13: Commit**
 
 ```bash
-git add src/eva_ai/relevance/worker.py src/eva_ai/worker.py src/eva_ai/cli.py tests/unit/relevance/test_worker.py tests/unit/test_worker.py tests/unit/test_cli.py tests/integration/test_relevance_cli.py
-git commit -m "feat: add relevance operator workflows"
+git add src/eva_ai/events/relay_worker.py src/eva_ai/relevance/worker.py src/eva_ai/worker.py src/eva_ai/cli.py tests/unit/events/test_relay_worker.py tests/unit/relevance/test_worker.py tests/unit/test_worker.py tests/unit/test_cli.py tests/integration/test_relevance_cli.py
+git commit -m "feat: add continuous event relay and relevance workflows"
 ```
 
 ---
@@ -1967,10 +2026,11 @@ git commit -m "feat: add relevance operator workflows"
 
 - [ ] **Step 1: Write failing documentation/Makefile contract tests**
 
-Extend `test_makefile.py` to prove relevance wrappers do not evaluate shell substitutions in
-`EVA_USER_ID`, `EVA_WORKSPACE_ID`, `EVA_EVENT_ID`, or `EVA_RELEVANCE_REASON`. Add a small documentation
-test that asserts README links to `docs/relevance-operator.md` and `.env.example` contains disabled
-safe defaults, model/version/bounds/retry values, and no real API key.
+Extend `test_makefile.py` to prove the `events-relay` target exists and relevance wrappers do not
+evaluate shell substitutions in `EVA_USER_ID`, `EVA_WORKSPACE_ID`, `EVA_EVENT_ID`, or
+`EVA_RELEVANCE_REASON`. Add a small documentation test that asserts README links to
+`docs/relevance-operator.md` and `.env.example` contains the relay interval, disabled relevance safe
+defaults, model/version/bounds/retry values, and no real API key.
 
 - [ ] **Step 2: Run documentation tests and verify failure**
 
@@ -1982,22 +2042,33 @@ Expected: FAIL because relevance wrappers/docs/config examples are absent.
 
 Document:
 
+- the two distinct topics: Gmail notification wake-ups on `eva-gmail-notifications` and canonical
+  internal Event envelopes on `eva-events`;
+- the independent continuous `eva events relay` and `eva relevance pull` processes, including that
+  both are process-manager responsibilities in deployment and separate terminals locally;
+- the transactional dual-write failure that makes the durable relay necessary, and that an optional
+  future direct post-commit attempt is only a latency fast path;
 - Event -> screening -> bounded context -> OpenAI -> application policy -> Signal -> Situation flow;
 - exact data sent and excluded;
 - `store=False` semantics without claiming general zero retention;
 - Secret Manager-backed `EVA_OPENAI_API_KEY` deployment expectation and local `.env` usage;
 - disabled-by-default enablement;
-- the `eva-relevance-local` subscription creation for the existing `eva-events` topic;
-- pull, show, history, re-evaluate, and backfill commands with exact arguments and JSON behavior;
+- the `eva-events` topic and `eva-relevance-local` subscription creation;
+- Event relay, relevance pull, show, history, re-evaluate, and backfill commands with exact
+  arguments and JSON behavior;
 - explicit backfill and the absence of automatic rescans;
 - retries, permanent review-required attempts, and same-key replay;
 - why `IGNORE` and `RECORD` remain retrievable/re-evaluable;
 - `NOTIFY`/`INVESTIGATE` do not yet send or act;
 - troubleshooting for missing key, invalid configuration, provider outage, and failed attempts.
 
-Include the explicit one-time GCP command, with the operator substituting the real project:
+Include the explicit one-time GCP commands, with the operator substituting the real project and
+skipping topic creation when it already exists:
 
 ```bash
+gcloud pubsub topics create eva-events \
+  --project=GCP_PROJECT_ID
+
 gcloud pubsub subscriptions create eva-relevance-local \
   --project=GCP_PROJECT_ID \
   --topic=eva-events
@@ -2016,6 +2087,7 @@ EVA_OPENAI_API_KEY=
 EVA_RELEVANCE_MODEL=gpt-5.6-luna
 EVA_RELEVANCE_SUBSCRIPTION_ID=eva-relevance-local
 EVA_RELEVANCE_PULL_TIMEOUT_SECONDS=30
+EVA_OUTBOX_RELAY_POLL_SECONDS=1
 EVA_RELEVANCE_CLASSIFIER_VERSION=relevance-v1
 EVA_RELEVANCE_POLICY_VERSION=relevance-policy-v1
 EVA_RELEVANCE_BODY_MAX_CHARS=4000
@@ -2027,9 +2099,8 @@ EVA_RELEVANCE_RETRY_MAX_BACKOFF_SECONDS=30
 EVA_RELEVANCE_RETRY_JITTER_RATIO=0.2
 ```
 
-Add Make wrappers named `relevance-pull`, `relevance-show`, `relevance-history`, and
-`relevance-reevaluate`; preserve
-the existing Makefile's literal assignments such as
+Add Make wrappers named `events-relay`, `relevance-pull`, `relevance-show`, `relevance-history`,
+and `relevance-reevaluate`; preserve the existing Makefile's literal assignments such as
 `override EVA_EVENT_ID := $(value EVA_EVENT_ID)` and quoted shell forwarding pattern.
 
 - [ ] **Step 5: Run documentation tests and commit docs**
@@ -2088,10 +2159,11 @@ gh pr create \
   --body-file /tmp/eva-milestone-4-pr.md
 ```
 
-Create `/tmp/eva-milestone-4-pr.md` with `apply_patch` before the command. It must summarize durable
-Signals, privacy-bounded OpenAI classification, application-owned routing, Situation behavior,
-explicit re-evaluation/backfill, and exact verification evidence. Do not include mailbox content,
-IDs, secrets, or raw model responses.
+Create `/tmp/eva-milestone-4-pr.md` with `apply_patch` before the command. It must summarize the
+independent continuous Event Relay and relevance consumer, durable Signals, privacy-bounded OpenAI
+classification, application-owned routing, Situation behavior, explicit re-evaluation/backfill,
+and exact verification evidence. Do not include mailbox content, IDs, secrets, or raw model
+responses.
 
 - [ ] **Step 10: Report handoff without merging**
 
