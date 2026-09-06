@@ -1,0 +1,4 @@
+project_id        = "evaai-507018"
+region            = "asia-south1"
+github_repository = "BugsBunnyWanders/EvaAI"
+state_bucket_name = "evaai-507018-terraform-state"

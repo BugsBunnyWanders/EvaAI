@@ -10,7 +10,7 @@ override EVA_MEMORY_QUERY := $(value EVA_MEMORY_QUERY)
 override EVA_SITUATION_ID := $(value EVA_SITUATION_ID)
 export EVA_USER_ID EVA_WORKSPACE_ID EVA_GMAIL_CONNECTOR_ID EVA_EVENT_ID EVA_RELEVANCE_REASON EVA_RELEVANCE_IDEMPOTENCY_KEY EVA_MEMORY_ID EVA_MEMORY_QUERY EVA_SITUATION_ID
 
-.PHONY: setup db-up db-down migrate run gmail-connect gmail-sync gmail-pull gmail-maintain events-relay relevance-pull relevance-show relevance-history relevance-reevaluate relevance-backfill memory-fact-list memory-episode-list memory-episode-show memory-episode-search context-build test lint format typecheck verify
+.PHONY: setup db-up db-down migrate run worker-run gmail-connect gmail-sync gmail-pull gmail-maintain events-relay relevance-pull relevance-show relevance-history relevance-reevaluate relevance-backfill memory-fact-list memory-episode-list memory-episode-show memory-episode-search context-build test lint format typecheck verify
 
 setup:
 	uv sync --all-groups
@@ -26,6 +26,9 @@ migrate:
 
 run:
 	uv run uvicorn eva_ai.main:app --reload
+
+worker-run:
+	uv run eva worker run
 
 gmail-connect:
 	uv run eva gmail connect --user-id "$${EVA_USER_ID}" --workspace-id "$${EVA_WORKSPACE_ID}"

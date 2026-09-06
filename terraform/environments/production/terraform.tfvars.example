@@ -1,0 +1,6 @@
+project_id    = "evaai-507018"
+region        = "asia-south1"
+database_tier = "db-f1-micro"
+
+# CI supplies the release image by digest. For a local plan, use an existing immutable image.
+image = "asia-south1-docker.pkg.dev/evaai-507018/eva/eva@sha256:0000000000000000000000000000000000000000000000000000000000000000"
