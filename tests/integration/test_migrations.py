@@ -61,6 +61,9 @@ async def test_event_backbone_tables_exist(database: Database) -> None:
         "situation_events",
         "situation_goals",
         "situation_correlation_keys",
+        "signals",
+        "signal_goals",
+        "relevance_evaluation_attempts",
     } <= set(tables)
 
 
