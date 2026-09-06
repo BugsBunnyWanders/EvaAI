@@ -81,4 +81,4 @@ OpenAI Python SDK 2.x embeddings API, argparse, pytest, Ruff, strict mypy, uv.
 - [x] Update README architecture and milestone status.
 - [x] Run Ruff formatting/linting, strict mypy, unit tests, PostgreSQL tests, and migrations.
 - [x] Review the diff for secrets and unrelated changes.
-- [ ] Commit, push `codex/milestone-5-memory-context`, and open a PR to `main`.
+- [x] Commit, push `codex/milestone-5-memory-context`, and open a PR to `main`.
