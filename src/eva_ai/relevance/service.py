@@ -15,7 +15,7 @@ from eva_ai.events.processor import EventCommit, StoredEvent
 from eva_ai.events.types import ProcessingStage
 from eva_ai.relevance.classifier import ClassifierRunRequest, RelevanceClassifierRunner
 from eva_ai.relevance.context import RelevanceContextBuilder, context_digest
-from eva_ai.relevance.errors import RelevanceConflictError, RelevanceError, RelevanceScopeError
+from eva_ai.relevance.errors import RelevanceConflictError, RelevanceScopeError
 from eva_ai.relevance.filters import (
     RelevanceRuleProvider,
     RelevanceRuleSet,
@@ -165,7 +165,7 @@ class RelevanceEventHandler:
         )
         if existing is not None:
             return ExistingRelevanceCommit(existing)
-        if trigger is EvaluationTrigger.INITIAL:
+        if trigger is not EvaluationTrigger.EXPLICIT_REEVALUATION:
             current = await self._signals.get_current(
                 event_id=event.id,
                 user_id=event.user_id,
@@ -316,9 +316,17 @@ class RelevanceService:
                     evaluation_key=key,
                 )
                 if signal is None:
+                    # Another worker may have evaluated an Event after this batch was selected.
+                    signal = await self._repository.get_current(
+                        event_id=event_id,
+                        user_id=user_id,
+                        workspace_id=workspace_id,
+                    )
+                if signal is None:
                     raise RelevanceScopeError("backfill did not create a Signal")
                 signal_ids.append(signal.id)
-            except RelevanceError:
+            except Exception:
+                # Backfill reports only counts; per-Event exception text is never surfaced.
                 failed += 1
         return BackfillSummary(
             selected=len(event_ids),

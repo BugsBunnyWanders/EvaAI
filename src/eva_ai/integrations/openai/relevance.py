@@ -1,6 +1,14 @@
 from typing import Any, Protocol
 
-from openai import APIConnectionError, APITimeoutError, RateLimitError
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    ContentFilterFinishReasonError,
+    InternalServerError,
+    LengthFinishReasonError,
+    RateLimitError,
+)
 from pydantic import ValidationError
 
 from eva_ai.relevance.context import serialize_context
@@ -43,6 +51,12 @@ class OpenAIRelevanceClassifier:
             raise ClassifierTransientError("CONNECTION") from None
         except RateLimitError:
             raise ClassifierTransientError("RATE_LIMIT") from None
+        except InternalServerError:
+            raise ClassifierTransientError("SERVER") from None
+        except LengthFinishReasonError, ContentFilterFinishReasonError:
+            raise ClassifierRejectedError("INCOMPLETE_OUTPUT") from None
+        except APIStatusError:
+            raise ClassifierRejectedError("PROVIDER_REJECTED") from None
         except ValidationError:
             raise ClassifierRejectedError("INVALID_SCHEMA") from None
 

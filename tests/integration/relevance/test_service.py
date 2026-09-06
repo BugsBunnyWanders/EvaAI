@@ -202,6 +202,45 @@ async def test_explicit_reevaluation_supersedes_without_erasing_history(database
     assert [item.is_current for item in history] == [False, True]
 
 
+@pytest.mark.integration
+async def test_backfill_processes_one_bounded_selected_batch(database: Database) -> None:
+    scope = await create_scope(database)
+    first = await ingest(database, scope)
+    second = await ingest(database, scope)
+    relevance_handler, repository = handler(
+        database,
+        (
+            classifier_result(RelevanceDisposition.RECORD),
+            classifier_result(RelevanceDisposition.RECORD),
+        ),
+    )
+
+    summary = await RelevanceService(database, repository, relevance_handler).backfill(
+        user_id=scope.user_id, workspace_id=scope.workspace_id, limit=2
+    )
+
+    assert summary.selected == 2
+    assert summary.succeeded == 2
+    assert summary.failed == 0
+    assert len(summary.signal_ids) == 2
+    assert (
+        await repository.get_current(
+            event_id=first.event_id,
+            user_id=scope.user_id,
+            workspace_id=scope.workspace_id,
+        )
+        is not None
+    )
+    assert (
+        await repository.get_current(
+            event_id=second.event_id,
+            user_id=scope.user_id,
+            workspace_id=scope.workspace_id,
+        )
+        is not None
+    )
+
+
 async def count(database: Database, model: Any, scope: Scope) -> int:
     async with database.session() as session:
         value = await session.scalar(
