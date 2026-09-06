@@ -203,6 +203,25 @@ class RelevanceRepository:
             row = await session.scalar(statement)
             return None if row is None else await _signal_record(session, row)
 
+    async def get_by_evaluation_key_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        event_id: UUID,
+        user_id: UUID,
+        workspace_id: UUID,
+        evaluation_key: UUID,
+    ) -> SignalRecord | None:
+        row = await session.scalar(
+            select(Signal).where(
+                Signal.event_id == event_id,
+                Signal.user_id == user_id,
+                Signal.workspace_id == workspace_id,
+                Signal.evaluation_key == evaluation_key,
+            )
+        )
+        return None if row is None else await _signal_record(session, row)
+
     async def get_signal(
         self, *, signal_id: UUID, user_id: UUID, workspace_id: UUID
     ) -> SignalRecord:

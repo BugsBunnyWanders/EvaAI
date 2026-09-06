@@ -65,3 +65,16 @@ __all__ = [
     "SituationContext",
     "StartEvaluationAttempt",
 ]
+from eva_ai.relevance.service import (
+    RelevanceEventHandler,
+    RelevanceService,
+    backfill_evaluation_key,
+    initial_evaluation_key,
+)
+
+__all__ = [
+    "RelevanceEventHandler",
+    "RelevanceService",
+    "backfill_evaluation_key",
+    "initial_evaluation_key",
+]

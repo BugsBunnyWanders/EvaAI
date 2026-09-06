@@ -119,6 +119,14 @@ class RelevanceClassifierRunner:
         self._clock = clock
         self._random = random_value
 
+    @property
+    def provider(self) -> str:
+        return self._provider
+
+    @property
+    def model(self) -> str:
+        return self._model
+
     async def run(self, request: ClassifierRunRequest) -> ClassifierRunResult:
         context = request.context
         await self._attempts.interrupt_started_attempts(
