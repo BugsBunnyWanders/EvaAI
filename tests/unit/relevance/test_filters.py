@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
@@ -33,6 +34,8 @@ def gmail_event(
         workspace_id=WORKSPACE_ID,
         source=source,
         event_type=event_type,
+        external_id=str(message_id) if isinstance(message_id, str) else None,
+        occurred_at=datetime(2026, 9, 1, tzinfo=UTC),
         payload={
             "message_id": message_id,
             "thread_id": thread_id,
@@ -40,6 +43,7 @@ def gmail_event(
             "label_ids": list(labels),
             "plain_text": "",
         },
+        correlation_keys=("gmail-thread:thread-1",),
         schema_version=schema_version,
     )
 

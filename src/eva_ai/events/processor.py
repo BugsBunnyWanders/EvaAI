@@ -41,7 +41,10 @@ class StoredEvent:
     workspace_id: UUID
     source: str
     event_type: str
+    external_id: str | None
+    occurred_at: datetime
     payload: dict[str, JsonValue]
+    correlation_keys: tuple[str, ...]
     schema_version: int
 
 
@@ -104,7 +107,10 @@ class EventProcessor:
                     workspace_id=event.workspace_id,
                     source=event.source,
                     event_type=event.event_type,
+                    external_id=event.external_id,
+                    occurred_at=event.occurred_at,
                     payload=dict(event.payload),
+                    correlation_keys=tuple(event.correlation_keys),
                     schema_version=event.schema_version,
                 )
 
