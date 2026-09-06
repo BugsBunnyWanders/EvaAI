@@ -12,6 +12,7 @@ from eva_ai.connectors.gmail.contracts import (
     GmailClientFactory,
     GmailNotification,
     HistoryCursorExpired,
+    MessageUnavailable,
     use_gmail_client,
 )
 from eva_ai.connectors.gmail.normalizer import normalize_message
@@ -88,7 +89,11 @@ class GmailRecoveryService:
 
         events_created = 0
         for message_id in message_ids:
-            raw = await gmail.get_message(message_id)
+            try:
+                raw = await gmail.get_message(message_id)
+            except MessageUnavailable:
+                # Gmail history can retain an ID after the underlying message was removed.
+                continue
             if not _has_inbox_label(raw):
                 continue
             event = normalize_message(raw, claim.connector, history_id)
@@ -240,7 +245,11 @@ class GmailSyncService:
                 events_created = 0
                 for message_id in message_ids:
                     failure_boundary = "message"
-                    raw = await gmail.get_message(message_id)
+                    try:
+                        raw = await gmail.get_message(message_id)
+                    except MessageUnavailable:
+                        # One removed message must not pin the durable history cursor forever.
+                        continue
                     if not _has_inbox_label(raw):
                         continue
                     failure_boundary = "normalization"

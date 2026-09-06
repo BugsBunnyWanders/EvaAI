@@ -13,7 +13,11 @@ from google_auth_httplib2 import AuthorizedHttp  # type: ignore[import-untyped]
 from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
 from httplib2 import Response  # type: ignore[import-untyped]
 
-from eva_ai.connectors.gmail.contracts import AuthorizationRevoked, HistoryCursorExpired
+from eva_ai.connectors.gmail.contracts import (
+    AuthorizationRevoked,
+    HistoryCursorExpired,
+    MessageUnavailable,
+)
 from eva_ai.integrations.gmail.api import (
     GmailProviderError,
     GoogleGmailClient,
@@ -701,6 +705,21 @@ async def test_history_404_maps_to_content_free_cursor_expiry() -> None:
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert [operation for operation, _ in service.calls] == ["list_history"]
+
+
+@pytest.mark.asyncio
+async def test_message_404_maps_to_content_free_unavailable_message() -> None:
+    """Fails if a removed message blocks the history cursor or leaks provider content."""
+    service = GmailResources(threading.get_ident())
+    service.errors["get_message"] = http_error(404, b'{"error":"private-provider-body"}')
+
+    with pytest.raises(MessageUnavailable) as raised:
+        await GoogleGmailClient(service).get_message("removed-message")
+
+    assert str(raised.value) == "Gmail message is no longer available"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert [operation for operation, _ in service.calls] == ["get_message"]
 
 
 @pytest.mark.asyncio

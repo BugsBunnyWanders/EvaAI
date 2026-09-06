@@ -17,6 +17,7 @@ from eva_ai.connectors.gmail.contracts import (
     HistoryCursorExpired,
     HistoryPage,
     MessageListPage,
+    MessageUnavailable,
     WatchResult,
 )
 from eva_ai.connectors.gmail.sync import (
@@ -633,6 +634,22 @@ async def test_transient_provider_error_stays_retryable_and_releases_claim() -> 
     assert harness.repository.state is not None and harness.repository.state.history_id == "100"
 
 
+async def test_unavailable_message_is_skipped_and_cursor_advances() -> None:
+    """Fails if a message removed after history listing permanently pins the cursor."""
+    harness = Harness()
+    harness.gmail.pages = {
+        None: HistoryPage(message_ids=("removed",), history_id="125", next_page_token=None)
+    }
+    harness.gmail.message_failure = MessageUnavailable("Gmail message is no longer available")
+
+    result = await harness.handle()
+
+    assert result == SyncResult(SyncStatus.SYNCED, CONNECTOR_ID, 0, "125")
+    assert harness.gmail.message_calls == ["removed"]
+    assert harness.repository.state is not None and harness.repository.state.history_id == "125"
+    assert harness.repository.busy is False
+
+
 async def test_recovery_failure_preserves_provider_type_and_releases_claim() -> None:
     """Fails if recovery provider errors lose classification or leave the old lease live."""
     harness = Harness()
@@ -690,6 +707,22 @@ async def test_expired_history_recovers_exact_connected_range_after_fresh_watch(
     assert harness.repository.state.next_watch_renewal_at == NOW + timedelta(hours=24)
     assert harness.repository.state.next_safety_sync_at == NOW + timedelta(minutes=60)
     assert harness.gmail.close_calls == 1
+
+
+async def test_recovery_skips_message_removed_after_listing() -> None:
+    """Fails if recovery cannot finish when a listed inbox message disappears."""
+    harness = Harness()
+    harness.gmail.history_failure = HistoryCursorExpired("Gmail history cursor expired")
+    harness.gmail.message_list_pages = {None: MessageListPage(("removed",), None)}
+    harness.gmail.message_failure = MessageUnavailable("Gmail message is no longer available")
+    harness.gmail.watch_result = WatchResult("250", NOW + timedelta(days=7))
+
+    result = await harness.handle()
+
+    assert result == SyncResult(SyncStatus.SYNCED, CONNECTOR_ID, 0, "250")
+    assert harness.gmail.message_calls == ["removed"]
+    assert harness.repository.state is not None and harness.repository.state.history_id == "250"
+    assert harness.repository.busy is False
 
 
 async def test_recovery_watch_precedes_scan_so_cutover_arrival_is_ingested_once() -> None:
