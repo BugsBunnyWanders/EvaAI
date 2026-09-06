@@ -133,7 +133,7 @@ resource "google_service_account_iam_member" "github_deployer" {
   service_account_id = google_service_account.github_deployer.name
   role               = "roles/iam.workloadIdentityUser"
 
-  # The production environment changes the GitHub OIDC subject. Branch and PR jobs cannot
-  # impersonate this deployment identity even when they originate in the same repository.
-  member = "principal://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/subject/repo:${var.github_repository}:environment:production"
+  # Bind the mapped repository attribute instead of GitHub's context-sensitive `sub`
+  # claim. The provider condition above separately restricts exchanges to main.
+  member = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.repository/${var.github_repository}"
 }
