@@ -21,6 +21,7 @@ from eva_ai.connectors.gmail.contracts import (
     HistoryCursorExpired,
     HistoryPage,
     MessageListPage,
+    MessageUnavailable,
     WatchResult,
 )
 from eva_ai.integrations.gmail.oauth import GMAIL_READONLY_SCOPE
@@ -47,6 +48,7 @@ class _RequestFailure(Enum):
     AUTHORIZATION_REVOKED = auto()
     AUTHORIZATION_REFRESH = auto()
     HISTORY_EXPIRED = auto()
+    MESSAGE_UNAVAILABLE = auto()
     TRANSIENT = auto()
     PROVIDER = auto()
 
@@ -335,7 +337,8 @@ class GoogleGmailClient:
                 .messages()
                 .get(userId="me", id=message_id, format="full")
                 .execute()
-            )
+            ),
+            message_request=True,
         )
 
     async def list_message_ids(self, query: str, page_token: str | None) -> MessageListPage:
@@ -357,6 +360,7 @@ class GoogleGmailClient:
         operation: Callable[[], Mapping[str, object]],
         *,
         history_request: bool = False,
+        message_request: bool = False,
     ) -> Mapping[str, object]:
         result: Mapping[str, object] | _RequestFailure = _RequestFailure.PROVIDER
         for attempt in range(self._retry_attempts):
@@ -372,6 +376,8 @@ class GoogleGmailClient:
                 status = getattr(error.resp, "status", None)
                 if history_request and status == 404:
                     result = _RequestFailure.HISTORY_EXPIRED
+                elif message_request and status == 404:
+                    result = _RequestFailure.MESSAGE_UNAVAILABLE
                 elif _is_transient_http_error(error, status) or (
                     isinstance(status, int) and 500 <= status <= 599
                 ):
@@ -394,6 +400,8 @@ class GoogleGmailClient:
             raise GmailProviderError("Gmail authorization refresh failed")
         if result is _RequestFailure.HISTORY_EXPIRED:
             raise HistoryCursorExpired("Gmail history cursor expired")
+        if result is _RequestFailure.MESSAGE_UNAVAILABLE:
+            raise MessageUnavailable("Gmail message is no longer available")
         if result is _RequestFailure.TRANSIENT or result is _RequestFailure.PROVIDER:
             raise GmailProviderError("Gmail API request failed")
         return result

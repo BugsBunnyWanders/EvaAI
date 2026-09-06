@@ -58,6 +58,10 @@ class HistoryCursorExpired(RuntimeError):
     pass
 
 
+class MessageUnavailable(RuntimeError):
+    """A history entry references a message that Gmail can no longer return."""
+
+
 class AuthorizationRevoked(RuntimeError):
     pass
 
