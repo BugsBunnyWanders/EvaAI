@@ -2,7 +2,7 @@
 
 Eva is a proactive, event-driven personal AI operator. The repository contains the application
 foundation, durable Event backbone, local Gmail ingestion worker, Goal and Situation domain,
-relevance engine, and scoped long-term memory.
+relevance engine, scoped long-term memory, and bounded email investigation agent.
 
 ## Requirements
 
@@ -198,3 +198,20 @@ and Situation links, and never expose their vectors through the service or CLI. 
 filtered by User and Workspace. Gmail and relevance events do not learn memory automatically in
 this milestone. See the [Memory and Context operator guide](docs/memory-operator.md) for lifecycle,
 safety boundaries, configuration, examples, and smoke testing.
+
+### Milestone 6: Agent investigation
+
+Milestone 6 launches a full agent after the relevance policy chooses `NOTIFY` or `INVESTIGATE`:
+
+```text
+NOTIFY/INVESTIGATE Signal -> AgentRun + transactional outbox -> eva-agent-runs
+                          -> scoped context + read-only Gmail tools
+                          -> strict proposal-only AgentInvestigationResult
+```
+
+The same Cloud Run worker process now hosts a fourth agent-pull loop. Runs are leased, retried,
+idempotent per Signal/version, and tenant-scoped. Email remains untrusted evidence; the model cannot
+choose another account or gain write authority. Results may propose notifications, Situation
+updates, memory, follow-ups, or future actions, but this milestone applies none of them. See the
+[Agent investigation operator guide](docs/agent-operator.md) for setup, privacy boundaries,
+inspection, and recovery.

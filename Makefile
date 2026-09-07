@@ -8,9 +8,10 @@ override EVA_RELEVANCE_IDEMPOTENCY_KEY := $(value EVA_RELEVANCE_IDEMPOTENCY_KEY)
 override EVA_MEMORY_ID := $(value EVA_MEMORY_ID)
 override EVA_MEMORY_QUERY := $(value EVA_MEMORY_QUERY)
 override EVA_SITUATION_ID := $(value EVA_SITUATION_ID)
-export EVA_USER_ID EVA_WORKSPACE_ID EVA_GMAIL_CONNECTOR_ID EVA_EVENT_ID EVA_RELEVANCE_REASON EVA_RELEVANCE_IDEMPOTENCY_KEY EVA_MEMORY_ID EVA_MEMORY_QUERY EVA_SITUATION_ID
+override EVA_AGENT_RUN_ID := $(value EVA_AGENT_RUN_ID)
+export EVA_USER_ID EVA_WORKSPACE_ID EVA_GMAIL_CONNECTOR_ID EVA_EVENT_ID EVA_RELEVANCE_REASON EVA_RELEVANCE_IDEMPOTENCY_KEY EVA_MEMORY_ID EVA_MEMORY_QUERY EVA_SITUATION_ID EVA_AGENT_RUN_ID
 
-.PHONY: setup db-up db-down migrate run worker-run gmail-connect gmail-sync gmail-pull gmail-maintain events-relay relevance-pull relevance-show relevance-history relevance-reevaluate relevance-backfill memory-fact-list memory-episode-list memory-episode-show memory-episode-search context-build test lint format typecheck verify
+.PHONY: setup db-up db-down migrate run worker-run gmail-connect gmail-sync gmail-pull gmail-maintain events-relay relevance-pull relevance-show relevance-history relevance-reevaluate relevance-backfill agent-pull agent-run-list agent-run-show agent-run-retry memory-fact-list memory-episode-list memory-episode-show memory-episode-search context-build test lint format typecheck verify
 
 setup:
 	uv sync --all-groups
@@ -59,6 +60,18 @@ relevance-reevaluate:
 
 relevance-backfill:
 	uv run eva relevance backfill --user-id "$${EVA_USER_ID}" --workspace-id "$${EVA_WORKSPACE_ID}"
+
+agent-pull:
+	uv run eva agent pull
+
+agent-run-list:
+	uv run eva agent run list --user-id "$${EVA_USER_ID}" --workspace-id "$${EVA_WORKSPACE_ID}"
+
+agent-run-show:
+	uv run eva agent run show --user-id "$${EVA_USER_ID}" --workspace-id "$${EVA_WORKSPACE_ID}" --run-id "$${EVA_AGENT_RUN_ID}"
+
+agent-run-retry:
+	uv run eva agent run retry --user-id "$${EVA_USER_ID}" --workspace-id "$${EVA_WORKSPACE_ID}" --run-id "$${EVA_AGENT_RUN_ID}"
 
 memory-fact-list:
 	uv run eva memory fact list --user-id "$${EVA_USER_ID}" --workspace-id "$${EVA_WORKSPACE_ID}"

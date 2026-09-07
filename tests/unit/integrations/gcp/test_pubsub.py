@@ -4,6 +4,7 @@ from uuid import uuid7
 
 import pytest
 
+from eva_ai.agent.types import AgentRunRequestedMessage
 from eva_ai.events.types import EventAvailableMessage, OutboundMessage
 from eva_ai.integrations.gcp.pubsub import GooglePubSubPublisher
 
@@ -66,6 +67,29 @@ async def test_google_publisher_serializes_envelope_and_awaits_ack() -> None:
         "event_id": str(message.envelope.event_id),
         "workspace_id": str(message.envelope.workspace_id),
     }
+
+
+@pytest.mark.asyncio
+async def test_google_publisher_routes_agent_envelope_attributes() -> None:
+    client = FakeClient()
+    envelope = AgentRunRequestedMessage(
+        outbox_message_id=uuid7(),
+        agent_run_id=uuid7(),
+        event_id=uuid7(),
+        signal_id=uuid7(),
+        situation_id=uuid7(),
+        user_id=uuid7(),
+        workspace_id=uuid7(),
+    )
+
+    await GooglePubSubPublisher("eva-project", client).publish(
+        OutboundMessage(envelope.outbox_message_id, "eva-agent-runs", envelope)
+    )
+    topic, _, attrs = client.published[0]
+
+    assert topic == "projects/eva-project/topics/eva-agent-runs"
+    assert attrs["message_type"] == "agent.run.requested"
+    assert attrs["event_id"] == str(envelope.event_id)
 
 
 @pytest.mark.asyncio

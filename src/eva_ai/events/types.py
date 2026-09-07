@@ -1,10 +1,12 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Self
+from typing import Literal, Self
 from uuid import UUID, uuid7
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
+
+from eva_ai.agent.types import AgentRunRequestedMessage
 
 
 class PrincipalType(StrEnum):
@@ -67,6 +69,7 @@ class NewEvent(BaseModel):
 class EventAvailableMessage(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    message_type: Literal["event.available"] = "event.available"
     outbox_message_id: UUID
     event_id: UUID
     user_id: UUID
@@ -75,8 +78,11 @@ class EventAvailableMessage(BaseModel):
     schema_version: int = Field(gt=0)
 
 
+type OutboundEnvelope = EventAvailableMessage | AgentRunRequestedMessage
+
+
 @dataclass(frozen=True, slots=True)
 class OutboundMessage:
     outbox_message_id: UUID
     destination: str
-    envelope: EventAvailableMessage
+    envelope: OutboundEnvelope

@@ -6,6 +6,9 @@ from typing import cast
 
 from openai import AsyncOpenAI
 
+from eva_ai.agent.repository import AgentRunRepository
+from eva_ai.agent.service import AgentInvestigationService
+from eva_ai.agent.worker import AgentPullWorker
 from eva_ai.config import Settings
 from eva_ai.db.session import Database
 from eva_ai.events.outbox import OutboxRelay
@@ -14,7 +17,10 @@ from eva_ai.events.publisher import InMemoryPublisher, Publisher
 from eva_ai.events.relay_worker import OutboxRelayWorker
 from eva_ai.events.types import EventAvailableMessage
 from eva_ai.integrations.gcp.pubsub import GooglePubSubPublisher
+from eva_ai.integrations.gcp.secret_manager import GoogleSecretManagerCredentialStore
 from eva_ai.integrations.gcp.subscriber import GooglePullSubscriber
+from eva_ai.integrations.gmail.api import GoogleGmailClientFactory
+from eva_ai.integrations.openai.agent import OpenAIAgentsInvestigationAgent
 from eva_ai.integrations.openai.memory import OpenAIEmbeddingClient, OpenAIEmbeddingProvider
 from eva_ai.integrations.openai.relevance import OpenAIClient, OpenAIRelevanceClassifier
 from eva_ai.memory.context import ContextBounds as MemoryContextBounds
@@ -99,6 +105,35 @@ class MemoryDependencies:
             close_functions.append(self.openai_client.close)
         close_functions.append(self.database.close)
         for close in close_functions:
+            try:
+                await close()
+            except asyncio.CancelledError as error:
+                interruption = interruption or error
+            except Exception:
+                ordinary_failure = True
+        return DependencyCleanupOutcome(interruption, ordinary_failure)
+
+
+@dataclass(slots=True)
+class AgentDependencies:
+    database: Database
+    credential_store: GoogleSecretManagerCredentialStore
+    gmail_client_factory: GoogleGmailClientFactory
+    subscriber: GooglePullSubscriber
+    openai_client: AsyncOpenAI
+    service: AgentInvestigationService
+    worker: AgentPullWorker
+
+    async def close(self) -> DependencyCleanupOutcome:
+        interruption: BaseException | None = None
+        ordinary_failure = False
+        for close in (
+            self.subscriber.close,
+            self.gmail_client_factory.close,
+            self.credential_store.close,
+            self.openai_client.close,
+            self.database.close,
+        ):
             try:
                 await close()
             except asyncio.CancelledError as error:
@@ -222,6 +257,11 @@ def build_relevance_dependencies(
         classifier=runner,
         policy=policy,
         classifier_version=settings.relevance_classifier_version,
+        agent_runs=AgentRunRepository(database) if settings.agent_enabled else None,
+        agent_destination=settings.agent_topic_id,
+        agent_model=settings.agent_model,
+        agent_version=settings.agent_version,
+        agent_prompt_version=settings.agent_prompt_version,
     )
     service = RelevanceService(database, repository, handler)
     subscriber = None
@@ -286,6 +326,83 @@ def build_memory_dependencies(settings: Settings, *, include_embedding: bool) ->
         clock=_utc_now,
     )
     return MemoryDependencies(database, service, context_builder, openai_client)
+
+
+def build_agent_dependencies(settings: Settings) -> AgentDependencies:
+    if not settings.agent_enabled:
+        raise ValueError("agent investigation is disabled")
+    project_id = _required_pubsub_project(settings)
+    api_key = settings.openai_api_key
+    if api_key is None or not api_key.get_secret_value().strip():
+        raise ValueError("OpenAI configuration is incomplete")
+    database = Database(settings.database_url.get_secret_value())
+    openai_client = AsyncOpenAI(api_key=api_key.get_secret_value())
+    memory_repository = MemoryRepository(database)
+    embedding = EmbeddingService(
+        OpenAIEmbeddingProvider(
+            cast(OpenAIEmbeddingClient, openai_client),
+            settings.memory_embedding_model,
+            settings.memory_embedding_dimensions,
+        ),
+        settings.memory_embedding_model,
+        settings.memory_embedding_dimensions,
+        settings.memory_embedding_input_max_chars,
+        _utc_now,
+    )
+    context_builder = MemoryContextBuilder(
+        memory_repository,
+        embedding,
+        MemoryContextBounds(
+            fact_limit=settings.memory_fact_limit,
+            fact_total_chars=settings.memory_fact_total_chars,
+            episode_candidate_limit=settings.memory_episode_candidate_limit,
+            episode_limit=settings.memory_episode_limit,
+            episode_total_chars=settings.memory_episode_total_chars,
+            query_max_chars=settings.memory_embedding_input_max_chars,
+        ),
+        _utc_now,
+    )
+    credential_store = GoogleSecretManagerCredentialStore(project_id)
+    gmail_client_factory = GoogleGmailClientFactory(
+        request_timeout_seconds=settings.gmail_request_timeout_seconds,
+        retry_attempts=settings.gmail_retry_attempts,
+        retry_initial_backoff_seconds=settings.gmail_retry_initial_backoff_seconds,
+        retry_max_backoff_seconds=settings.gmail_retry_max_backoff_seconds,
+        retry_jitter_ratio=settings.gmail_retry_jitter_ratio,
+    )
+    agent = OpenAIAgentsInvestigationAgent(
+        openai_client,
+        model=settings.agent_model,
+        reasoning_effort=settings.agent_reasoning_effort,
+        max_turns=settings.agent_max_turns,
+        max_tool_calls=settings.agent_max_tool_calls,
+        tool_timeout_seconds=settings.agent_tool_timeout_seconds,
+    )
+    service = AgentInvestigationService(
+        runs=AgentRunRepository(database),
+        context_builder=context_builder,
+        credential_store=credential_store,
+        gmail_clients=gmail_client_factory,
+        agent=agent,
+        lease_seconds=settings.agent_lease_seconds,
+        max_attempts=settings.agent_max_attempts,
+        retry_initial_backoff_seconds=settings.agent_retry_initial_backoff_seconds,
+        retry_max_backoff_seconds=settings.agent_retry_max_backoff_seconds,
+        thread_message_limit=settings.agent_thread_message_limit,
+        search_result_limit=settings.agent_search_result_limit,
+        body_max_chars=settings.agent_message_body_max_chars,
+    )
+    subscriber = GooglePullSubscriber(project_id, settings.agent_subscription_id)
+    worker = AgentPullWorker(subscriber, service, settings.agent_pull_timeout_seconds)
+    return AgentDependencies(
+        database=database,
+        credential_store=credential_store,
+        gmail_client_factory=gmail_client_factory,
+        subscriber=subscriber,
+        openai_client=openai_client,
+        service=service,
+        worker=worker,
+    )
 
 
 def _required_pubsub_project(settings: Settings) -> str:

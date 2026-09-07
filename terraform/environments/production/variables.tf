@@ -48,6 +48,12 @@ variable "events_topic_id" {
   default     = "eva-events"
 }
 
+variable "agent_topic_id" {
+  description = "Eva agent investigation request topic."
+  type        = string
+  default     = "eva-agent-runs"
+}
+
 variable "openai_secret_id" {
   description = "Secret created by the bootstrap stack; its value is added out of band."
   type        = string

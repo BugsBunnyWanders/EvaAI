@@ -93,7 +93,7 @@ resource "google_cloud_run_v2_worker_pool" "worker" {
   name                = "eva-worker"
   location            = var.region
   deletion_protection = true
-  description         = "Continuous Gmail ingestion, transactional outbox, and relevance loops"
+  description         = "Continuous Gmail, outbox, relevance, and agent investigation loops"
 
   template {
     service_account = google_service_account.worker.email
@@ -167,6 +167,7 @@ resource "google_cloud_run_v2_worker_pool" "worker" {
     google_project_iam_member.worker_roles,
     google_pubsub_subscription.gmail,
     google_pubsub_subscription.relevance,
+    google_pubsub_subscription.agent,
     google_secret_manager_secret_version.database_url,
   ]
 }
