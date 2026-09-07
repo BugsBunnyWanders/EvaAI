@@ -91,4 +91,4 @@ Google Pub/Sub, OpenAI Agents SDK 0.22.x, pytest, Ruff, strict mypy, Terraform, 
 - [x] Run Ruff formatting/linting, strict mypy, unit tests, PostgreSQL tests, migrations, and
   Terraform validation.
 - [x] Review the diff for secrets, prompt/email logging, direct side effects, and unrelated changes.
-- [ ] Commit, push `codex/milestone-6-agent-investigation`, and open a PR to `main`.
+- [x] Commit, push `codex/milestone-6-agent-investigation`, and open a PR to `main`.
