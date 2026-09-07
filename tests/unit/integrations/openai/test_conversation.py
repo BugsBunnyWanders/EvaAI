@@ -7,14 +7,19 @@ import pytest
 from agents import AgentOutputSchema, MaxTurnsExceeded, RunConfig
 from openai import AsyncOpenAI
 
-from eva_ai.conversation.errors import ConversationPermanentError
+from eva_ai.conversation.errors import ConversationModelOutputError
 from eva_ai.conversation.types import (
     ConversationAgentRequest,
     ConversationAgentResult,
     ConversationHistoryTurn,
     ConversationTurnRole,
 )
-from eva_ai.integrations.openai.conversation import OpenAIAgentsConversationAgent
+from eva_ai.integrations.openai.conversation import (
+    OpenAIAgentsConversationAgent,
+    _ConversationAgentOutput,
+    _ProposedActionOutput,
+    _to_domain_result,
+)
 from eva_ai.memory.types import AgentWorkingContext, ContextIdentity, ContextSituation
 from eva_ai.situations.types import AttentionLevel
 
@@ -46,7 +51,6 @@ async def test_conversation_adapter_registers_only_context_appropriate_read_tool
     captured: dict[str, object] = {}
 
     class Run:
-        final_output = expected
         last_response_id = "response-1"
         context_wrapper = SimpleNamespace(
             usage=SimpleNamespace(input_tokens=12, output_tokens=4, total_tokens=16)
@@ -55,7 +59,12 @@ async def test_conversation_adapter_registers_only_context_appropriate_read_tool
         def final_output_as(
             self, output_type: type[object], raise_if_incorrect_type: bool
         ) -> object:
-            return self.final_output
+            return cast(Any, output_type)(
+                message=expected.message,
+                reasoning_summary=expected.reasoning_summary,
+                proposed_actions=(),
+                memory_proposals=(),
+            )
 
     async def fake_run(agent: Any, input: str, **kwargs: object) -> Run:
         captured["tool_names"] = tuple(tool.name for tool in agent.tools)
@@ -80,7 +89,7 @@ async def test_conversation_adapter_registers_only_context_appropriate_read_tool
 
     assert captured["tool_names"] == expected_tools
     assert isinstance(captured["output_type"], AgentOutputSchema)
-    assert captured["output_type"].is_strict_json_schema() is False
+    assert captured["output_type"].is_strict_json_schema() is True
     assert "authenticated Eva user" in str(captured["instructions"])
     assert "untrusted evidence" in str(captured["instructions"])
     assert "trusted personal chief of staff" in str(captured["instructions"])
@@ -108,11 +117,47 @@ async def test_conversation_adapter_safely_classifies_turn_exhaustion(monkeypatc
         tool_timeout_seconds=30,
     )
 
-    with pytest.raises(ConversationPermanentError, match="invalid output") as captured:
+    with pytest.raises(ConversationModelOutputError, match="invalid output") as captured:
         await adapter.respond(_request(False), None)
 
     assert "private provider details" not in str(captured.value)
     await adapter._client.close()
+
+
+def test_conversation_transport_converts_json_action_arguments() -> None:
+    output = _ConversationAgentOutput(
+        message="I found the interview email.",
+        reasoning_summary="Read the matching Gmail result.",
+        proposed_actions=(
+            _ProposedActionOutput(
+                capability="prepare_interview",
+                description="Prepare for the interview.",
+                arguments_json='{"company":"Scaler"}',
+                requires_approval=True,
+            ),
+        ),
+    )
+
+    result = _to_domain_result(output)
+
+    assert result.message == "I found the interview email."
+    assert result.proposed_actions[0].arguments == {"company": "Scaler"}
+
+
+def test_conversation_transport_discards_invalid_optional_action() -> None:
+    output = _ConversationAgentOutput(
+        message="The answer remains deliverable.",
+        reasoning_summary="Optional metadata was malformed.",
+        proposed_actions=(
+            _ProposedActionOutput(
+                capability="prepare_interview",
+                description="Prepare for the interview.",
+                arguments_json="not-json",
+            ),
+        ),
+    )
+
+    assert _to_domain_result(output).proposed_actions == ()
 
 
 def _request(is_email_situation: bool) -> ConversationAgentRequest:

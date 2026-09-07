@@ -230,3 +230,17 @@ def test_configure_logging_replaces_root_handlers() -> None:
     assert root.level == logging.WARNING
     assert len(root.handlers) == 1
     assert json.loads(stream.getvalue())["message"] == "careful"
+
+
+def test_configure_logging_suppresses_http_client_urls() -> None:
+    stream = io.StringIO()
+    settings = Settings(log_level="INFO", log_format=LogFormat.JSON, _env_file=None)
+
+    configure_logging(settings, stream=stream)
+    logging.getLogger("httpx").info(
+        "POST https://api.telegram.org/bottelegram-token-private/sendMessage"
+    )
+
+    assert stream.getvalue() == ""
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpx2").level == logging.WARNING
