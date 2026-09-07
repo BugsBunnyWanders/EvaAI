@@ -13,6 +13,16 @@ resource "google_pubsub_topic" "agent_runs" {
   name    = var.agent_topic_id
 }
 
+resource "google_pubsub_topic" "telegram_turns" {
+  project = var.project_id
+  name    = var.telegram_turn_topic_id
+}
+
+resource "google_pubsub_topic" "telegram_delivery" {
+  project = var.project_id
+  name    = var.telegram_delivery_topic_id
+}
+
 # These topics predate Terraform. Declarative imports adopt them on the first production apply.
 import {
   to = google_pubsub_topic.gmail
@@ -67,6 +77,38 @@ resource "google_pubsub_subscription" "agent" {
   project              = var.project_id
   name                 = local.agent_subscription
   topic                = google_pubsub_topic.agent_runs.id
+  ack_deadline_seconds = 600
+
+  expiration_policy {
+    ttl = ""
+  }
+
+  retry_policy {
+    minimum_backoff = "10s"
+    maximum_backoff = "600s"
+  }
+}
+
+resource "google_pubsub_subscription" "telegram_turns" {
+  project              = var.project_id
+  name                 = local.telegram_turn_subscription
+  topic                = google_pubsub_topic.telegram_turns.id
+  ack_deadline_seconds = 600
+
+  expiration_policy {
+    ttl = ""
+  }
+
+  retry_policy {
+    minimum_backoff = "10s"
+    maximum_backoff = "600s"
+  }
+}
+
+resource "google_pubsub_subscription" "telegram_delivery" {
+  project              = var.project_id
+  name                 = local.telegram_delivery_subscription
+  topic                = google_pubsub_topic.telegram_delivery.id
   ack_deadline_seconds = 600
 
   expiration_policy {

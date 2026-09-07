@@ -1523,6 +1523,58 @@ async def test_worker_run_adds_agent_loop_when_enabled(
     assert started == {"gmail", "relay", "relevance", "agent"}
 
 
+async def test_worker_run_adds_both_telegram_loops_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fails if production enables Telegram without both durable consumer loops."""
+    started: set[str] = set()
+    all_started = asyncio.Event()
+
+    async def run(component: str, *, settings: Settings) -> None:
+        started.add(component)
+        if len(started) == 6:
+            all_started.set()
+        await asyncio.Future()
+
+    for function_name, component in (
+        ("gmail_pull_command", "gmail"),
+        ("events_relay_command", "relay"),
+        ("relevance_pull_command", "relevance"),
+        ("agent_pull_command", "agent"),
+        ("telegram_turn_pull_command", "telegram-turn"),
+        ("telegram_delivery_pull_command", "telegram-delivery"),
+    ):
+
+        async def command(*, settings: Settings, name: str = component) -> None:
+            await run(name, settings=settings)
+
+        monkeypatch.setattr(cli_module, function_name, command)
+
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        relevance_enabled=True,
+        agent_enabled=True,
+        telegram_enabled=True,
+        openai_api_key=SecretStr("test-key"),
+    )
+    task = asyncio.create_task(worker_run_command(settings=settings))
+
+    await asyncio.wait_for(all_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert started == {
+        "gmail",
+        "relay",
+        "relevance",
+        "agent",
+        "telegram-turn",
+        "telegram-delivery",
+    }
+
+
 class RecordingCloseResource:
     def __init__(self, name: str, calls: list[str]) -> None:
         self.name = name

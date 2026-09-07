@@ -64,7 +64,34 @@ async def test_event_backbone_tables_exist(database: Database) -> None:
         "signals",
         "signal_goals",
         "relevance_evaluation_attempts",
+        "telegram_accounts",
+        "telegram_pairing_codes",
+        "telegram_conversations",
+        "conversation_turns",
+        "notifications",
     } <= set(tables)
+
+
+@pytest.mark.integration
+async def test_telegram_tables_enforce_tenant_and_provider_identity(database: Database) -> None:
+    assert await constraint_names(database, "telegram_accounts") >= {
+        "fk_telegram_accounts_workspace_user",
+        "uq_telegram_accounts_workspace_user",
+        "uq_telegram_accounts_user",
+    }
+    assert await constraint_names(database, "telegram_conversations") >= {
+        "fk_telegram_conversations_account_scope",
+        "fk_telegram_conversations_situation_scope",
+    }
+    assert await constraint_names(database, "conversation_turns") >= {
+        "fk_conversation_turns_conversation_scope",
+        "fk_conversation_turns_event_scope",
+    }
+    assert await constraint_names(database, "notifications") >= {
+        "fk_notifications_event_scope",
+        "fk_notifications_workspace_user",
+        "uq_notifications_scope_dedupe",
+    }
 
 
 @pytest.mark.integration

@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 class SituationType(StrEnum):
     EMAIL_THREAD = "EMAIL_THREAD"
+    TELEGRAM_CHAT = "TELEGRAM_CHAT"
 
 
 class SituationLifecycle(StrEnum):
@@ -33,6 +34,7 @@ class CorrelationMethod(StrEnum):
 
 class CorrelationKeyKind(StrEnum):
     GMAIL_THREAD = "GMAIL_THREAD"
+    TELEGRAM_CONVERSATION = "TELEGRAM_CONVERSATION"
 
 
 class GoalContribution(StrEnum):

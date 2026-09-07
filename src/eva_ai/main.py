@@ -4,9 +4,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from eva_ai.api.health import router as health_router
+from eva_ai.api.telegram import router as telegram_router
 from eva_ai.config import Settings, get_settings
 from eva_ai.db import Database
 from eva_ai.logging import configure_logging
+from eva_ai.telegram.ingestion import TelegramEventService
+from eva_ai.telegram.repository import TelegramAccountRepository
+from eva_ai.telegram.webhook import TelegramWebhookService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -17,6 +21,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         database = Database(resolved_settings.database_url.get_secret_value())
         application.state.database = database
+        application.state.telegram_webhook_service = TelegramWebhookService(
+            TelegramAccountRepository(database),
+            TelegramEventService(database, resolved_settings.telegram_turn_topic_id),
+        )
         try:
             yield
         finally:
@@ -25,6 +33,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application = FastAPI(title=resolved_settings.app_name, lifespan=lifespan)
     application.state.settings = resolved_settings
     application.include_router(health_router)
+    application.include_router(telegram_router)
     return application
 
 

@@ -139,3 +139,53 @@ def test_memory_settings_reject_dimension_drift_and_incoherent_limits() -> None:
         Settings(_env_file=None, memory_embedding_dimensions=512)
     with pytest.raises(ValidationError, match="memory candidate limit"):
         Settings(_env_file=None, memory_episode_candidate_limit=5, memory_episode_limit=8)
+
+
+def test_telegram_settings_have_safe_disabled_defaults() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.telegram_enabled is False
+    assert settings.telegram_bot_token is None
+    assert settings.telegram_webhook_secret is None
+    assert settings.telegram_turn_topic_id == "eva-telegram-turns"
+    assert settings.telegram_delivery_topic_id == "eva-telegram-delivery"
+    assert settings.telegram_message_max_chars == 4000
+    assert settings.conversation_history_turn_limit == 20
+
+
+def test_telegram_username_is_normalized_without_becoming_identity() -> None:
+    settings = Settings(_env_file=None, telegram_bot_username="@EvaPersonalBot")
+
+    assert settings.telegram_bot_username == "EvaPersonalBot"
+
+
+def test_enabled_telegram_requires_agent_pipeline_and_openai() -> None:
+    with pytest.raises(ValidationError, match="requires relevance and agent"):
+        Settings(
+            _env_file=None,
+            telegram_enabled=True,
+            openai_api_key=SecretStr("test-key"),
+        )
+
+    with pytest.raises(ValidationError, match="OpenAI API key"):
+        Settings(
+            _env_file=None,
+            telegram_enabled=True,
+            relevance_enabled=True,
+            agent_enabled=True,
+            openai_api_key=None,
+        )
+
+
+def test_enabled_telegram_allows_runtime_specific_secret_injection() -> None:
+    """API and worker revisions receive different Telegram secrets by design."""
+    settings = Settings(
+        _env_file=None,
+        telegram_enabled=True,
+        relevance_enabled=True,
+        agent_enabled=True,
+        openai_api_key=SecretStr("test-key"),
+    )
+
+    assert settings.telegram_bot_token is None
+    assert settings.telegram_webhook_secret is None

@@ -42,6 +42,7 @@ from eva_ai.integrations.gcp.secret_manager import GoogleSecretManagerCredential
 from eva_ai.integrations.gcp.subscriber import GooglePullSubscriber
 from eva_ai.integrations.gmail.api import GoogleGmailClientFactory
 from eva_ai.integrations.gmail.oauth import GoogleDesktopOAuthAuthorizer
+from eva_ai.integrations.telegram.api import TelegramBotAPI
 from eva_ai.local_scope import LocalScope, create_local_scope, local_scope_exists
 from eva_ai.logging import configure_logging
 from eva_ai.memory.context import serialize_context
@@ -58,12 +59,16 @@ from eva_ai.memory.types import (
     MemoryScopeType,
     MemorySourceType,
 )
+from eva_ai.notifications.repository import NotificationRepository
 from eva_ai.relevance.repository import RelevanceRepository
 from eva_ai.relevance.types import ReevaluateEvent
 from eva_ai.situations import SituationLifecycle, SituationRepository, SituationService
+from eva_ai.telegram.repository import TelegramAccountRepository
 from eva_ai.worker import (
     MemoryDependencies,
     build_agent_dependencies,
+    build_conversation_dependencies,
+    build_delivery_dependencies,
     build_event_relay_dependencies,
     build_memory_dependencies,
     build_relevance_dependencies,
@@ -95,6 +100,13 @@ ContextBuildCommand = Callable[[UUID, UUID, UUID, str | None], Awaitable[None]]
 AgentRunShowCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
 AgentRunListCommand = Callable[[UUID, UUID, int], Awaitable[None]]
 AgentRunRetryCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
+TelegramPairingCreateCommand = Callable[[UUID, UUID], Awaitable[None]]
+TelegramAccountListCommand = Callable[[UUID, UUID], Awaitable[None]]
+TelegramAccountRevokeCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
+TelegramWebhookSetCommand = Callable[[str], Awaitable[None]]
+NotificationListCommand = Callable[[UUID, UUID, int], Awaitable[None]]
+NotificationShowCommand = Callable[[UUID, UUID, UUID, bool], Awaitable[None]]
+NotificationRetryCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
 DatabaseFactory = Callable[[str], Database]
 DependencyBuilder = Callable[[Settings], "GmailDependencies"]
 MemoryDependencyBuilder = Callable[..., MemoryDependencies]
@@ -156,6 +168,16 @@ class CommandFunctions:
     agent_run_show: AgentRunShowCommand = _unavailable_command
     agent_run_list: AgentRunListCommand = _unavailable_command
     agent_run_retry: AgentRunRetryCommand = _unavailable_command
+    telegram_pairing_create: TelegramPairingCreateCommand = _unavailable_command
+    telegram_account_list: TelegramAccountListCommand = _unavailable_command
+    telegram_account_revoke: TelegramAccountRevokeCommand = _unavailable_command
+    telegram_webhook_set: TelegramWebhookSetCommand = _unavailable_command
+    telegram_webhook_status: NoArgumentCommand = _unavailable_command
+    telegram_turn_pull: NoArgumentCommand = _unavailable_command
+    telegram_delivery_pull: NoArgumentCommand = _unavailable_command
+    notification_list: NotificationListCommand = _unavailable_command
+    notification_show: NotificationShowCommand = _unavailable_command
+    notification_retry: NotificationRetryCommand = _unavailable_command
 
 
 @dataclass(slots=True)
@@ -565,6 +587,32 @@ async def agent_pull_command(*, settings: Settings) -> None:
     )
 
 
+async def telegram_turn_pull_command(*, settings: Settings) -> None:
+    dependencies = build_conversation_dependencies(settings)
+    primary_failure: BaseException | None = None
+    try:
+        await dependencies.worker.run_forever()
+    except BaseException as error:
+        primary_failure = error
+    cleanup = await dependencies.close()
+    _raise_after_cleanup(
+        primary_failure, CleanupOutcome(cleanup.interruption, cleanup.ordinary_failure)
+    )
+
+
+async def telegram_delivery_pull_command(*, settings: Settings) -> None:
+    dependencies = build_delivery_dependencies(settings)
+    primary_failure: BaseException | None = None
+    try:
+        await dependencies.worker.run_forever()
+    except BaseException as error:
+        primary_failure = error
+    cleanup = await dependencies.close()
+    _raise_after_cleanup(
+        primary_failure, CleanupOutcome(cleanup.interruption, cleanup.ordinary_failure)
+    )
+
+
 async def worker_run_command(*, settings: Settings) -> None:
     """Run every continuous consumer as one Cloud Run worker-pool process."""
     # A failure in any loop cancels its siblings. Their command-level cleanup handlers then
@@ -575,6 +623,13 @@ async def worker_run_command(*, settings: Settings) -> None:
         group.create_task(relevance_pull_command(settings=settings), name="relevance-pull")
         if settings.agent_enabled:
             group.create_task(agent_pull_command(settings=settings), name="agent-pull")
+        if settings.telegram_enabled:
+            group.create_task(
+                telegram_turn_pull_command(settings=settings), name="telegram-turn-pull"
+            )
+            group.create_task(
+                telegram_delivery_pull_command(settings=settings), name="telegram-delivery-pull"
+            )
 
 
 async def agent_run_show_command(
@@ -627,6 +682,166 @@ async def agent_run_retry_command(
             user_id=user_id,
             workspace_id=workspace_id,
             destination=settings.agent_topic_id,
+            requested_at=_utc_now(),
+        )
+
+    _write_json(await _run_database_operation(settings, database_factory, retry), stdout)
+
+
+async def telegram_pairing_create_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    bot_username = settings.telegram_bot_username
+    if bot_username is None:
+        raise CliValidationError("Telegram bot username is unavailable")
+
+    async def create(database: Database) -> BaseModel:
+        return await TelegramAccountRepository(database).create_pairing(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            bot_username=bot_username,
+            now=_utc_now(),
+            ttl_seconds=settings.telegram_pairing_ttl_seconds,
+        )
+
+    _write_json(await _run_database_operation(settings, database_factory, create), stdout)
+
+
+async def telegram_account_list_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def list_accounts(database: Database) -> tuple[BaseModel, ...]:
+        return await TelegramAccountRepository(database).list(
+            user_id=user_id, workspace_id=workspace_id
+        )
+
+    records = await _run_database_operation(settings, database_factory, list_accounts)
+    _write_json({"count": len(records), "items": records}, stdout)
+
+
+async def telegram_account_revoke_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    account_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def revoke(database: Database) -> BaseModel:
+        return await TelegramAccountRepository(database).revoke(
+            account_id=account_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            now=_utc_now(),
+        )
+
+    _write_json(await _run_database_operation(settings, database_factory, revoke), stdout)
+
+
+async def telegram_webhook_set_command(
+    url: str, *, settings: Settings, stdout: TextIO | None = None
+) -> None:
+    token = settings.telegram_bot_token
+    secret = settings.telegram_webhook_secret
+    if (
+        token is None
+        or not token.get_secret_value().strip()
+        or secret is None
+        or not secret.get_secret_value().strip()
+        or not url.startswith("https://")
+    ):
+        raise CliValidationError("Telegram webhook configuration is incomplete")
+    telegram = TelegramBotAPI(token.get_secret_value())
+    try:
+        await telegram.set_webhook(url=url, secret_token=secret.get_secret_value())
+    finally:
+        await telegram.close()
+    _write_json({"configured": True, "url": url}, stdout)
+
+
+async def telegram_webhook_status_command(
+    *, settings: Settings, stdout: TextIO | None = None
+) -> None:
+    token = settings.telegram_bot_token
+    if token is None or not token.get_secret_value().strip():
+        raise CliValidationError("Telegram bot token is unavailable")
+    telegram = TelegramBotAPI(token.get_secret_value())
+    try:
+        info = await telegram.get_webhook_info()
+    finally:
+        await telegram.close()
+    _write_json(info, stdout)
+
+
+async def notification_list_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    limit: int,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def list_notifications(database: Database) -> tuple[BaseModel, ...]:
+        return await NotificationRepository(database).list(
+            user_id=user_id, workspace_id=workspace_id, limit=limit
+        )
+
+    records = await _run_database_operation(settings, database_factory, list_notifications)
+    items = [record.model_dump(exclude={"message"}) for record in records]
+    _write_json({"count": len(items), "items": items}, stdout)
+
+
+async def notification_show_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    notification_id: UUID,
+    include_content: bool,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def show(database: Database) -> BaseModel | None:
+        return await NotificationRepository(database).get(
+            notification_id=notification_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        )
+
+    record = await _run_database_operation(settings, database_factory, show)
+    output: object = record
+    if record is not None and not include_content:
+        output = record.model_dump(exclude={"message"})
+    _write_json(output, stdout)
+
+
+async def notification_retry_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    notification_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def retry(database: Database) -> BaseModel:
+        return await NotificationRepository(database).retry(
+            notification_id=notification_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            destination=settings.telegram_delivery_topic_id,
             requested_at=_utc_now(),
         )
 
@@ -970,6 +1185,16 @@ def build_command_functions(settings: Settings) -> CommandFunctions:
         agent_run_show=partial(agent_run_show_command, settings=settings),
         agent_run_list=partial(agent_run_list_command, settings=settings),
         agent_run_retry=partial(agent_run_retry_command, settings=settings),
+        telegram_pairing_create=partial(telegram_pairing_create_command, settings=settings),
+        telegram_account_list=partial(telegram_account_list_command, settings=settings),
+        telegram_account_revoke=partial(telegram_account_revoke_command, settings=settings),
+        telegram_webhook_set=partial(telegram_webhook_set_command, settings=settings),
+        telegram_webhook_status=partial(telegram_webhook_status_command, settings=settings),
+        telegram_turn_pull=partial(telegram_turn_pull_command, settings=settings),
+        telegram_delivery_pull=partial(telegram_delivery_pull_command, settings=settings),
+        notification_list=partial(notification_list_command, settings=settings),
+        notification_show=partial(notification_show_command, settings=settings),
+        notification_retry=partial(notification_retry_command, settings=settings),
     )
 
 
@@ -1031,6 +1256,46 @@ def build_parser() -> argparse.ArgumentParser:
         agent_run_record = agent_run_commands.add_parser(command_name)
         _add_scope_arguments(agent_run_record)
         agent_run_record.add_argument("--run-id", required=True, type=_parse_uuid)
+
+    telegram = commands.add_parser("telegram")
+    telegram_commands = telegram.add_subparsers(dest="telegram_command", required=True)
+    telegram_pairing = telegram_commands.add_parser("pairing")
+    telegram_pairing_commands = telegram_pairing.add_subparsers(
+        dest="telegram_pairing_command", required=True
+    )
+    telegram_pairing_create = telegram_pairing_commands.add_parser("create")
+    _add_scope_arguments(telegram_pairing_create)
+    telegram_account = telegram_commands.add_parser("account")
+    telegram_account_commands = telegram_account.add_subparsers(
+        dest="telegram_account_command", required=True
+    )
+    telegram_account_list = telegram_account_commands.add_parser("list")
+    _add_scope_arguments(telegram_account_list)
+    telegram_account_revoke = telegram_account_commands.add_parser("revoke")
+    _add_scope_arguments(telegram_account_revoke)
+    telegram_account_revoke.add_argument("--account-id", required=True, type=_parse_uuid)
+    telegram_webhook = telegram_commands.add_parser("webhook")
+    telegram_webhook_commands = telegram_webhook.add_subparsers(
+        dest="telegram_webhook_command", required=True
+    )
+    telegram_webhook_set = telegram_webhook_commands.add_parser("set")
+    telegram_webhook_set.add_argument("--url", required=True)
+    telegram_webhook_commands.add_parser("status")
+    telegram_commands.add_parser("turn-pull")
+    telegram_commands.add_parser("delivery-pull")
+
+    notification = commands.add_parser("notification")
+    notification_commands = notification.add_subparsers(dest="notification_command", required=True)
+    notification_list = notification_commands.add_parser("list")
+    _add_scope_arguments(notification_list)
+    notification_list.add_argument("--limit", type=_parse_limit, default=50)
+    notification_show = notification_commands.add_parser("show")
+    _add_scope_arguments(notification_show)
+    notification_show.add_argument("--notification-id", required=True, type=_parse_uuid)
+    notification_show.add_argument("--include-content", action="store_true")
+    notification_retry = notification_commands.add_parser("retry")
+    _add_scope_arguments(notification_retry)
+    notification_retry.add_argument("--notification-id", required=True, type=_parse_uuid)
 
     goal = commands.add_parser("goal")
     goal_commands = goal.add_subparsers(dest="goal_command", required=True)
@@ -1243,6 +1508,47 @@ async def _dispatch(arguments: argparse.Namespace, commands: CommandFunctions) -
         if command is None:
             raise CliValidationError("Command is unavailable")
         await command(arguments.user_id, arguments.workspace_id, arguments.run_id)
+    elif (
+        arguments.area == "telegram"
+        and arguments.telegram_command == "pairing"
+        and arguments.telegram_pairing_command == "create"
+    ):
+        await commands.telegram_pairing_create(arguments.user_id, arguments.workspace_id)
+    elif (
+        arguments.area == "telegram"
+        and arguments.telegram_command == "account"
+        and arguments.telegram_account_command == "list"
+    ):
+        await commands.telegram_account_list(arguments.user_id, arguments.workspace_id)
+    elif arguments.area == "telegram" and arguments.telegram_command == "account":
+        await commands.telegram_account_revoke(
+            arguments.user_id, arguments.workspace_id, arguments.account_id
+        )
+    elif (
+        arguments.area == "telegram"
+        and arguments.telegram_command == "webhook"
+        and arguments.telegram_webhook_command == "set"
+    ):
+        await commands.telegram_webhook_set(arguments.url)
+    elif arguments.area == "telegram" and arguments.telegram_command == "webhook":
+        await commands.telegram_webhook_status()
+    elif arguments.area == "telegram" and arguments.telegram_command == "turn-pull":
+        await commands.telegram_turn_pull()
+    elif arguments.area == "telegram" and arguments.telegram_command == "delivery-pull":
+        await commands.telegram_delivery_pull()
+    elif arguments.area == "notification" and arguments.notification_command == "list":
+        await commands.notification_list(arguments.user_id, arguments.workspace_id, arguments.limit)
+    elif arguments.area == "notification" and arguments.notification_command == "show":
+        await commands.notification_show(
+            arguments.user_id,
+            arguments.workspace_id,
+            arguments.notification_id,
+            arguments.include_content,
+        )
+    elif arguments.area == "notification" and arguments.notification_command == "retry":
+        await commands.notification_retry(
+            arguments.user_id, arguments.workspace_id, arguments.notification_id
+        )
     elif arguments.area == "goal" and arguments.goal_command == "create":
         await commands.goal_create(
             GoalDraft(

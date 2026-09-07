@@ -19,6 +19,8 @@ from eva_ai.events.types import (
     OutboundMessage,
     OutboxState,
 )
+from eva_ai.notifications.types import NotificationDeliveryRequestedMessage
+from eva_ai.telegram.types import TelegramTurnRequestedMessage
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -198,4 +200,8 @@ def _parse_envelope(message_type: str, payload: Mapping[str, object]) -> Outboun
         return EventAvailableMessage.model_validate(payload)
     if message_type == "agent.run.requested":
         return AgentRunRequestedMessage.model_validate(payload)
+    if message_type == "telegram.turn.requested":
+        return TelegramTurnRequestedMessage.model_validate(payload)
+    if message_type == "notification.delivery.requested":
+        return NotificationDeliveryRequestedMessage.model_validate(payload)
     raise ValueError("unsupported outbox message type")

@@ -1,8 +1,8 @@
 # Eva AI
 
 Eva is a proactive, event-driven personal AI operator. The repository contains the application
-foundation, durable Event backbone, local Gmail ingestion worker, Goal and Situation domain,
-relevance engine, scoped long-term memory, and bounded email investigation agent.
+foundation, durable Event backbone, Gmail ingestion, Goal and Situation domain, relevance engine,
+scoped long-term memory, bounded email investigation, and user-specific Telegram conversation.
 
 ## Requirements
 
@@ -212,6 +212,24 @@ NOTIFY/INVESTIGATE Signal -> AgentRun + transactional outbox -> eva-agent-runs
 The same Cloud Run worker process now hosts a fourth agent-pull loop. Runs are leased, retried,
 idempotent per Signal/version, and tenant-scoped. Email remains untrusted evidence; the model cannot
 choose another account or gain write authority. Results may propose notifications, Situation
-updates, memory, follow-ups, or future actions, but this milestone applies none of them. See the
+updates, memory, follow-ups, or future actions. Milestone 7 now delivers notification proposals;
+the other proposal types remain inert. See the
 [Agent investigation operator guide](docs/agent-operator.md) for setup, privacy boundaries,
 inspection, and recovery.
+
+### Milestone 7: Telegram conversation
+
+Milestone 7 makes Eva both proactive and reactive over a paired private Telegram chat:
+
+```text
+Agent notification -> Notification + outbox -> Telegram delivery -> proactive message
+User message -> authenticated webhook -> Event + outbox -> conversation agent -> Notification
+             -> Telegram delivery -> reply
+```
+
+Pairing binds immutable numeric Telegram user and chat IDs to one Eva User and Workspace. Every
+conversation, Situation, memory lookup, Gmail read, and response remains within that persisted
+scope. Replies to proactive messages recover the originating Situation; ordinary messages use the
+active general chat, and `/new` starts a fresh one. The shared Cloud Run worker now supervises six
+continuous loops. Gmail access remains read-only; drafting, approval, and sending are deferred to
+Milestone 8. See the [Telegram operator guide](docs/telegram-operator.md).

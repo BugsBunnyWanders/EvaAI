@@ -1,0 +1,13 @@
+from typing import Protocol
+
+from eva_ai.telegram.types import TelegramSendResult, TelegramWebhookInfo
+
+
+class TelegramGateway(Protocol):
+    async def send_message(self, *, chat_id: int, text: str) -> TelegramSendResult: ...
+
+    async def set_webhook(self, *, url: str, secret_token: str) -> None: ...
+
+    async def get_webhook_info(self) -> TelegramWebhookInfo: ...
+
+    async def answer_callback_query(self, *, callback_query_id: str) -> None: ...

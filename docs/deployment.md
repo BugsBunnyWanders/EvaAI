@@ -14,10 +14,12 @@ evaatyourservice.com                 eva-api (Cloud Run service)
                                        - transactional outbox relay
                                        - relevance pull
                                        - agent investigation pull
+                                       - Telegram conversation pull
+                                       - Telegram delivery pull
                                      eva-migrate (Cloud Run job)
                                      eva-gmail-maintenance (scheduled job)
                                      Cloud SQL PostgreSQL 17 + pgvector
-                                     Pub/Sub (Gmail, events, agent runs) + Secret Manager
+                                     Pub/Sub (Gmail, events, agent runs, Telegram) + Secret Manager
 ```
 
 The API scales to zero. The worker pool uses one manually scaled instance because pull consumers
@@ -59,6 +61,10 @@ authenticate. An owner therefore applies the small local-state bootstrap stack e
    unset OPENAI_API_KEY
    ```
 
+   Before enabling Telegram, also create the two secret containers and add their values as
+   described in the [Telegram operator guide](telegram-operator.md). Terraform intentionally
+   references existing secret containers so neither value enters Terraform state.
+
 5. Copy the bootstrap outputs into GitHub repository variables:
 
    ```bash
@@ -71,6 +77,7 @@ authenticate. An owner therefore applies the small local-state bootstrap stack e
    gh variable set GCP_DEPLOY_SERVICE_ACCOUNT \
      --body "$(terraform -chdir=terraform/bootstrap output -raw deployer_service_account)"
    gh variable set EVA_WORKER_INSTANCE_COUNT --body 0
+   gh variable set EVA_TELEGRAM_ENABLED --body false
    ```
 
 6. In GitHub, create a `production` environment and restrict its deployment branches to `main`.
@@ -124,7 +131,8 @@ account are acknowledged deliberately and would not be replayed later.
 
 - Production state is kept in a private, versioned GCS bucket with state locking.
 - GitHub stores only non-secret resource identifiers as repository variables.
-- The OpenAI key and runtime database URL are injected from Secret Manager.
+- The OpenAI key, Telegram bot token, webhook secret, and runtime database URL are injected from
+  Secret Manager according to each runtime's needs.
 - The generated database password exists in encrypted Terraform state because Terraform manages
   the Cloud SQL user; never print or download production state unnecessarily.
 - Cloud SQL, Cloud Run service, jobs, and worker pool have deletion protection enabled. Removing

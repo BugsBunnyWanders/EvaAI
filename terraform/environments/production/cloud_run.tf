@@ -49,7 +49,7 @@ resource "google_cloud_run_v2_service" "api" {
       }
 
       dynamic "env" {
-        for_each = local.common_environment
+        for_each = local.api_environment
         content {
           name  = env.key
           value = env.value
@@ -66,6 +66,19 @@ resource "google_cloud_run_v2_service" "api" {
         }
       }
 
+      dynamic "env" {
+        for_each = var.telegram_enabled ? [true] : []
+        content {
+          name = "EVA_TELEGRAM_WEBHOOK_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = data.google_secret_manager_secret.telegram_webhook_secret[0].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
       volume_mounts {
         name       = "cloudsql"
         mount_path = "/cloudsql"
@@ -76,6 +89,7 @@ resource "google_cloud_run_v2_service" "api" {
   depends_on = [
     google_project_iam_member.api_cloud_sql,
     google_secret_manager_secret_iam_member.api_database,
+    google_secret_manager_secret_iam_member.api_telegram_webhook,
     google_secret_manager_secret_version.database_url,
   ]
 }
@@ -93,7 +107,7 @@ resource "google_cloud_run_v2_worker_pool" "worker" {
   name                = "eva-worker"
   location            = var.region
   deletion_protection = true
-  description         = "Continuous Gmail, outbox, relevance, and agent investigation loops"
+  description         = "Continuous Gmail, outbox, relevance, agent, Telegram turn, and delivery loops"
 
   template {
     service_account = google_service_account.worker.email
@@ -146,6 +160,19 @@ resource "google_cloud_run_v2_worker_pool" "worker" {
         }
       }
 
+      dynamic "env" {
+        for_each = var.telegram_enabled ? [true] : []
+        content {
+          name = "EVA_TELEGRAM_BOT_TOKEN"
+          value_source {
+            secret_key_ref {
+              secret  = data.google_secret_manager_secret.telegram_bot_token[0].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
       volume_mounts {
         name       = "cloudsql"
         mount_path = "/cloudsql"
@@ -168,6 +195,8 @@ resource "google_cloud_run_v2_worker_pool" "worker" {
     google_pubsub_subscription.gmail,
     google_pubsub_subscription.relevance,
     google_pubsub_subscription.agent,
+    google_pubsub_subscription.telegram_turns,
+    google_pubsub_subscription.telegram_delivery,
     google_secret_manager_secret_version.database_url,
   ]
 }

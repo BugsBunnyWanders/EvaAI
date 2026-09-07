@@ -20,6 +20,8 @@ from eva_ai.agent.types import (
 from eva_ai.db.models import AgentRun, ConnectorAccount, Event, OutboxMessage, Signal
 from eva_ai.db.session import Database
 from eva_ai.events.types import OutboxState
+from eva_ai.notifications.repository import NotificationRepository
+from eva_ai.notifications.types import NotificationKind
 from eva_ai.relevance.types import RelevanceDisposition
 
 _RUN_NAMESPACE = UUID("f52ef2db-4f65-5cca-a10a-a75780af41f9")
@@ -47,8 +49,10 @@ class AgentRunSubject:
 
 
 class AgentRunRepository:
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, notification_destination: str | None = None) -> None:
         self._database = database
+        self._notification_destination = notification_destination
+        self._notifications = NotificationRepository(database)
 
     async def schedule_in_session(
         self,
@@ -271,7 +275,31 @@ class AgentRunRepository:
             )
             .returning(AgentRun)
         )
-        return await self._finish(statement)
+        async with self._database.session() as session:
+            async with session.begin():
+                row = (await session.scalars(statement)).one_or_none()
+                if row is None:
+                    raise AgentConflictError("AgentRun claim is stale")
+                if result.notification is not None and self._notification_destination is not None:
+                    # Agent completion and proactive delivery intent commit together. A crash can
+                    # delay publication, but cannot leave a successful user-facing run invisible.
+                    await self._notifications.create_in_session(
+                        session,
+                        event_id=row.event_id,
+                        user_id=row.user_id,
+                        workspace_id=row.workspace_id,
+                        situation_id=row.situation_id,
+                        agent_run_id=row.id,
+                        kind=NotificationKind.PROACTIVE,
+                        urgency=result.notification.urgency,
+                        message=result.notification.message,
+                        dedupe_key=(
+                            f"agent-run:{row.id}:notification:v{row.output_schema_version}"
+                        ),
+                        destination=self._notification_destination,
+                        created_at=completed_at,
+                    )
+                return _record(row)
 
     async def fail(
         self,
