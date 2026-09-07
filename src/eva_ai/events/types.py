@@ -7,6 +7,8 @@ from uuid import UUID, uuid7
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from eva_ai.agent.types import AgentRunRequestedMessage
+from eva_ai.notifications.types import NotificationDeliveryRequestedMessage
+from eva_ai.telegram.types import TelegramTurnRequestedMessage
 
 
 class PrincipalType(StrEnum):
@@ -78,7 +80,12 @@ class EventAvailableMessage(BaseModel):
     schema_version: int = Field(gt=0)
 
 
-type OutboundEnvelope = EventAvailableMessage | AgentRunRequestedMessage
+type OutboundEnvelope = (
+    EventAvailableMessage
+    | AgentRunRequestedMessage
+    | TelegramTurnRequestedMessage
+    | NotificationDeliveryRequestedMessage
+)
 
 
 @dataclass(frozen=True, slots=True)

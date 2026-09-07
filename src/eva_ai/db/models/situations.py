@@ -39,7 +39,7 @@ class Situation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             ondelete="CASCADE",
         ),
         UniqueConstraint("id", "workspace_id", "user_id", name="uq_situations_id_workspace_user"),
-        CheckConstraint("type IN ('EMAIL_THREAD')", name="ck_situations_type"),
+        CheckConstraint("type IN ('EMAIL_THREAD', 'TELEGRAM_CHAT')", name="ck_situations_type"),
         CheckConstraint(
             "lifecycle IN ('OPEN', 'ACTIVE', 'WAITING_USER', 'WAITING_EXTERNAL', "
             "'RESOLVED', 'ABANDONED')",
@@ -162,7 +162,10 @@ class SituationCorrelationKey(Base):
             name="fk_situation_correlation_keys_workspace_user",
             ondelete="CASCADE",
         ),
-        CheckConstraint("kind IN ('GMAIL_THREAD')", name="ck_situation_correlation_keys_kind"),
+        CheckConstraint(
+            "kind IN ('GMAIL_THREAD', 'TELEGRAM_CONVERSATION')",
+            name="ck_situation_correlation_keys_kind",
+        ),
         CheckConstraint(
             "btrim(correlation_key) <> ''",
             name="ck_situation_correlation_keys_key_nonblank",

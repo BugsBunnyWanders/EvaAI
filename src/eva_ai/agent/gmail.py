@@ -16,7 +16,7 @@ class ScopedGmailInvestigationReader:
         connector_id: UUID,
         user_id: UUID,
         workspace_id: UUID,
-        thread_id: str,
+        thread_id: str | None,
         thread_message_limit: int,
         search_result_limit: int,
         body_max_chars: int,
@@ -39,6 +39,8 @@ class ScopedGmailInvestigationReader:
         self._body_max_chars = body_max_chars
 
     async def read_thread(self) -> GmailThreadEvidence:
+        if self._thread_id is None:
+            raise AgentPermanentError("No Gmail thread is linked to this Situation")
         raw_thread = await self._client.get_thread(self._thread_id)
         raw_messages = raw_thread.get("messages")
         if not isinstance(raw_messages, list):

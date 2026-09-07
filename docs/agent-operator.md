@@ -84,8 +84,9 @@ A successful AgentRun can propose:
 - memory candidates; or
 - a follow-up.
 
-Milestone 6 stores these proposals but applies none of them. Telegram consumes notification
-proposals in Milestone 7. Policy, approval, and external execution arrive in Milestone 8.
+Milestone 7 turns a non-empty notification proposal into a durable Telegram Notification and
+delivery request. Situation updates, memory candidates, follow-ups, and action proposals remain
+inert. Policy, approval, and external execution arrive in Milestone 8.
 
 For Gmail draft/send, the intended Milestone 8 flow is:
 

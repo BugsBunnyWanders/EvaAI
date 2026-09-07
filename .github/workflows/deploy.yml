@@ -152,12 +152,16 @@ jobs:
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           REGION: ${{ vars.GCP_REGION }}
           IMAGE: ${{ steps.image.outputs.uri }}
+          TELEGRAM_BOT_USERNAME: ${{ vars.EVA_TELEGRAM_BOT_USERNAME }}
+          TELEGRAM_ENABLED: ${{ vars.EVA_TELEGRAM_ENABLED || 'false' }}
         run: |
           terraform -chdir=terraform/environments/production plan \
             -out=paused.tfplan \
             -var="project_id=${PROJECT_ID}" \
             -var="region=${REGION}" \
             -var="image=${IMAGE}" \
+            -var="telegram_bot_username=${TELEGRAM_BOT_USERNAME}" \
+            -var="telegram_enabled=${TELEGRAM_ENABLED}" \
             -var="worker_instance_count=0"
           terraform -chdir=terraform/environments/production apply -auto-approve paused.tfplan
 
@@ -179,12 +183,16 @@ jobs:
           REGION: ${{ vars.GCP_REGION }}
           IMAGE: ${{ steps.image.outputs.uri }}
           WORKER_COUNT: ${{ vars.EVA_WORKER_INSTANCE_COUNT || '0' }}
+          TELEGRAM_BOT_USERNAME: ${{ vars.EVA_TELEGRAM_BOT_USERNAME }}
+          TELEGRAM_ENABLED: ${{ vars.EVA_TELEGRAM_ENABLED || 'false' }}
         run: |
           terraform -chdir=terraform/environments/production plan \
             -out=running.tfplan \
             -var="project_id=${PROJECT_ID}" \
             -var="region=${REGION}" \
             -var="image=${IMAGE}" \
+            -var="telegram_bot_username=${TELEGRAM_BOT_USERNAME}" \
+            -var="telegram_enabled=${TELEGRAM_ENABLED}" \
             -var="worker_instance_count=${WORKER_COUNT}"
           terraform -chdir=terraform/environments/production apply -auto-approve running.tfplan
 

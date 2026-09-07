@@ -12,9 +12,11 @@ from eva_ai.agent.types import (
     AgentRunRequestedMessage,
     AgentRunStatus,
     AgentUsage,
+    NotificationProposal,
+    NotificationUrgency,
 )
 from eva_ai.db import Database
-from eva_ai.db.models import OutboxMessage, Situation
+from eva_ai.db.models import Notification, OutboxMessage, Situation
 from eva_ai.events.service import EventService
 from eva_ai.events.types import NewEvent, PrincipalType
 from eva_ai.relevance.repository import RelevanceRepository
@@ -193,7 +195,7 @@ async def test_schedule_claim_complete_is_scoped_and_idempotent(database: Databa
     assert first_claim is not None and first_claim.attempt_count == 1
     claim = await runs.claim(message, now=NOW + timedelta(seconds=61), lease_seconds=60)
     assert claim is not None and claim.attempt_count == 2
-    with pytest.raises(AgentConflictError, match="no longer current"):
+    with pytest.raises(AgentConflictError, match="claim is stale"):
         await runs.complete(
             first_claim,
             result=AgentInvestigationResult(
@@ -222,3 +224,68 @@ async def test_schedule_claim_complete_is_scoped_and_idempotent(database: Databa
     assert completed.status is AgentRunStatus.SUCCEEDED
     assert completed.result is not None
     assert await runs.claim(message, now=NOW, lease_seconds=60) is None
+
+    # A new agent version is a distinct logical run. Its user-facing result must commit the
+    # proactive Notification and delivery outbox intent with the successful run.
+    proactive_runs = AgentRunRepository(database, "eva-telegram-delivery")
+    async with database.session() as session:
+        async with session.begin():
+            proactive = await proactive_runs.schedule_in_session(
+                session,
+                event_id=event_id,
+                signal_id=signal.id,
+                situation_id=situation_id,
+                user_id=scope.user_id,
+                workspace_id=scope.workspace_id,
+                destination="eva-agent-runs",
+                provider="openai",
+                model="gpt-5.6-sol",
+                agent_version="v2",
+                prompt_version="p2",
+                queued_at=NOW + timedelta(minutes=2),
+            )
+    proactive_message = AgentRunRequestedMessage(
+        outbox_message_id=uuid7(),
+        agent_run_id=proactive.id,
+        event_id=event_id,
+        signal_id=signal.id,
+        situation_id=situation_id,
+        user_id=scope.user_id,
+        workspace_id=scope.workspace_id,
+    )
+    proactive_claim = await proactive_runs.claim(
+        proactive_message, now=NOW + timedelta(minutes=2), lease_seconds=60
+    )
+    assert proactive_claim is not None
+    await proactive_runs.complete(
+        proactive_claim,
+        result=AgentInvestigationResult(
+            decision=AgentDecision.NOTIFY_USER,
+            reasoning_summary="The user needs the meeting update.",
+            notification=NotificationProposal(
+                urgency=NotificationUrgency.HIGH,
+                message="The meeting time changed. Would you like the details?",
+            ),
+        ),
+        input_digest="c" * 64,
+        provider_response_id="response-2",
+        usage=AgentUsage(),
+        tool_audit=(),
+        completed_at=NOW + timedelta(minutes=3),
+    )
+
+    async with database.session() as session:
+        notification = await session.scalar(
+            select(Notification).where(Notification.agent_run_id == proactive.id)
+        )
+        delivery_count = await session.scalar(
+            select(func.count())
+            .select_from(OutboxMessage)
+            .where(
+                OutboxMessage.message_type == "notification.delivery.requested",
+                OutboxMessage.event_id == event_id,
+            )
+        )
+    assert notification is not None
+    assert notification.message == "The meeting time changed. Would you like the details?"
+    assert delivery_count == 1

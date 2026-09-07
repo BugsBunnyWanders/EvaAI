@@ -54,8 +54,44 @@ variable "agent_topic_id" {
   default     = "eva-agent-runs"
 }
 
+variable "telegram_turn_topic_id" {
+  description = "Eva authenticated Telegram conversation-turn topic."
+  type        = string
+  default     = "eva-telegram-turns"
+}
+
+variable "telegram_delivery_topic_id" {
+  description = "Eva Telegram Notification delivery topic."
+  type        = string
+  default     = "eva-telegram-delivery"
+}
+
+variable "telegram_bot_username" {
+  description = "Telegram bot username without the leading at-sign."
+  type        = string
+  default     = ""
+}
+
+variable "telegram_enabled" {
+  description = "Enable the Telegram API secret and worker conversation/delivery loops."
+  type        = bool
+  default     = false
+}
+
 variable "openai_secret_id" {
   description = "Secret created by the bootstrap stack; its value is added out of band."
   type        = string
   default     = "eva-openai-api-key"
+}
+
+variable "telegram_bot_token_secret_id" {
+  description = "Existing Secret Manager secret containing the Telegram bot token."
+  type        = string
+  default     = "eva-telegram-bot-token"
+}
+
+variable "telegram_webhook_secret_id" {
+  description = "Existing Secret Manager secret containing the Telegram webhook secret token."
+  type        = string
+  default     = "eva-telegram-webhook-secret"
 }

@@ -22,3 +22,13 @@ output "agent_subscription" {
   description = "Production Eva agent investigation subscription."
   value       = google_pubsub_subscription.agent.name
 }
+
+output "telegram_turn_subscription" {
+  description = "Production Telegram conversation-turn subscription."
+  value       = google_pubsub_subscription.telegram_turns.name
+}
+
+output "telegram_delivery_subscription" {
+  description = "Production Telegram Notification delivery subscription."
+  value       = google_pubsub_subscription.telegram_delivery.name
+}

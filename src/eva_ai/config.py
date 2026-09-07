@@ -114,6 +114,30 @@ class Settings(BaseSettings):
     agent_thread_message_limit: int = Field(default=20, ge=1, le=20)
     agent_search_result_limit: int = Field(default=10, ge=1, le=10)
     agent_message_body_max_chars: int = Field(default=6000, ge=1, le=8000)
+    telegram_enabled: bool = False
+    telegram_bot_username: str | None = None
+    telegram_bot_token: SecretStr | None = None
+    telegram_webhook_secret: SecretStr | None = None
+    telegram_turn_topic_id: str = "eva-telegram-turns"
+    telegram_turn_subscription_id: str = "eva-telegram-turns-local"
+    telegram_delivery_topic_id: str = "eva-telegram-delivery"
+    telegram_delivery_subscription_id: str = "eva-telegram-delivery-local"
+    telegram_pairing_ttl_seconds: PositiveInt = 900
+    telegram_webhook_max_bytes: int = Field(default=64_000, ge=1_024, le=1_000_000)
+    telegram_pull_timeout_seconds: PositiveInt = 30
+    telegram_lease_seconds: PositiveInt = 300
+    telegram_max_attempts: PositiveInt = 6
+    telegram_retry_initial_backoff_seconds: PositiveFloat = 2.0
+    telegram_retry_max_backoff_seconds: PositiveFloat = 120.0
+    telegram_message_max_chars: int = Field(default=4000, ge=1, le=4096)
+    conversation_model: str = "gpt-5.6-sol"
+    conversation_reasoning_effort: ReasoningEffort = "medium"
+    conversation_agent_version: str = "conversation-v1"
+    conversation_prompt_version: str = "conversation-prompt-v1"
+    conversation_history_turn_limit: int = Field(default=20, ge=1, le=40)
+    conversation_history_max_chars: int = Field(default=24_000, ge=1_000, le=50_000)
+    conversation_max_turns: int = Field(default=6, ge=1, le=10)
+    conversation_max_tool_calls: int = Field(default=4, ge=0, le=10)
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -136,6 +160,13 @@ class Settings(BaseSettings):
         "agent_model",
         "agent_version",
         "agent_prompt_version",
+        "telegram_turn_topic_id",
+        "telegram_turn_subscription_id",
+        "telegram_delivery_topic_id",
+        "telegram_delivery_subscription_id",
+        "conversation_model",
+        "conversation_agent_version",
+        "conversation_prompt_version",
     )
     @classmethod
     def reject_blank_topic_id(cls, value: str) -> str:
@@ -149,6 +180,16 @@ class Settings(BaseSettings):
         if value is not None and not value.strip():
             raise ValueError("must not be blank")
         return value
+
+    @field_validator("telegram_bot_username")
+    @classmethod
+    def normalize_telegram_bot_username(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.removeprefix("@").strip()
+        if not normalized:
+            raise ValueError("must not be blank")
+        return normalized
 
     @field_validator(
         "relevance_ignored_sources",
@@ -174,6 +215,8 @@ class Settings(BaseSettings):
             raise ValueError("memory candidate limit must not be below result limit")
         if self.agent_retry_max_backoff_seconds < self.agent_retry_initial_backoff_seconds:
             raise ValueError("agent retry maximum must not be below its initial backoff")
+        if self.telegram_retry_max_backoff_seconds < self.telegram_retry_initial_backoff_seconds:
+            raise ValueError("Telegram retry maximum must not be below its initial backoff")
         if self.relevance_enabled and self.relevance_provider is RelevanceProvider.OPENAI:
             if self.openai_api_key is None or not self.openai_api_key.get_secret_value().strip():
                 raise ValueError("OpenAI API key is required when relevance processing is enabled")
@@ -182,6 +225,11 @@ class Settings(BaseSettings):
                 raise ValueError("agent investigation requires relevance processing")
             if self.openai_api_key is None or not self.openai_api_key.get_secret_value().strip():
                 raise ValueError("OpenAI API key is required when agent investigation is enabled")
+        if self.telegram_enabled:
+            if not self.relevance_enabled or not self.agent_enabled:
+                raise ValueError("Telegram processing requires relevance and agent processing")
+            if self.openai_api_key is None or not self.openai_api_key.get_secret_value().strip():
+                raise ValueError("OpenAI API key is required when Telegram processing is enabled")
         return self
 
 
