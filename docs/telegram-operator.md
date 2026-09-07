@@ -60,11 +60,12 @@ never Terraform variables.
 
 ## 2. Deploy and register the webhook
 
-Merge the Milestone 7 PR after both secret versions exist. The main-branch deployment creates the
-Telegram Pub/Sub resources, applies the database migration, and deploys the API and worker. Keep
-`EVA_WORKER_INSTANCE_COUNT=0` until the production User, Workspace, Gmail connector, and Telegram
-account are ready. A zero worker count safely queues durable Pub/Sub messages but does not answer
-them.
+The Milestone 7 PR can be merged while `EVA_TELEGRAM_ENABLED` is absent or false. That deployment
+creates the Telegram Pub/Sub resources and applies the database migration without requiring either
+Telegram secret. After both secret versions exist, set the bot username and activation variables
+shown above and rerun the deployment workflow. Keep `EVA_WORKER_INSTANCE_COUNT=0` only if the
+production User, Workspace, and Gmail connector are not ready; a zero worker count safely queues
+durable Pub/Sub messages but does not answer them.
 
 Load the secrets into a local shell without printing them, set the deployed API URL, and register
 the webhook:
