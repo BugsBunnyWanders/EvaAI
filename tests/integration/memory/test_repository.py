@@ -275,8 +275,9 @@ async def test_context_subject_and_fact_order_are_situation_first_and_scoped(
     )
 
     assert subject is not None
-    assert subject[0].id == situation_id
-    assert [item.id for item in subject[1]] == [goal.id]
+    assert subject[0].display_name == f"User {scope.user_id}"
+    assert subject[1].id == situation_id
+    assert [item.id for item in subject[2]] == [goal.id]
     assert [item.scope_type for item in facts] == [
         MemoryScopeType.SITUATION,
         MemoryScopeType.GOAL,

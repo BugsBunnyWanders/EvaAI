@@ -6,7 +6,7 @@ from uuid import UUID, uuid5, uuid7
 from sqlalchemy import and_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from eva_ai.agent.types import AgentUsage, NotificationUrgency, ToolCallAudit
+from eva_ai.agent.types import AgentUsage, NotificationUrgency, ProposedAction, ToolCallAudit
 from eva_ai.connectors.types import ConnectorStatus
 from eva_ai.conversation.errors import ConversationConflictError, ConversationScopeError
 from eva_ai.conversation.types import (
@@ -32,6 +32,7 @@ from eva_ai.db.models import (
 )
 from eva_ai.db.session import Database
 from eva_ai.events.types import ProcessingStage
+from eva_ai.memory.types import MemoryProposal
 from eva_ai.notifications.repository import NotificationRepository
 from eva_ai.notifications.types import NotificationKind
 from eva_ai.situations.types import (
@@ -68,6 +69,7 @@ class ConversationTurnSubject:
     connector_id: UUID | None
     secret_reference: str | None
     gmail_thread_id: str | None
+    telegram_chat_id: int
 
 
 class ConversationRepository:
@@ -241,7 +243,7 @@ class ConversationRepository:
         self, claim: ConversationTurnClaim, *, history_limit: int, history_max_chars: int
     ) -> ConversationTurnSubject:
         statement = (
-            select(ConversationTurn, TelegramConversation, Situation)
+            select(ConversationTurn, TelegramConversation, Situation, TelegramAccount)
             .join(
                 TelegramConversation,
                 and_(
@@ -258,13 +260,22 @@ class ConversationRepository:
                     Situation.workspace_id == TelegramConversation.workspace_id,
                 ),
             )
+            .join(
+                TelegramAccount,
+                and_(
+                    TelegramAccount.id == TelegramConversation.telegram_account_id,
+                    TelegramAccount.user_id == TelegramConversation.user_id,
+                    TelegramAccount.workspace_id == TelegramConversation.workspace_id,
+                    TelegramAccount.status == TelegramAccountStatus.ACTIVE,
+                ),
+            )
             .where(_claim_predicate(claim))
         )
         async with self._database.session() as session:
             values = (await session.execute(statement)).one_or_none()
             if values is None:
                 raise ConversationScopeError("claimed conversation turn is unavailable")
-            turn, conversation, situation = values
+            turn, conversation, situation, telegram_account = values
             history_rows = (
                 await session.scalars(
                     select(ConversationTurn)
@@ -307,6 +318,7 @@ class ConversationRepository:
             connector_id=None if connector is None else connector.id,
             secret_reference=None if connector is None else connector.secret_reference,
             gmail_thread_id=thread_id,
+            telegram_chat_id=telegram_account.chat_id,
         )
 
     async def complete(
@@ -318,6 +330,9 @@ class ConversationRepository:
         provider_response_id: str | None,
         usage: AgentUsage,
         tool_audit: tuple[ToolCallAudit, ...],
+        reasoning_summary: str | None = None,
+        proposed_actions: tuple[ProposedAction, ...] = (),
+        memory_proposals: tuple[MemoryProposal, ...] = (),
         completed_at: datetime,
     ) -> ConversationTurnRecord:
         async with self._database.session() as session:
@@ -370,6 +385,9 @@ class ConversationRepository:
                     output_tokens=usage.output_tokens,
                     total_tokens=usage.total_tokens,
                     tool_audit=[item.model_dump(mode="json") for item in tool_audit],
+                    reasoning_summary=reasoning_summary,
+                    proposed_actions=[item.model_dump(mode="json") for item in proposed_actions],
+                    memory_proposals=[item.model_dump(mode="json") for item in memory_proposals],
                     completed_at=completed_at,
                 )
                 conversation.next_sequence += 1
@@ -715,6 +733,13 @@ def _turn_record(row: ConversationTurn) -> ConversationTurnRecord:
             total_tokens=row.total_tokens,
         ),
         tool_audit=tuple(ToolCallAudit.model_validate(value) for value in row.tool_audit),
+        reasoning_summary=row.reasoning_summary,
+        proposed_actions=tuple(
+            ProposedAction.model_validate(value) for value in row.proposed_actions
+        ),
+        memory_proposals=tuple(
+            MemoryProposal.model_validate(value) for value in row.memory_proposals
+        ),
         failure_code=row.failure_code,
         failure_summary=row.failure_summary,
         created_at=row.created_at,

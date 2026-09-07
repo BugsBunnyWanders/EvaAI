@@ -6,6 +6,7 @@ from eva_ai.memory.context import ContextBounds, ContextRepository, MemoryContex
 from eva_ai.memory.embedding import EmbeddedText, EmbeddingService, ScriptedEmbeddingProvider
 from eva_ai.memory.types import (
     ContextGoal,
+    ContextIdentity,
     ContextSituation,
     EpisodicMemoryRecord,
     EpisodicMemoryStatus,
@@ -102,8 +103,12 @@ class FakeContextRepository:
 
     async def load_context_subject(
         self, *, user_id: UUID, workspace_id: UUID, situation_id: UUID
-    ) -> tuple[ContextSituation, tuple[ContextGoal, ...]]:
-        return situation(), (goal(),)
+    ) -> tuple[ContextIdentity, ContextSituation, tuple[ContextGoal, ...]]:
+        return (
+            ContextIdentity(display_name="Saswat Ray", workspace_name="Personal"),
+            situation(),
+            (goal(),),
+        )
 
     async def list_context_facts(
         self,
@@ -156,6 +161,8 @@ async def test_context_builder_skips_embedding_without_episodes() -> None:
     )
 
     assert context.situation.id == SITUATION_ID
+    assert context.identity.display_name == "Saswat Ray"
+    assert context.identity.timezone is None
     assert context.goals[0].id == GOAL_ID
     assert context.facts[0].key == "interview_time"
     assert context.episodes == ()

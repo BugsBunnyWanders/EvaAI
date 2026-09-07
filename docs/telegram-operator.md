@@ -13,7 +13,8 @@ AgentRun succeeds -> Notification + transactional outbox -> eva-telegram-deliver
 
 Reactive
 Telegram -> authenticated API webhook -> Event + transactional outbox -> eva-telegram-turns
-         -> conversation worker -> scoped Situation + memory + optional Gmail reads
+         -> conversation worker -> typing indicator + scoped identity/Situation/memory
+         -> optional Gmail reads
          -> assistant turn + Notification + transactional outbox -> eva-telegram-delivery
          -> delivery worker -> Telegram sendMessage
 ```
@@ -134,6 +135,13 @@ gh workflow run "Deploy Eva to GCP"
 Send an ordinary private message to the bot. Eva should answer within a few seconds. Send a second
 message to verify context continuity, then `/new` to create a fresh general conversation. Replying
 directly to a proactive Eva message should recover its originating Gmail Situation and memory.
+The Telegram client should show `typing...` while Eva is processing. The action is refreshed every
+four seconds because Telegram expires it automatically.
+
+Tell Eva a stable preference, for example `Please remember that I prefer concise updates`, then
+start `/new` and ask `What do you remember about me?`. A high-confidence proposal should become a
+Workspace-scoped fact and remain available in the new conversation. `/new` does not erase durable
+memory.
 
 Inspect delivery state without exposing message text by default:
 
@@ -182,6 +190,9 @@ uv run eva notification retry \
 - **Bot replies without Gmail evidence:** confirm an active Gmail connector exists for the exact
   paired User and Workspace. Eva can still answer without Gmail tools if authorization is absent or
   revoked.
+- **No typing indicator:** confirm the worker revision has the Telegram bot token and outbound
+  access to `api.telegram.org`. A failed typing action is intentionally non-fatal, so inspect worker
+  connectivity while confirming replies still arrive.
 - **Proactive reply loses context:** verify the original Notification reached `SENT` and has its
   Telegram provider message ID. Replies to unknown message IDs fall back to the active general
   conversation.

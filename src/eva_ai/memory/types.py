@@ -235,6 +235,14 @@ class ContextGoal(BaseModel):
     priority: int = Field(ge=0, le=100)
 
 
+class ContextIdentity(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    display_name: str = Field(max_length=200)
+    workspace_name: str = Field(max_length=200)
+    timezone: str | None = Field(default=None, max_length=100)
+
+
 class RankedEpisode(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -253,9 +261,10 @@ class SemanticCandidate(BaseModel):
 class AgentWorkingContext(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: int = Field(default=1, ge=1)
+    schema_version: int = Field(default=2, ge=1)
     user_id: UUID
     workspace_id: UUID
+    identity: ContextIdentity
     situation: ContextSituation
     goals: tuple[ContextGoal, ...]
     facts: tuple[MemoryFactRecord, ...]

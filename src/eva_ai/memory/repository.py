@@ -13,6 +13,7 @@ from eva_ai.db.models import (
     MemoryFact,
     Situation,
     SituationGoal,
+    User,
     Workspace,
 )
 from eva_ai.db.session import Database
@@ -20,6 +21,7 @@ from eva_ai.memory.embedding import EmbeddedText
 from eva_ai.memory.errors import MemoryConflictError, MemoryNotFoundError, MemoryScopeError
 from eva_ai.memory.types import (
     ContextGoal,
+    ContextIdentity,
     ContextSituation,
     EpisodicMemoryDraft,
     EpisodicMemoryRecord,
@@ -357,8 +359,22 @@ class MemoryRepository:
 
     async def load_context_subject(
         self, *, user_id: UUID, workspace_id: UUID, situation_id: UUID
-    ) -> tuple[ContextSituation, tuple[ContextGoal, ...]] | None:
+    ) -> tuple[ContextIdentity, ContextSituation, tuple[ContextGoal, ...]] | None:
         async with self._database.session() as session:
+            identity = (
+                await session.execute(
+                    select(User, Workspace)
+                    .join(Workspace, Workspace.user_id == User.id)
+                    .where(
+                        User.id == user_id,
+                        Workspace.id == workspace_id,
+                        Workspace.user_id == user_id,
+                    )
+                )
+            ).one_or_none()
+            if identity is None:
+                return None
+            user, workspace = identity
             situation = await session.scalar(
                 select(Situation).where(
                     Situation.id == situation_id,
@@ -387,6 +403,10 @@ class MemoryRepository:
                 )
             ).all()
         return (
+            ContextIdentity(
+                display_name=user.display_name,
+                workspace_name=workspace.name,
+            ),
             ContextSituation(
                 id=situation.id,
                 title=situation.title,

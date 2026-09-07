@@ -28,7 +28,8 @@ from eva_ai.integrations.gmail.api import (
 )
 from eva_ai.memory.context import MemoryContextBuilder
 from eva_ai.memory.errors import MemoryNotFoundError
-from eva_ai.memory.types import AgentWorkingContext
+from eva_ai.memory.learning import MemoryLearningService
+from eva_ai.memory.types import AgentWorkingContext, MemoryEpisodeType, MemorySourceType
 from eva_ai.relevance.types import RelevanceDisposition
 
 
@@ -48,6 +49,7 @@ class AgentInvestigationService:
         thread_message_limit: int,
         search_result_limit: int,
         body_max_chars: int,
+        memory_learner: MemoryLearningService | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._runs = runs
@@ -62,6 +64,7 @@ class AgentInvestigationService:
         self._thread_message_limit = thread_message_limit
         self._search_result_limit = search_result_limit
         self._body_max_chars = body_max_chars
+        self._memory_learner = memory_learner
         self._clock = clock
 
     async def process(self, message: AgentRunRequestedMessage) -> InvestigationOutcome:
@@ -131,6 +134,7 @@ class AgentInvestigationService:
                 return await self._agent.investigate(request, reader)
 
             invocation = await use_gmail_client(gmail_client, investigate)
+            completed_at = self._clock()
             await self._runs.complete(
                 claim,
                 result=invocation.result,
@@ -138,8 +142,20 @@ class AgentInvestigationService:
                 provider_response_id=invocation.provider_response_id,
                 usage=invocation.usage,
                 tool_audit=invocation.tool_audit,
-                completed_at=self._clock(),
+                completed_at=completed_at,
             )
+            if self._memory_learner is not None:
+                await self._memory_learner.learn(
+                    invocation.result.memory_proposals,
+                    user_id=claim.user_id,
+                    workspace_id=claim.workspace_id,
+                    situation_id=subject.run.situation_id,
+                    goal_ids=tuple(goal.id for goal in context.goals),
+                    source_type=MemorySourceType.EXTERNAL_EVENT,
+                    source_ref=f"gmail-event:{subject.event.event_id}",
+                    occurred_at=completed_at,
+                    episode_type=MemoryEpisodeType.OUTCOME,
+                )
             return InvestigationOutcome.SUCCEEDED
         except AuthorizationRevoked, InvalidAuthorizedUserCredentials, AgentPermanentError:
             await self._record_failure(

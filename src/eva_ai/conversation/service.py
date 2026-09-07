@@ -1,4 +1,6 @@
+import asyncio
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 
 from eva_ai.agent.errors import AgentPermanentError, AgentToolBudgetExceeded
@@ -31,7 +33,10 @@ from eva_ai.integrations.gcp.secret_manager import SecretManagerProviderError
 from eva_ai.integrations.gmail.api import GmailProviderError, InvalidAuthorizedUserCredentials
 from eva_ai.memory.context import MemoryContextBuilder
 from eva_ai.memory.errors import MemoryNotFoundError
+from eva_ai.memory.learning import MemoryLearningService
+from eva_ai.memory.types import MemoryEpisodeType, MemorySourceType
 from eva_ai.situations.types import SituationType
+from eva_ai.telegram.contracts import TelegramGateway
 from eva_ai.telegram.types import TelegramTurnRequestedMessage
 
 
@@ -54,6 +59,9 @@ class ConversationService:
         thread_message_limit: int,
         search_result_limit: int,
         body_max_chars: int,
+        memory_learner: MemoryLearningService | None = None,
+        telegram: TelegramGateway | None = None,
+        typing_refresh_seconds: float = 4.0,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._conversations = conversations
@@ -71,6 +79,9 @@ class ConversationService:
         self._thread_message_limit = thread_message_limit
         self._search_result_limit = search_result_limit
         self._body_max_chars = body_max_chars
+        self._memory_learner = memory_learner
+        self._telegram = telegram
+        self._typing_refresh_seconds = typing_refresh_seconds
         self._clock = clock
 
     async def process(self, message: TelegramTurnRequestedMessage) -> ConversationOutcome:
@@ -99,12 +110,18 @@ class ConversationService:
             }:
                 return ConversationOutcome.TERMINAL
             return ConversationOutcome.DEFERRED
+        typing_task: asyncio.Task[None] | None = None
         try:
             subject = await self._conversations.load_subject(
                 claim,
                 history_limit=self._history_turn_limit,
                 history_max_chars=self._history_max_chars,
             )
+            if self._telegram is not None:
+                typing_task = asyncio.create_task(
+                    self._refresh_typing(subject.telegram_chat_id),
+                    name=f"telegram-typing-{claim.turn_id}",
+                )
             context = await self._context_builder.build_for_situation(
                 user_id=claim.user_id,
                 workspace_id=claim.workspace_id,
@@ -120,6 +137,7 @@ class ConversationService:
                 is_email_situation=subject.situation_type is SituationType.EMAIL_THREAD,
             )
             invocation = await self._respond(subject, request)
+            completed_at = self._clock()
             await self._conversations.complete(
                 claim,
                 response_text=invocation.result.message,
@@ -127,8 +145,23 @@ class ConversationService:
                 provider_response_id=invocation.provider_response_id,
                 usage=invocation.usage,
                 tool_audit=invocation.tool_audit,
-                completed_at=self._clock(),
+                reasoning_summary=invocation.result.reasoning_summary,
+                proposed_actions=invocation.result.proposed_actions,
+                memory_proposals=invocation.result.memory_proposals,
+                completed_at=completed_at,
             )
+            if self._memory_learner is not None:
+                await self._memory_learner.learn(
+                    invocation.result.memory_proposals,
+                    user_id=claim.user_id,
+                    workspace_id=claim.workspace_id,
+                    situation_id=subject.conversation.situation_id,
+                    goal_ids=tuple(goal.id for goal in context.goals),
+                    source_type=MemorySourceType.AGENT_INFERRED,
+                    source_ref=f"telegram-conversation:{claim.turn_id}",
+                    occurred_at=completed_at,
+                    episode_type=MemoryEpisodeType.EXPERIENCE,
+                )
             return ConversationOutcome.SUCCEEDED
         except ConversationPermanentError, AgentPermanentError, AgentToolBudgetExceeded:
             await self._record_failure(
@@ -155,6 +188,23 @@ class ConversationService:
         except Exception:
             # Raw provider/model errors can contain private content and are never persisted.
             return await self._retry(claim, "UNEXPECTED_CONVERSATION_FAILURE")
+        finally:
+            if typing_task is not None:
+                typing_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await typing_task
+
+    async def _refresh_typing(self, chat_id: int) -> None:
+        telegram = self._telegram
+        if telegram is None:
+            return
+        while True:
+            try:
+                await telegram.send_chat_action(chat_id=chat_id, action="typing")
+            except Exception:
+                # Typing is cosmetic and must never affect conversation delivery.
+                pass
+            await asyncio.sleep(self._typing_refresh_seconds)
 
     async def _respond(
         self, subject: ConversationTurnSubject, request: ConversationAgentRequest

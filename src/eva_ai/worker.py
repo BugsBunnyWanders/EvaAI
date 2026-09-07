@@ -31,6 +31,7 @@ from eva_ai.integrations.telegram.api import TelegramBotAPI
 from eva_ai.memory.context import ContextBounds as MemoryContextBounds
 from eva_ai.memory.context import MemoryContextBuilder
 from eva_ai.memory.embedding import EmbeddingService
+from eva_ai.memory.learning import MemoryLearningService
 from eva_ai.memory.policy import MemoryPolicy
 from eva_ai.memory.repository import MemoryRepository
 from eva_ai.memory.service import MemoryService
@@ -157,6 +158,7 @@ class ConversationDependencies:
     credential_store: GoogleSecretManagerCredentialStore
     gmail_client_factory: GoogleGmailClientFactory
     subscriber: GooglePullSubscriber
+    telegram: TelegramBotAPI
     openai_client: AsyncOpenAI
     service: ConversationService
     worker: ConversationPullWorker
@@ -166,6 +168,7 @@ class ConversationDependencies:
         ordinary_failure = False
         for close in (
             self.subscriber.close,
+            self.telegram.close,
             self.gmail_client_factory.close,
             self.credential_store.close,
             self.openai_client.close,
@@ -420,6 +423,9 @@ def build_agent_dependencies(settings: Settings) -> AgentDependencies:
         ),
         _utc_now,
     )
+    memory_learner = MemoryLearningService(
+        MemoryService(memory_repository, MemoryPolicy(), embedding, clock=_utc_now)
+    )
     credential_store = GoogleSecretManagerCredentialStore(project_id)
     gmail_client_factory = GoogleGmailClientFactory(
         request_timeout_seconds=settings.gmail_request_timeout_seconds,
@@ -454,6 +460,7 @@ def build_agent_dependencies(settings: Settings) -> AgentDependencies:
         thread_message_limit=settings.agent_thread_message_limit,
         search_result_limit=settings.agent_search_result_limit,
         body_max_chars=settings.agent_message_body_max_chars,
+        memory_learner=memory_learner,
     )
     subscriber = GooglePullSubscriber(project_id, settings.agent_subscription_id)
     worker = AgentPullWorker(subscriber, service, settings.agent_pull_timeout_seconds)
@@ -502,6 +509,9 @@ def build_conversation_dependencies(settings: Settings) -> ConversationDependenc
         ),
         _utc_now,
     )
+    memory_learner = MemoryLearningService(
+        MemoryService(memory_repository, MemoryPolicy(), embedding, clock=_utc_now)
+    )
     credential_store = GoogleSecretManagerCredentialStore(project_id)
     gmail_client_factory = GoogleGmailClientFactory(
         request_timeout_seconds=settings.gmail_request_timeout_seconds,
@@ -517,6 +527,13 @@ def build_conversation_dependencies(settings: Settings) -> ConversationDependenc
         max_turns=settings.conversation_max_turns,
         max_tool_calls=settings.conversation_max_tool_calls,
         tool_timeout_seconds=settings.agent_tool_timeout_seconds,
+    )
+    token = settings.telegram_bot_token
+    if token is None or not token.get_secret_value().strip():
+        raise ValueError("Telegram bot token is unavailable")
+    telegram = TelegramBotAPI(
+        token.get_secret_value(),
+        timeout_seconds=settings.gmail_request_timeout_seconds,
     )
     service = ConversationService(
         conversations=ConversationRepository(database, settings.telegram_delivery_topic_id),
@@ -534,6 +551,8 @@ def build_conversation_dependencies(settings: Settings) -> ConversationDependenc
         thread_message_limit=settings.agent_thread_message_limit,
         search_result_limit=settings.agent_search_result_limit,
         body_max_chars=settings.agent_message_body_max_chars,
+        memory_learner=memory_learner,
+        telegram=telegram,
     )
     subscriber = GooglePullSubscriber(project_id, settings.telegram_turn_subscription_id)
     worker = ConversationPullWorker(subscriber, service, settings.telegram_pull_timeout_seconds)
@@ -542,6 +561,7 @@ def build_conversation_dependencies(settings: Settings) -> ConversationDependenc
         credential_store=credential_store,
         gmail_client_factory=gmail_client_factory,
         subscriber=subscriber,
+        telegram=telegram,
         openai_client=openai_client,
         service=service,
         worker=worker,
