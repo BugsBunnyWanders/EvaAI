@@ -1,7 +1,9 @@
 import json
+import logging
 from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, Literal
+from uuid import UUID
 
 from agents import (
     Agent,
@@ -25,18 +27,36 @@ from openai import (
     RateLimitError,
 )
 from openai.types.shared import Reasoning
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from eva_ai.agent.contracts import GmailInvestigationReader
 from eva_ai.agent.errors import AgentToolBudgetExceeded
-from eva_ai.agent.types import GmailSearchEvidence, GmailThreadEvidence, ToolCallAudit
+from eva_ai.agent.types import (
+    GmailSearchEvidence,
+    GmailThreadEvidence,
+    ProposedAction,
+    ToolCallAudit,
+)
 from eva_ai.config import ReasoningEffort
-from eva_ai.conversation.errors import ConversationPermanentError, ConversationTransientError
+from eva_ai.conversation.errors import (
+    ConversationModelOutputError,
+    ConversationPermanentError,
+    ConversationTransientError,
+)
 from eva_ai.conversation.types import (
     ConversationAgentRequest,
     ConversationAgentResult,
     ConversationInvocationResult,
 )
+from eva_ai.memory.types import (
+    MemoryProposal,
+    MemoryProposalKind,
+    MemoryScopeType,
+    MemorySourceType,
+)
 from eva_ai.personality import EVA_PERSONALITY, MEMORY_PROPOSAL_GUIDANCE
+
+_LOGGER = logging.getLogger(__name__)
 
 _INSTRUCTIONS = f"""You are Eva, the user's proactive and reactive personal AI assistant.
 
@@ -81,6 +101,48 @@ class _ToolContext:
             self.audit.append(_audit(tool_name, monotonic(), "budget_exhausted", 0))
             raise AgentToolBudgetExceeded("Gmail tool budget exhausted")
         self.calls += 1
+
+
+class _ProposedActionOutput(BaseModel):
+    """Strict-schema transport shape for action arguments encoded as JSON text."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    capability: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=1000)
+    arguments_json: str = Field(default="{}", max_length=8000)
+    requires_approval: bool = True
+
+
+class _MemoryProposalOutput(BaseModel):
+    """Strict transport shape; conditional domain validation happens after parsing."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: MemoryProposalKind
+    claim: str = Field(min_length=1, max_length=4000)
+    namespace: str | None = Field(default=None, max_length=100)
+    key: str | None = Field(default=None, max_length=200)
+    scope_type: MemoryScopeType | None = None
+    scope_id: UUID | None = None
+    source_type: Literal[
+        MemorySourceType.AGENT_INFERRED,
+        MemorySourceType.EXTERNAL_EVENT,
+    ]
+    source_ref: str = Field(min_length=1, max_length=500)
+    confidence: float = Field(ge=0, le=1)
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class _ConversationAgentOutput(BaseModel):
+    """OpenAI-facing strict schema kept separate from the richer domain result."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    message: str = Field(min_length=1, max_length=4000)
+    reasoning_summary: str = Field(min_length=1, max_length=2000)
+    proposed_actions: tuple[_ProposedActionOutput, ...] = Field(default=(), max_length=10)
+    memory_proposals: tuple[_MemoryProposalOutput, ...] = Field(default=(), max_length=10)
 
 
 class OpenAIAgentsConversationAgent:
@@ -146,13 +208,9 @@ class OpenAIAgentsConversationAgent:
                 store=False,
             ),
             tools=tools,
-            # Proposed actions intentionally accept JSON-valued arguments. Open objects cannot
-            # be represented by the API's strict schema subset, so retain Pydantic validation
-            # while allowing the Agents SDK to submit the complete domain schema.
-            output_type=AgentOutputSchema(
-                ConversationAgentResult,
-                strict_json_schema=False,
-            ),
+            # Action arguments use JSON text in the transport model so the whole response can use
+            # strict structured output. This prevents malformed post-tool JSON replies.
+            output_type=AgentOutputSchema(_ConversationAgentOutput, strict_json_schema=True),
         )
         try:
             run = await Runner.run(
@@ -167,7 +225,8 @@ class OpenAIAgentsConversationAgent:
                     workflow_name="Eva Telegram conversation",
                 ),
             )
-            result = run.final_output_as(ConversationAgentResult, raise_if_incorrect_type=True)
+            output = run.final_output_as(_ConversationAgentOutput, raise_if_incorrect_type=True)
+            result = _to_domain_result(output)
         except APIConnectionError, APITimeoutError, InternalServerError, RateLimitError:
             raise ConversationTransientError("conversation provider unavailable") from None
         except APIStatusError as error:
@@ -176,7 +235,15 @@ class OpenAIAgentsConversationAgent:
             raise ConversationPermanentError("conversation request was rejected") from None
         except AgentToolBudgetExceeded:
             raise
-        except MaxTurnsExceeded, ModelBehaviorError, UserError, TypeError, ValueError:
+        except MaxTurnsExceeded, ModelBehaviorError, TypeError, ValueError:
+            _LOGGER.warning(
+                "conversation model output was invalid",
+                extra={"error_category": "model_output_invalid"},
+            )
+            raise ConversationModelOutputError(
+                "conversation agent returned invalid output"
+            ) from None
+        except UserError:
             raise ConversationPermanentError("conversation agent returned invalid output") from None
         usage = run.context_wrapper.usage
         return ConversationInvocationResult(
@@ -189,6 +256,47 @@ class OpenAIAgentsConversationAgent:
             },
             tool_audit=() if context is None else tuple(context.audit),
         )
+
+
+def _to_domain_result(output: _ConversationAgentOutput) -> ConversationAgentResult:
+    actions: list[ProposedAction] = []
+    for action_output in output.proposed_actions:
+        try:
+            arguments = json.loads(action_output.arguments_json)
+            if not isinstance(arguments, dict):
+                raise ValueError("action arguments must decode to an object")
+            actions.append(
+                ProposedAction(
+                    capability=action_output.capability,
+                    description=action_output.description,
+                    arguments=arguments,
+                    requires_approval=action_output.requires_approval,
+                )
+            )
+        except json.JSONDecodeError, TypeError, ValueError, ValidationError:
+            # Optional action metadata must never suppress an otherwise useful reply.
+            _LOGGER.warning(
+                "conversation proposed action was discarded",
+                extra={"error_category": "model_output_invalid"},
+            )
+
+    memories: list[MemoryProposal] = []
+    for memory_output in output.memory_proposals:
+        try:
+            memories.append(MemoryProposal.model_validate(memory_output.model_dump()))
+        except ValidationError:
+            # Conditional fact/episode validation is stricter than the transport schema.
+            _LOGGER.warning(
+                "conversation memory proposal was discarded",
+                extra={"error_category": "model_output_invalid"},
+            )
+
+    return ConversationAgentResult(
+        message=output.message,
+        reasoning_summary=output.reasoning_summary,
+        proposed_actions=tuple(actions),
+        memory_proposals=tuple(memories),
+    )
 
 
 async def _gmail_read_thread(

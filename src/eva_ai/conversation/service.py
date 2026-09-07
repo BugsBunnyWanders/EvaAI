@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from eva_ai.agent.errors import AgentPermanentError, AgentToolBudgetExceeded
 from eva_ai.agent.gmail import ScopedGmailInvestigationReader
+from eva_ai.agent.types import AgentUsage
 from eva_ai.connectors.gmail.contracts import (
     AuthorizationRevoked,
     CredentialStore,
@@ -13,6 +14,7 @@ from eva_ai.connectors.gmail.contracts import (
 )
 from eva_ai.conversation.contracts import ConversationAgent
 from eva_ai.conversation.errors import (
+    ConversationModelOutputError,
     ConversationPermanentError,
     ConversationScopeError,
     ConversationTransientError,
@@ -163,14 +165,10 @@ class ConversationService:
                     episode_type=MemoryEpisodeType.EXPERIENCE,
                 )
             return ConversationOutcome.SUCCEEDED
+        except ConversationModelOutputError:
+            return await self._retry(claim, "MODEL_OUTPUT_INVALID")
         except ConversationPermanentError, AgentPermanentError, AgentToolBudgetExceeded:
-            await self._record_failure(
-                claim,
-                retryable=False,
-                code="PERMANENT_CONVERSATION_FAILURE",
-                summary="The conversation turn cannot continue without corrected input.",
-            )
-            return ConversationOutcome.TERMINAL
+            return await self._complete_fallback(claim, "PERMANENT_CONVERSATION_FAILURE")
         except ConversationScopeError, MemoryNotFoundError:
             await self._record_failure(
                 claim,
@@ -235,22 +233,39 @@ class ConversationService:
         return await use_gmail_client(gmail_client, respond)
 
     async def _retry(self, claim: ConversationTurnClaim, code: str) -> ConversationOutcome:
+        if claim.attempt_count >= self._max_attempts:
+            return await self._complete_fallback(claim, code)
         delay = min(
             self._retry_max_backoff_seconds,
             self._retry_initial_backoff_seconds * (2 ** max(0, claim.attempt_count - 1)),
         )
-        record = await self._record_failure(
+        await self._record_failure(
             claim,
             retryable=True,
             code=code,
             summary="The conversation turn failed transiently and may be retried.",
             next_retry_at=self._clock() + timedelta(seconds=delay),
         )
-        return (
-            ConversationOutcome.RETRY
-            if record.status is ConversationTurnStatus.RETRYABLE_FAILURE
-            else ConversationOutcome.TERMINAL
+        return ConversationOutcome.RETRY
+
+    async def _complete_fallback(
+        self, claim: ConversationTurnClaim, code: str
+    ) -> ConversationOutcome:
+        # A model/tool failure is not a reason to leave the user with an unanswered message.
+        await self._conversations.complete(
+            claim,
+            response_text=(
+                "I’m sorry—I hit a problem while putting that answer together. "
+                "Please try once more, and I’ll take another run at it."
+            ),
+            agent_version=self._agent_version,
+            provider_response_id=None,
+            usage=AgentUsage(),
+            tool_audit=(),
+            reasoning_summary=f"Safe conversation fallback: {code}.",
+            completed_at=self._clock(),
         )
+        return ConversationOutcome.SUCCEEDED
 
     async def _record_failure(
         self,

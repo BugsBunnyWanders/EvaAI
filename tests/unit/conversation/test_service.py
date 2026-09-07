@@ -1,8 +1,12 @@
 import asyncio
 from contextlib import suppress
+from datetime import UTC, datetime
 from typing import cast
+from uuid import uuid7
 
+from eva_ai.conversation.repository import ConversationRepository, ConversationTurnClaim
 from eva_ai.conversation.service import ConversationService
+from eva_ai.conversation.types import ConversationOutcome
 from eva_ai.telegram.contracts import TelegramGateway
 
 
@@ -48,3 +52,38 @@ async def test_typing_refresh_ignores_provider_failure() -> None:
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task
+
+
+async def test_exhausted_retry_completes_with_user_visible_fallback() -> None:
+    class Conversations:
+        def __init__(self) -> None:
+            self.completed: dict[str, object] | None = None
+
+        async def complete(self, claim: ConversationTurnClaim, **values: object) -> None:
+            self.completed = values
+
+        async def fail(self, claim: ConversationTurnClaim, **values: object) -> None:
+            raise AssertionError("exhausted retries must not silently fail the turn")
+
+    conversations = Conversations()
+    service = object.__new__(ConversationService)
+    service._conversations = cast(ConversationRepository, conversations)
+    service._max_attempts = 1
+    service._agent_version = "conversation-v2"
+    service._clock = lambda: datetime(2030, 1, 1, tzinfo=UTC)
+    claim = ConversationTurnClaim(
+        turn_id=uuid7(),
+        conversation_id=uuid7(),
+        claim_id=uuid7(),
+        event_id=uuid7(),
+        user_id=uuid7(),
+        workspace_id=uuid7(),
+        attempt_count=1,
+    )
+
+    outcome = await service._retry(claim, "MODEL_OUTPUT_INVALID")
+
+    assert outcome is ConversationOutcome.SUCCEEDED
+    assert conversations.completed is not None
+    assert "try once more" in str(conversations.completed["response_text"])
+    assert conversations.completed["provider_response_id"] is None

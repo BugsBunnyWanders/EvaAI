@@ -16,3 +16,7 @@ class ConversationPermanentError(ConversationError):
 
 class ConversationTransientError(ConversationError):
     """Safe retryable conversation-agent failure."""
+
+
+class ConversationModelOutputError(ConversationTransientError):
+    """Retryable failure caused by malformed or schema-invalid model output."""

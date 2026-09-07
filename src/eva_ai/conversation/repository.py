@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid5, uuid7
 
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from eva_ai.agent.types import AgentUsage, NotificationUrgency, ProposedAction, ToolCallAudit
@@ -276,13 +276,21 @@ class ConversationRepository:
             if values is None:
                 raise ConversationScopeError("claimed conversation turn is unavailable")
             turn, conversation, situation, telegram_account = values
+            # Retain legacy failed user prompts so a terse follow-up (for example, "?") does not
+            # lose the intent that Eva previously failed to answer.
             history_rows = (
                 await session.scalars(
                     select(ConversationTurn)
                     .where(
                         ConversationTurn.conversation_id == conversation.id,
                         ConversationTurn.sequence < turn.sequence,
-                        ConversationTurn.status == ConversationTurnStatus.SUCCEEDED,
+                        or_(
+                            ConversationTurn.status == ConversationTurnStatus.SUCCEEDED,
+                            and_(
+                                ConversationTurn.role == ConversationTurnRole.USER,
+                                ConversationTurn.status == ConversationTurnStatus.PERMANENT_FAILURE,
+                            ),
+                        ),
                     )
                     .order_by(ConversationTurn.sequence.desc())
                     .limit(history_limit)

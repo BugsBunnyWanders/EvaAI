@@ -189,14 +189,40 @@ async def test_pairing_chat_reply_and_new_conversation_are_user_scoped(
     assert reply_subject.conversation.situation_id == first_subject.conversation.situation_id
     assert [turn.text for turn in reply_subject.history][-1] == notification.message
 
+    await conversations.fail(
+        reply_claim,
+        retryable=False,
+        max_attempts=1,
+        next_retry_at=None,
+        failure_code="MODEL_OUTPUT_INVALID",
+        failure_summary="Safe failure summary.",
+        completed_at=NOW + timedelta(seconds=9),
+    )
+    follow_up_ingest = await webhook.handle(
+        _update(3, "?", telegram_user_id=account.telegram_user_id),
+        received_at=NOW + timedelta(seconds=10),
+    )
+    assert follow_up_ingest.event_id is not None
+    follow_up_claim = await conversations.resolve_and_claim(
+        await _turn_envelope(database, follow_up_ingest.event_id),
+        now=NOW + timedelta(seconds=11),
+        lease_seconds=300,
+        agent_version="conversation-v1",
+    )
+    assert follow_up_claim is not None
+    follow_up_subject = await conversations.load_subject(
+        follow_up_claim, history_limit=20, history_max_chars=24000
+    )
+    assert [turn.text for turn in follow_up_subject.history][-1] == "Tell me about it"
+
     new_ingest = await webhook.handle(
-        _update(3, "/new", telegram_user_id=account.telegram_user_id),
-        received_at=NOW + timedelta(seconds=9),
+        _update(4, "/new", telegram_user_id=account.telegram_user_id),
+        received_at=NOW + timedelta(seconds=12),
     )
     assert new_ingest.event_id is not None
     new_claim = await conversations.resolve_and_claim(
         await _turn_envelope(database, new_ingest.event_id),
-        now=NOW + timedelta(seconds=10),
+        now=NOW + timedelta(seconds=13),
         lease_seconds=300,
         agent_version="conversation-v1",
     )

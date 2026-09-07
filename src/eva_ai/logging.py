@@ -51,6 +51,7 @@ _SAFE_CATEGORY_VALUES = {
             "internal_failure",
             "maintenance_failed",
             "malformed_notification",
+            "model_output_invalid",
             "provider_transient",
             "synchronization_busy",
             "synchronization_failed",
@@ -118,3 +119,8 @@ def configure_logging(settings: Settings, stream: TextIO | None = None) -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(settings.log_level)
+
+    # HTTP clients log complete URLs at INFO. Telegram authenticates in the URL path, so these
+    # libraries must never inherit Eva's application-level INFO setting.
+    for logger_name in ("httpx", "httpx2", "httpcore"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
