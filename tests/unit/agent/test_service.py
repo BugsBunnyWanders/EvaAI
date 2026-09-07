@@ -20,7 +20,7 @@ from eva_ai.agent.types import (
 )
 from eva_ai.connectors.gmail.contracts import CredentialStore, GmailClientFactory
 from eva_ai.memory.context import MemoryContextBuilder
-from eva_ai.memory.types import AgentWorkingContext, ContextSituation
+from eva_ai.memory.types import AgentWorkingContext, ContextIdentity, ContextSituation
 from eva_ai.relevance.types import RelevanceDisposition
 from eva_ai.situations.types import AttentionLevel
 
@@ -261,6 +261,7 @@ def _fixture(
     context = AgentWorkingContext(
         user_id=user_id,
         workspace_id=workspace_id,
+        identity=ContextIdentity(display_name="Saswat Ray", workspace_name="Personal"),
         situation=ContextSituation(
             id=situation_id,
             title="Meeting",

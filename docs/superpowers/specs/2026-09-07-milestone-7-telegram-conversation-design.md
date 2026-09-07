@@ -52,6 +52,28 @@ worker normally answers within seconds. Milestone 7 sends complete text messages
 streaming partial tokens. This prevents Telegram retries, model latency, or Cloud Run restarts from
 losing a turn.
 
+While a turn is being processed, the conversation worker sends Telegram's `typing` chat action and
+refreshes it every four seconds until completion. This is best-effort presentation state; a failed
+chat action never fails or delays the durable conversation.
+
+### Personality and durable learning
+
+Eva uses one shared voice contract across reactive conversation and proactive investigation: warm,
+perceptive, calm, candid, concise, and proactive without being pushy. Telegram output is plain text;
+the delivery adapter removes common Markdown artifacts as a final boundary safeguard.
+
+Working context now carries the authenticated user's display name and Workspace name. A remembered
+`profile.timezone` fact supplies the optional timezone. `/new` clears bounded conversational
+history, but identity, active facts, and episodic memory remain available because they belong to
+the authenticated Workspace rather than a Telegram conversation.
+
+The model can only propose memory. A deterministic learning service applies proposals after the
+answer or investigation result is durably committed. It enforces a confidence threshold, replaces
+all model-provided tenant scope and provenance with server-derived values, runs the existing memory
+policy, and isolates rejected writes from message delivery. Stable preferences and attributes
+become Workspace facts; important conversation events and Gmail developments become Situation-
+linked episodes. Credentials and secret-like fact slots remain prohibited.
+
 ## Decisions
 
 - Support full bidirectional text conversation in Milestone 7, not only inbound-message storage.
@@ -96,9 +118,9 @@ Milestone 7 excludes:
 
 - Gmail drafts, sends, labels, deletes, or any other write operation
 - approval authorization or Action execution
-- applying Situation updates or memory proposals from model output
+- applying Situation updates from model output
 - Telegram groups, channels, media, voice, locations, contacts, or file attachments
-- partial-token streaming, typing indicators, reactions, or message editing
+- partial-token streaming, reactions, or message editing
 - a public web UI for account connection
 - autonomous follow-up scheduling
 
@@ -128,12 +150,14 @@ User sends Telegram message
     -> continuous outbox relay
     -> eva-telegram-turns topic
     -> conversation worker resolves conversation/Situation
+    -> send and periodically refresh Telegram typing action (best effort)
     -> load bounded Situation, goals, memory, and conversation history
     -> conversational agent may call scoped read-only Gmail tools
     -> one database transaction:
          persist assistant turn
          create deduplicated Notification
          insert notification.delivery.requested outbox message
+    -> policy-controlled memory learner materializes high-confidence proposals
     -> existing delivery path sends the response
 ```
 
@@ -363,8 +387,8 @@ EVA_TELEGRAM_MAX_ATTEMPTS=6
 EVA_TELEGRAM_MESSAGE_MAX_CHARS=4000
 EVA_CONVERSATION_MODEL=gpt-5.6-sol
 EVA_CONVERSATION_REASONING_EFFORT=medium
-EVA_CONVERSATION_AGENT_VERSION=conversation-v1
-EVA_CONVERSATION_PROMPT_VERSION=conversation-prompt-v1
+EVA_CONVERSATION_AGENT_VERSION=conversation-v2
+EVA_CONVERSATION_PROMPT_VERSION=conversation-prompt-v2
 EVA_CONVERSATION_HISTORY_TURN_LIMIT=20
 EVA_CONVERSATION_HISTORY_MAX_CHARS=24000
 EVA_CONVERSATION_MAX_TURNS=6

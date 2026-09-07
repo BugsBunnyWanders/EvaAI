@@ -101,8 +101,8 @@ class Settings(BaseSettings):
     agent_subscription_id: str = "eva-agent-local"
     agent_model: str = "gpt-5.6-sol"
     agent_reasoning_effort: ReasoningEffort = "medium"
-    agent_version: str = "investigation-v1"
-    agent_prompt_version: str = "investigation-prompt-v1"
+    agent_version: str = "investigation-v2"
+    agent_prompt_version: str = "investigation-prompt-v2"
     agent_pull_timeout_seconds: PositiveInt = 30
     agent_lease_seconds: PositiveInt = 900
     agent_max_attempts: PositiveInt = 4
@@ -132,8 +132,8 @@ class Settings(BaseSettings):
     telegram_message_max_chars: int = Field(default=4000, ge=1, le=4096)
     conversation_model: str = "gpt-5.6-sol"
     conversation_reasoning_effort: ReasoningEffort = "medium"
-    conversation_agent_version: str = "conversation-v1"
-    conversation_prompt_version: str = "conversation-prompt-v1"
+    conversation_agent_version: str = "conversation-v2"
+    conversation_prompt_version: str = "conversation-prompt-v2"
     conversation_history_turn_limit: int = Field(default=20, ge=1, le=40)
     conversation_history_max_chars: int = Field(default=24_000, ge=1_000, le=50_000)
     conversation_max_turns: int = Field(default=6, ge=1, le=10)

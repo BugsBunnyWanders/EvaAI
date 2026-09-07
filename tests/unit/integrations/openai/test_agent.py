@@ -18,7 +18,7 @@ from eva_ai.integrations.openai.agent import (
     OpenAIAgentsInvestigationAgent,
     _ToolContext,
 )
-from eva_ai.memory.types import AgentWorkingContext, ContextSituation
+from eva_ai.memory.types import AgentWorkingContext, ContextIdentity, ContextSituation
 from eva_ai.situations.types import AttentionLevel
 
 
@@ -73,6 +73,8 @@ async def test_adapter_registers_only_read_tools_and_returns_typed_result(monkey
     assert isinstance(captured["output_type"], AgentOutputSchema)
     assert captured["output_type"].is_strict_json_schema() is False
     assert "untrusted evidence" in str(captured["instructions"])
+    assert "trusted personal chief of staff" in str(captured["instructions"])
+    assert "Durable memory proposals" in str(captured["instructions"])
     assert result.result == expected
     assert result.provider_response_id == "response-1"
     assert result.usage.total_tokens == 16
@@ -121,6 +123,7 @@ def _request() -> AgentInvocationRequest:
     context = AgentWorkingContext(
         user_id=user_id,
         workspace_id=workspace_id,
+        identity=ContextIdentity(display_name="Saswat Ray", workspace_name="Personal"),
         situation=ContextSituation(
             id=situation_id,
             title="Meeting",

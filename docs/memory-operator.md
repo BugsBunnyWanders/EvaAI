@@ -1,8 +1,9 @@
 # Memory and Context Operator Guide
 
 Milestone 5 gives Eva durable structured facts, searchable episodic summaries, and a bounded
-Situation-first context builder. Memory creation is explicit in this milestone: Gmail messages,
-relevance classifications, and external content do not write memory automatically.
+Situation-first context builder. Milestone 7.1 adds policy-controlled automatic learning from
+conversation and investigation results; raw Gmail ingestion and relevance classification still do
+not write memory directly.
 
 ## Mental model
 
@@ -18,6 +19,13 @@ Retraction marks a record inactive; it does not delete audit history. Context bu
 the requested Situation, adds linked active Goals, selects currently valid facts in Situation →
 Goal → Workspace order, then retrieves and reranks relevant episodes. The generated context is a
 temporary snapshot and is never persisted as authority.
+
+The model never writes memory directly. It emits typed proposals, and the application accepts only
+high-confidence proposals after replacing the model's tenant scope and provenance with the
+authenticated User, Workspace, Situation, and source record. Conversation facts are stored at
+Workspace scope so they survive `/new`; meaningful conversation and Gmail events become linked
+episodes. Existing policy checks continue to reject credential-like fact slots, and any failed
+learning write is isolated from the user-visible reply.
 
 Every command requires both `--user-id` and `--workspace-id`. The repository repeats these filters
 and the database uses composite foreign keys so a guessed record ID cannot cross a Workspace

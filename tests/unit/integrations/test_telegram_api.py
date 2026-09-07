@@ -28,6 +28,45 @@ async def test_send_message_uses_scoped_chat_and_returns_provider_anchor() -> No
     await client.aclose()
 
 
+async def test_send_message_removes_markdown_artifacts_from_plain_text() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"ok": True, "result": {"message_id": 17, "chat": {"id": 42}}},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    api = TelegramBotAPI("secret-token", client=client)
+
+    await api.send_message(chat_id=42, text="## Plan\n- **Prepare** well")
+
+    assert json.loads(requests[0].content) == {
+        "chat_id": 42,
+        "text": "Plan\n• Prepare well",
+    }
+    await client.aclose()
+
+
+async def test_send_chat_action_requests_typing_for_scoped_chat() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True, "result": True})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    api = TelegramBotAPI("secret-token", client=client)
+
+    await api.send_chat_action(chat_id=42)
+
+    assert requests[0].url.path.endswith("/sendChatAction")
+    assert json.loads(requests[0].content) == {"chat_id": 42, "action": "typing"}
+    await client.aclose()
+
+
 async def test_provider_server_failure_is_sanitized_and_retryable() -> None:
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(

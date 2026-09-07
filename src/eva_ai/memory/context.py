@@ -12,6 +12,7 @@ from eva_ai.memory.ranking import query_entities, rank_episodes
 from eva_ai.memory.types import (
     AgentWorkingContext,
     ContextGoal,
+    ContextIdentity,
     ContextSituation,
     MemoryFactRecord,
     RankedEpisode,
@@ -32,7 +33,7 @@ class ContextBounds:
 class ContextRepository(Protocol):
     async def load_context_subject(
         self, *, user_id: UUID, workspace_id: UUID, situation_id: UUID
-    ) -> tuple[ContextSituation, tuple[ContextGoal, ...]] | None: ...
+    ) -> tuple[ContextIdentity, ContextSituation, tuple[ContextGoal, ...]] | None: ...
 
     async def list_context_facts(
         self,
@@ -86,7 +87,7 @@ class MemoryContextBuilder:
         )
         if subject is None:
             raise MemoryNotFoundError
-        situation, goals = subject
+        identity, situation, goals = subject
         goal_ids = tuple(goal.id for goal in goals)
         facts = await self._repository.list_context_facts(
             user_id=user_id,
@@ -97,6 +98,7 @@ class MemoryContextBuilder:
             limit=self._bounds.fact_limit,
         )
         bounded_facts = _bound_facts(facts, self._bounds.fact_total_chars)
+        identity = identity.model_copy(update={"timezone": _remembered_timezone(bounded_facts)})
         episodes: tuple[RankedEpisode, ...] = ()
         if await self._repository.has_active_episodes(user_id=user_id, workspace_id=workspace_id):
             query = _query_text(situation, goals, focus, self._bounds.query_max_chars)
@@ -123,9 +125,10 @@ class MemoryContextBuilder:
                 episodes = _bound_episodes(ranked, self._bounds.episode_total_chars)
 
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "user_id": user_id,
             "workspace_id": workspace_id,
+            "identity": identity,
             "situation": situation,
             "goals": goals,
             "facts": bounded_facts,
@@ -171,6 +174,15 @@ def _bound_facts(
         selected.append(fact)
         remaining -= size
     return tuple(selected)
+
+
+def _remembered_timezone(facts: tuple[MemoryFactRecord, ...]) -> str | None:
+    for fact in facts:
+        if fact.namespace == "profile" and fact.key == "timezone":
+            value = fact.value_json
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:100]
+    return None
 
 
 def _bound_episodes(

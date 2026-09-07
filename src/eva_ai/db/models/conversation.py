@@ -141,6 +141,13 @@ class ConversationTurn(UUIDPrimaryKeyMixin, Base):
     tool_audit: Mapped[list[dict[str, JsonValue]]] = mapped_column(
         JSONB, default=list, server_default="[]"
     )
+    reasoning_summary: Mapped[str | None] = mapped_column(Text)
+    proposed_actions: Mapped[list[dict[str, JsonValue]]] = mapped_column(
+        JSONB, default=list, server_default="[]"
+    )
+    memory_proposals: Mapped[list[dict[str, JsonValue]]] = mapped_column(
+        JSONB, default=list, server_default="[]"
+    )
     failure_code: Mapped[str | None] = mapped_column(String(100))
     failure_summary: Mapped[str | None] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(

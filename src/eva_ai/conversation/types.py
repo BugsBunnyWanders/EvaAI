@@ -86,6 +86,9 @@ class ConversationTurnRecord(BaseModel):
     provider_response_id: str | None = Field(default=None, max_length=500)
     usage: AgentUsage
     tool_audit: tuple[ToolCallAudit, ...]
+    reasoning_summary: str | None = Field(default=None, max_length=2000)
+    proposed_actions: tuple[ProposedAction, ...] = ()
+    memory_proposals: tuple[MemoryProposal, ...] = ()
     failure_code: str | None = Field(default=None, max_length=100)
     failure_summary: str | None = Field(default=None, max_length=500)
     created_at: datetime

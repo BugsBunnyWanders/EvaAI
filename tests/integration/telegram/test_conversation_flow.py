@@ -1,14 +1,21 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from uuid import uuid7
 
 import pytest
 from sqlalchemy import select
 
-from eva_ai.agent.types import AgentUsage
+from eva_ai.agent.types import AgentUsage, ProposedAction
 from eva_ai.conversation.repository import ConversationRepository
 from eva_ai.db import Database
 from eva_ai.db.models import OutboxMessage
+from eva_ai.memory.types import (
+    MemoryProposal,
+    MemoryProposalKind,
+    MemoryScopeType,
+    MemorySourceType,
+)
 from eva_ai.notifications.repository import NotificationRepository
 from eva_ai.notifications.types import NotificationDeliveryRequestedMessage, NotificationStatus
 from eva_ai.telegram.ingestion import TelegramEventService
@@ -106,9 +113,33 @@ async def test_pairing_chat_reply_and_new_conversation_are_user_scoped(
         provider_response_id="response-1",
         usage=AgentUsage(input_tokens=10, output_tokens=8, total_tokens=18),
         tool_audit=(),
+        reasoning_summary="The user asked for an attention summary.",
+        proposed_actions=(
+            ProposedAction(
+                capability="review_email",
+                description="Review the relevant recruiting email.",
+            ),
+        ),
+        memory_proposals=(
+            MemoryProposal(
+                kind=MemoryProposalKind.FACT,
+                claim="The user is exploring recruiting opportunities.",
+                namespace="career",
+                key="job_search_status",
+                scope_type=MemoryScopeType.WORKSPACE,
+                scope_id=scope.workspace_id,
+                source_type=MemorySourceType.AGENT_INFERRED,
+                source_ref="conversation:test",
+                confidence=Decimal("0.9"),
+                reason="Useful for future career assistance.",
+            ),
+        ),
         completed_at=NOW + timedelta(seconds=4),
     )
     assert assistant.notification_id is not None
+    assert assistant.reasoning_summary == "The user asked for an attention summary."
+    assert assistant.proposed_actions[0].capability == "review_email"
+    assert assistant.memory_proposals[0].key == "job_search_status"
     notifications = NotificationRepository(database)
     notification = await notifications.get(
         notification_id=assistant.notification_id,

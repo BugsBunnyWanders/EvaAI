@@ -1,3 +1,4 @@
+import re
 from typing import Any, cast
 
 import httpx
@@ -19,13 +20,19 @@ class TelegramBotAPI:
         self._owns_client = client is None
 
     async def send_message(self, *, chat_id: int, text: str) -> TelegramSendResult:
-        result = await self._call("sendMessage", {"chat_id": chat_id, "text": text})
+        result = await self._call(
+            "sendMessage",
+            {"chat_id": chat_id, "text": _plain_telegram_text(text)},
+        )
         message_id = result.get("message_id")
         chat = result.get("chat")
         returned_chat_id = chat.get("id") if isinstance(chat, dict) else None
         if not isinstance(message_id, int) or not isinstance(returned_chat_id, int):
             raise TelegramProviderError("INVALID_RESPONSE", retryable=False)
         return TelegramSendResult(message_id=message_id, chat_id=returned_chat_id)
+
+    async def send_chat_action(self, *, chat_id: int, action: str = "typing") -> None:
+        await self._call("sendChatAction", {"chat_id": chat_id, "action": action})
 
     async def set_webhook(self, *, url: str, secret_token: str) -> None:
         await self._call(
@@ -100,3 +107,13 @@ def _optional_string(value: object) -> str | None:
     if value is None:
         return None
     return _string(value)[:500]
+
+
+def _plain_telegram_text(value: str) -> str:
+    """Remove common Markdown artifacts because Eva sends Telegram messages as plain text."""
+    text = re.sub(r"(?m)^#{1,6}\s+", "", value)
+    text = re.sub(r"(?m)^\s*[-*]\s+", "• ", text)
+    text = re.sub(r"\*\*([^*\n]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_\n]+)__", r"\1", text)
+    text = text.replace("```", "").replace("`", "")
+    return text.strip()
