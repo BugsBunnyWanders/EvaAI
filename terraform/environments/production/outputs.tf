@@ -17,3 +17,8 @@ output "relevance_subscription" {
   description = "Production Eva event subscription."
   value       = google_pubsub_subscription.relevance.name
 }
+
+output "agent_subscription" {
+  description = "Production Eva agent investigation subscription."
+  value       = google_pubsub_subscription.agent.name
+}

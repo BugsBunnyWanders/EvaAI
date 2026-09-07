@@ -9,7 +9,7 @@ from typing import cast
 from uuid import UUID, uuid7
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 
 import eva_ai.cli as cli_module
 from eva_ai.cli import (
@@ -99,6 +99,10 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
         "memory_episode_retract": RecordingCommand(),
         "memory_episode_search": RecordingCommand(),
         "context_build": RecordingCommand(),
+        "agent_pull": RecordingCommand(),
+        "agent_run_show": RecordingCommand(),
+        "agent_run_list": RecordingCommand(),
+        "agent_run_retry": RecordingCommand(),
     }
     return (
         CommandFunctions(
@@ -130,6 +134,10 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
             memory_episode_retract=commands["memory_episode_retract"],
             memory_episode_search=commands["memory_episode_search"],
             context_build=commands["context_build"],
+            agent_pull=commands["agent_pull"],
+            agent_run_show=commands["agent_run_show"],
+            agent_run_list=commands["agent_run_list"],
+            agent_run_retry=commands["agent_run_retry"],
         ),
         commands,
     )
@@ -164,6 +172,50 @@ def command_functions() -> tuple[CommandFunctions, dict[str, RecordingCommand]]:
         (["gmail", "maintain"], "gmail_maintain", ()),
         (["events", "relay"], "events_relay", ()),
         (["relevance", "pull"], "relevance_pull", ()),
+        (["agent", "pull"], "agent_pull", ()),
+        (
+            [
+                "agent",
+                "run",
+                "list",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+            ],
+            "agent_run_list",
+            (USER_ID, WORKSPACE_ID, 50),
+        ),
+        (
+            [
+                "agent",
+                "run",
+                "show",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--run-id",
+                str(MEMORY_ID),
+            ],
+            "agent_run_show",
+            (USER_ID, WORKSPACE_ID, MEMORY_ID),
+        ),
+        (
+            [
+                "agent",
+                "run",
+                "retry",
+                "--user-id",
+                str(USER_ID),
+                "--workspace-id",
+                str(WORKSPACE_ID),
+                "--run-id",
+                str(MEMORY_ID),
+            ],
+            "agent_run_retry",
+            (USER_ID, WORKSPACE_ID, MEMORY_ID),
+        ),
         (["worker", "run"], "worker_run", ()),
         (
             [
@@ -1424,6 +1476,51 @@ async def test_worker_run_supervises_every_continuous_loop(
         await task
 
     assert started == {"gmail", "relay", "relevance"}
+
+
+async def test_worker_run_adds_agent_loop_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started: set[str] = set()
+    all_started = asyncio.Event()
+
+    async def run(component: str, *, settings: Settings) -> None:
+        started.add(component)
+        if len(started) == 4:
+            all_started.set()
+        await asyncio.Future()
+
+    async def gmail(*, settings: Settings) -> None:
+        await run("gmail", settings=settings)
+
+    async def relay(*, settings: Settings) -> None:
+        await run("relay", settings=settings)
+
+    async def relevance(*, settings: Settings) -> None:
+        await run("relevance", settings=settings)
+
+    async def agent(*, settings: Settings) -> None:
+        await run("agent", settings=settings)
+
+    monkeypatch.setattr(cli_module, "gmail_pull_command", gmail)
+    monkeypatch.setattr(cli_module, "events_relay_command", relay)
+    monkeypatch.setattr(cli_module, "relevance_pull_command", relevance)
+    monkeypatch.setattr(cli_module, "agent_pull_command", agent)
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        relevance_enabled=True,
+        agent_enabled=True,
+        openai_api_key=SecretStr("test-key"),
+    )
+    task = asyncio.create_task(worker_run_command(settings=settings))
+
+    await asyncio.wait_for(all_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert started == {"gmail", "relay", "relevance", "agent"}
 
 
 class RecordingCloseResource:

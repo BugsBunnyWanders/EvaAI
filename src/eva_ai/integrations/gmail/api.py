@@ -67,6 +67,10 @@ class MessagesResource(Protocol):
     def list(self, **kwargs: object) -> ExecutableRequest: ...
 
 
+class ThreadsResource(Protocol):
+    def get(self, **kwargs: object) -> ExecutableRequest: ...
+
+
 class UsersResource(Protocol):
     def getProfile(self, **kwargs: object) -> ExecutableRequest: ...  # noqa: N802
 
@@ -75,6 +79,8 @@ class UsersResource(Protocol):
     def history(self) -> HistoryResource: ...
 
     def messages(self) -> MessagesResource: ...
+
+    def threads(self) -> ThreadsResource: ...
 
 
 class GmailService(Protocol):
@@ -341,14 +347,29 @@ class GoogleGmailClient:
             message_request=True,
         )
 
-    async def list_message_ids(self, query: str, page_token: str | None) -> MessageListPage:
-        response = await self._execute(
+    async def get_thread(self, thread_id: str) -> Mapping[str, object]:
+        return await self._execute(
             lambda: (
                 self._service.users()
-                .messages()
-                .list(userId="me", q=query, pageToken=page_token)
+                .threads()
+                .get(userId="me", id=thread_id, format="full")
                 .execute()
-            )
+            ),
+            message_request=True,
+        )
+
+    async def list_message_ids(
+        self, query: str, page_token: str | None, max_results: int = 100
+    ) -> MessageListPage:
+        parameters: dict[str, object] = {
+            "userId": "me",
+            "q": query,
+            "pageToken": page_token,
+        }
+        if max_results != 100:
+            parameters["maxResults"] = max_results
+        response = await self._execute(
+            lambda: self._service.users().messages().list(**parameters).execute()
         )
         return MessageListPage(
             message_ids=_message_ids(response.get("messages")),

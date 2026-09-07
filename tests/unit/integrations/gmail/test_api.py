@@ -64,6 +64,9 @@ class GmailResources:
     def messages(self) -> GmailResources:
         return self
 
+    def threads(self) -> ThreadsResources:
+        return ThreadsResources(self)
+
     def _request(self, operation: str, kwargs: dict[str, object]) -> ExecutableRequest:
         assert threading.get_ident() != self.main_thread_id
         self.calls.append((operation, kwargs))
@@ -89,6 +92,14 @@ class GmailResources:
         self.close_calls += 1
         if self.close_failures:
             raise self.close_failures.pop(0)
+
+
+class ThreadsResources:
+    def __init__(self, parent: GmailResources) -> None:
+        self._parent = parent
+
+    def get(self, **kwargs: object) -> ExecutableRequest:
+        return self._parent._request("get_thread", kwargs)
 
 
 @pytest.mark.asyncio
@@ -126,6 +137,10 @@ async def test_gmail_client_emits_exact_requests_and_converts_provider_responses
             "sizeEstimate": 42,
             "historyId": "814",
         },
+        "get_thread": {
+            "id": "thread-1",
+            "messages": [{"id": "message-1", "threadId": "thread-1"}],
+        },
         "list_messages": {
             "messages": [
                 {"id": "message-3", "threadId": "thread-3"},
@@ -141,6 +156,7 @@ async def test_gmail_client_emits_exact_requests_and_converts_provider_responses
     watch = await client.watch("projects/evaai-507018/topics/eva-gmail-notifications")
     history = await client.list_history("812", "history-page-1")
     message = await client.get_message("message-1")
+    thread = await client.get_thread("thread-1")
     listed = await client.list_message_ids("after:1788105600 label:inbox", "message-page-1")
 
     assert profile.email_address == "owner@example.com"
@@ -151,6 +167,7 @@ async def test_gmail_client_emits_exact_requests_and_converts_provider_responses
     assert history.history_id == "814"
     assert history.next_page_token == "history-page-2"
     assert message == service.results["get_message"]
+    assert thread == service.results["get_thread"]
     assert listed.message_ids == ("message-3", "message-4")
     assert listed.next_page_token == "message-page-2"
     assert service.calls == [
@@ -176,6 +193,7 @@ async def test_gmail_client_emits_exact_requests_and_converts_provider_responses
             },
         ),
         ("get_message", {"userId": "me", "id": "message-1", "format": "full"}),
+        ("get_thread", {"userId": "me", "id": "thread-1", "format": "full"}),
         (
             "list_messages",
             {

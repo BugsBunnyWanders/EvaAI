@@ -32,7 +32,7 @@ class GooglePubSubPublisher:
         future = self._client.publish(
             topic,
             data,
-            message_type="event.available",
+            message_type=message.envelope.message_type,
             event_id=str(message.envelope.event_id),
             workspace_id=str(message.envelope.workspace_id),
         )

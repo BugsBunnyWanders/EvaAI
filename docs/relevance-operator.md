@@ -39,7 +39,8 @@ Exact ignore rules and malformed/unsupported/duplicate checks run first. Otherwi
 recommends relevance, importance, urgency, category, Goal matches, and an action. Application code
 owns the final `IGNORE`, `RECORD`, `NOTIFY`, or `INVESTIGATE` route. Only the latter two create or
 reuse a Gmail-thread Situation. This milestone does not send Telegram notifications, launch an
-investigator, call tools, or execute actions.
+investigator, call tools, or execute actions. Milestone 6 consumes the resulting `INVESTIGATE`
+Signal to schedule a separate AgentRun; it still does not notify the user or execute actions.
 
 ## GCP setup
 
@@ -73,7 +74,7 @@ The OpenAI request contains only:
 - at most 20 bounded active Goals; and
 - at most five bounded candidate Situations.
 
-HTML, attachments, raw headers, OAuth material, connector metadata, API keys, database URLs, full
+HTML, attachment bodies, raw headers, OAuth material, connector metadata, API keys, database URLs, full
 prompts, and raw model responses are excluded from persistence and logs. Requests use strict
 structured parsing, no tools, and `store=False`. That flag asks the API not to store the response;
 it is not a broader claim about all provider retention or abuse-monitoring policies.

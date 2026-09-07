@@ -5,8 +5,9 @@ from uuid import uuid7
 import pytest
 from sqlalchemy import func, select
 
+from eva_ai.agent.repository import AgentRunRepository
 from eva_ai.db import Database
-from eva_ai.db.models import RelevanceEvaluationAttempt, Signal, Situation
+from eva_ai.db.models import AgentRun, OutboxMessage, RelevanceEvaluationAttempt, Signal, Situation
 from eva_ai.events import EventAvailableMessage, EventProcessor, EventService
 from eva_ai.events.types import NewEvent, PrincipalType
 from eva_ai.relevance.classifier import RelevanceClassifierRunner, ScriptedRelevanceClassifier
@@ -64,8 +65,9 @@ async def ingest(
 
 def classifier_result(action: RelevanceDisposition) -> ClassifierResult:
     high = action is RelevanceDisposition.NOTIFY
+    investigate = action is RelevanceDisposition.INVESTIGATE
     return ClassifierResult(
-        relevance=0.9 if high else 0.4,
+        relevance=0.9 if high else (0.7 if investigate else 0.4),
         importance=0.8 if high else 0.4,
         urgency=0.7 if high else 0.3,
         confidence=0.9,
@@ -80,6 +82,7 @@ def handler(
     script: tuple[ClassifierResult | BaseException, ...],
     *,
     rules: RelevanceRuleSet | None = None,
+    schedule_agent: bool = False,
 ) -> tuple[RelevanceEventHandler, RelevanceRepository]:
     repository = RelevanceRepository(database)
     runner = RelevanceClassifierRunner(
@@ -104,6 +107,11 @@ def handler(
             classifier=runner,
             policy=policy,
             classifier_version="v1",
+            agent_runs=AgentRunRepository(database) if schedule_agent else None,
+            agent_destination="eva-agent-runs",
+            agent_model="gpt-5.6-sol",
+            agent_version="investigation-v1",
+            agent_prompt_version="investigation-prompt-v1",
             clock=lambda: NOW,
         ),
         repository,
@@ -122,7 +130,9 @@ async def test_ai_routes_signal_and_only_actionable_mail_to_situation(
 ) -> None:
     scope = await create_scope(database)
     message = await ingest(database, scope)
-    relevance_handler, repository = handler(database, (classifier_result(action),))
+    relevance_handler, repository = handler(
+        database, (classifier_result(action),), schedule_agent=True
+    )
 
     await EventProcessor(database, 300).process(message, relevance_handler, NOW)
 
@@ -137,6 +147,7 @@ async def test_ai_routes_signal_and_only_actionable_mail_to_situation(
     assert await count(database, Situation, scope) == expected_situations
     assert await count(database, Signal, scope) == 1
     assert await count(database, RelevanceEvaluationAttempt, scope) == 1
+    assert await count(database, AgentRun, scope) == 0
 
 
 @pytest.mark.integration
@@ -158,6 +169,37 @@ async def test_deterministic_ignore_skips_classifier_and_situation(database: Dat
     assert current.disposition is RelevanceDisposition.IGNORE
     assert await count(database, RelevanceEvaluationAttempt, scope) == 0
     assert await count(database, Situation, scope) == 0
+
+
+@pytest.mark.integration
+async def test_investigate_transactionally_schedules_one_agent_run(database: Database) -> None:
+    scope = await create_scope(database)
+    message = await ingest(database, scope)
+    relevance_handler, repository = handler(
+        database,
+        (classifier_result(RelevanceDisposition.INVESTIGATE),),
+        schedule_agent=True,
+    )
+
+    await EventProcessor(database, 300).process(message, relevance_handler, NOW)
+
+    current = await repository.get_current(
+        event_id=message.event_id,
+        user_id=scope.user_id,
+        workspace_id=scope.workspace_id,
+    )
+    assert current is not None and current.disposition is RelevanceDisposition.INVESTIGATE
+    assert await count(database, AgentRun, scope) == 1
+    async with database.session() as session:
+        agent_messages = await session.scalar(
+            select(func.count())
+            .select_from(OutboxMessage)
+            .where(
+                OutboxMessage.event_id == message.event_id,
+                OutboxMessage.message_type == "agent.run.requested",
+            )
+        )
+    assert agent_messages == 1
 
 
 @pytest.mark.integration

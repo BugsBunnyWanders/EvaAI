@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from eva_ai.agent.repository import AgentRunRepository
 from eva_ai.db.models import EventProcessing
 from eva_ai.db.session import Database
 from eva_ai.events.processor import EventCommit, StoredEvent
@@ -83,6 +84,12 @@ class PreparedRelevanceCommit:
     resolve_command: ResolveEvent
     correlation_key: str
     initial_snapshot: InitialSituationSnapshot
+    agent_runs: AgentRunRepository | None
+    agent_destination: str
+    agent_provider: str
+    agent_model: str
+    agent_version: str
+    agent_prompt_version: str
 
     async def apply(self, session: AsyncSession, committed_at: datetime) -> ProcessingStage:
         existing = await self.signals.get_by_evaluation_key_in_session(
@@ -111,7 +118,30 @@ class PreparedRelevanceCommit:
                 initial_snapshot=self.initial_snapshot,
             )
             situation_id = resolution.situation.id
-        await self.signals.persist_signal_in_session(session, self.draft, situation_id=situation_id)
+        signal = await self.signals.persist_signal_in_session(
+            session, self.draft, situation_id=situation_id
+        )
+        if (
+            self.agent_runs is not None
+            and signal.disposition is RelevanceDisposition.INVESTIGATE
+            and signal.situation_id is not None
+        ):
+            # Scheduling shares the Signal transaction so a committed investigation always has a
+            # durable outbox delivery, even if the worker stops immediately after commit.
+            await self.agent_runs.schedule_in_session(
+                session,
+                event_id=signal.event_id,
+                signal_id=signal.id,
+                situation_id=signal.situation_id,
+                user_id=signal.user_id,
+                workspace_id=signal.workspace_id,
+                destination=self.agent_destination,
+                provider=self.agent_provider,
+                model=self.agent_model,
+                agent_version=self.agent_version,
+                prompt_version=self.agent_prompt_version,
+                queued_at=committed_at,
+            )
         return (
             ProcessingStage.CORRELATED if situation_id is not None else ProcessingStage.CLASSIFIED
         )
@@ -128,6 +158,12 @@ class RelevanceEventHandler:
         classifier: RelevanceClassifierRunner,
         policy: RelevanceRoutingPolicy,
         classifier_version: str,
+        agent_runs: AgentRunRepository | None = None,
+        agent_destination: str = "eva-agent-runs",
+        agent_provider: str = "openai",
+        agent_model: str = "gpt-5.6-sol",
+        agent_version: str = "investigation-v1",
+        agent_prompt_version: str = "investigation-prompt-v1",
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._signals = signals
@@ -137,6 +173,12 @@ class RelevanceEventHandler:
         self._classifier = classifier
         self._policy = policy
         self._classifier_version = classifier_version
+        self._agent_runs = agent_runs
+        self._agent_destination = agent_destination
+        self._agent_provider = agent_provider
+        self._agent_model = agent_model
+        self._agent_version = agent_version
+        self._agent_prompt_version = agent_prompt_version
         self._clock = clock
 
     async def prepare(self, event: StoredEvent) -> EventCommit:
@@ -251,6 +293,12 @@ class RelevanceEventHandler:
             ),
             correlation_key=_gmail_correlation_key(event),
             initial_snapshot=_initial_snapshot(event),
+            agent_runs=self._agent_runs,
+            agent_destination=self._agent_destination,
+            agent_provider=self._agent_provider,
+            agent_model=self._agent_model,
+            agent_version=self._agent_version,
+            agent_prompt_version=self._agent_prompt_version,
         )
 
 

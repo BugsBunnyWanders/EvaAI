@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -7,11 +8,17 @@ from uuid import UUID, uuid7
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.engine import CursorResult
 
+from eva_ai.agent.types import AgentRunRequestedMessage
 from eva_ai.db.models import OutboxMessage
 from eva_ai.db.session import Database
 from eva_ai.events.errors import StaleClaimError, sanitize_error
 from eva_ai.events.publisher import Publisher
-from eva_ai.events.types import EventAvailableMessage, OutboundMessage, OutboxState
+from eva_ai.events.types import (
+    EventAvailableMessage,
+    OutboundEnvelope,
+    OutboundMessage,
+    OutboxState,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,7 +29,7 @@ class ClaimedOutboxMessage:
     claim_id: UUID
     event_id: UUID
     destination: str
-    envelope: EventAvailableMessage
+    envelope: OutboundEnvelope
     attempt_count: int
 
     def outbound(self) -> OutboundMessage:
@@ -83,7 +90,7 @@ class OutboxRelay:
                             claim_id=claim_id,
                             event_id=row.event_id,
                             destination=row.destination,
-                            envelope=EventAvailableMessage.model_validate(row.payload),
+                            envelope=_parse_envelope(row.message_type, row.payload),
                             attempt_count=row.attempt_count,
                         )
                     )
@@ -184,3 +191,11 @@ class OutboxRelay:
                 )
 
         return PublishBatchResult(len(claimed), published, failed)
+
+
+def _parse_envelope(message_type: str, payload: Mapping[str, object]) -> OutboundEnvelope:
+    if message_type == "event.available":
+        return EventAvailableMessage.model_validate(payload)
+    if message_type == "agent.run.requested":
+        return AgentRunRequestedMessage.model_validate(payload)
+    raise ValueError("unsupported outbox message type")

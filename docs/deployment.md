@@ -13,10 +13,11 @@ evaatyourservice.com                 eva-api (Cloud Run service)
                                        - Gmail pull
                                        - transactional outbox relay
                                        - relevance pull
+                                       - agent investigation pull
                                      eva-migrate (Cloud Run job)
                                      eva-gmail-maintenance (scheduled job)
                                      Cloud SQL PostgreSQL 17 + pgvector
-                                     Pub/Sub + Secret Manager
+                                     Pub/Sub (Gmail, events, agent runs) + Secret Manager
 ```
 
 The API scales to zero. The worker pool uses one manually scaled instance because pull consumers

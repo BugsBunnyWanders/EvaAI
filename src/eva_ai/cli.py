@@ -15,6 +15,7 @@ from uuid import UUID, uuid7
 
 from pydantic import BaseModel, JsonValue
 
+from eva_ai.agent.repository import AgentRunRepository
 from eva_ai.config import Settings, get_settings
 from eva_ai.connectors.gmail.bootstrap import ConnectGmail, GmailBootstrapService
 from eva_ai.connectors.gmail.maintenance import GmailMaintenanceService, MaintenanceSummary
@@ -62,6 +63,7 @@ from eva_ai.relevance.types import ReevaluateEvent
 from eva_ai.situations import SituationLifecycle, SituationRepository, SituationService
 from eva_ai.worker import (
     MemoryDependencies,
+    build_agent_dependencies,
     build_event_relay_dependencies,
     build_memory_dependencies,
     build_relevance_dependencies,
@@ -90,6 +92,9 @@ MemoryEpisodeListCommand = Callable[
 ]
 MemoryEpisodeSearchCommand = Callable[[UUID, UUID, str, int], Awaitable[None]]
 ContextBuildCommand = Callable[[UUID, UUID, UUID, str | None], Awaitable[None]]
+AgentRunShowCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
+AgentRunListCommand = Callable[[UUID, UUID, int], Awaitable[None]]
+AgentRunRetryCommand = Callable[[UUID, UUID, UUID], Awaitable[None]]
 DatabaseFactory = Callable[[str], Database]
 DependencyBuilder = Callable[[Settings], "GmailDependencies"]
 MemoryDependencyBuilder = Callable[..., MemoryDependencies]
@@ -147,6 +152,10 @@ class CommandFunctions:
     memory_episode_retract: MemoryRecordCommand = _unavailable_command
     memory_episode_search: MemoryEpisodeSearchCommand = _unavailable_command
     context_build: ContextBuildCommand = _unavailable_command
+    agent_pull: NoArgumentCommand = _unavailable_command
+    agent_run_show: AgentRunShowCommand = _unavailable_command
+    agent_run_list: AgentRunListCommand = _unavailable_command
+    agent_run_retry: AgentRunRetryCommand = _unavailable_command
 
 
 @dataclass(slots=True)
@@ -543,6 +552,19 @@ async def relevance_pull_command(*, settings: Settings) -> None:
     )
 
 
+async def agent_pull_command(*, settings: Settings) -> None:
+    dependencies = build_agent_dependencies(settings)
+    primary_failure: BaseException | None = None
+    try:
+        await dependencies.worker.run_forever()
+    except BaseException as error:
+        primary_failure = error
+    cleanup = await dependencies.close()
+    _raise_after_cleanup(
+        primary_failure, CleanupOutcome(cleanup.interruption, cleanup.ordinary_failure)
+    )
+
+
 async def worker_run_command(*, settings: Settings) -> None:
     """Run every continuous consumer as one Cloud Run worker-pool process."""
     # A failure in any loop cancels its siblings. Their command-level cleanup handlers then
@@ -551,6 +573,64 @@ async def worker_run_command(*, settings: Settings) -> None:
         group.create_task(gmail_pull_command(settings=settings), name="gmail-pull")
         group.create_task(events_relay_command(settings=settings), name="event-relay")
         group.create_task(relevance_pull_command(settings=settings), name="relevance-pull")
+        if settings.agent_enabled:
+            group.create_task(agent_pull_command(settings=settings), name="agent-pull")
+
+
+async def agent_run_show_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    run_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def show(database: Database) -> BaseModel | None:
+        return await AgentRunRepository(database).get(
+            run_id=run_id, user_id=user_id, workspace_id=workspace_id
+        )
+
+    _write_json(await _run_database_operation(settings, database_factory, show), stdout)
+
+
+async def agent_run_list_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    limit: int,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def list_runs(database: Database) -> tuple[BaseModel, ...]:
+        return await AgentRunRepository(database).list(
+            user_id=user_id, workspace_id=workspace_id, limit=limit
+        )
+
+    records = await _run_database_operation(settings, database_factory, list_runs)
+    _write_json({"count": len(records), "items": records}, stdout)
+
+
+async def agent_run_retry_command(
+    user_id: UUID,
+    workspace_id: UUID,
+    run_id: UUID,
+    *,
+    settings: Settings,
+    database_factory: DatabaseFactory = Database,
+    stdout: TextIO | None = None,
+) -> None:
+    async def retry(database: Database) -> BaseModel:
+        return await AgentRunRepository(database).retry(
+            run_id=run_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            destination=settings.agent_topic_id,
+            requested_at=_utc_now(),
+        )
+
+    _write_json(await _run_database_operation(settings, database_factory, retry), stdout)
 
 
 async def relevance_show_command(
@@ -886,6 +966,10 @@ def build_command_functions(settings: Settings) -> CommandFunctions:
         memory_episode_retract=partial(memory_episode_retract_command, settings=settings),
         memory_episode_search=partial(memory_episode_search_command, settings=settings),
         context_build=partial(context_build_command, settings=settings),
+        agent_pull=partial(agent_pull_command, settings=settings),
+        agent_run_show=partial(agent_run_show_command, settings=settings),
+        agent_run_list=partial(agent_run_list_command, settings=settings),
+        agent_run_retry=partial(agent_run_retry_command, settings=settings),
     )
 
 
@@ -934,6 +1018,19 @@ def build_parser() -> argparse.ArgumentParser:
     relevance_backfill = relevance_commands.add_parser("backfill")
     _add_scope_arguments(relevance_backfill)
     relevance_backfill.add_argument("--limit", type=_parse_limit, default=50)
+
+    agent = commands.add_parser("agent")
+    agent_commands = agent.add_subparsers(dest="agent_command", required=True)
+    agent_commands.add_parser("pull")
+    agent_run = agent_commands.add_parser("run")
+    agent_run_commands = agent_run.add_subparsers(dest="agent_run_command", required=True)
+    agent_run_list = agent_run_commands.add_parser("list")
+    _add_scope_arguments(agent_run_list)
+    agent_run_list.add_argument("--limit", type=_parse_limit, default=50)
+    for command_name in ("show", "retry"):
+        agent_run_record = agent_run_commands.add_parser(command_name)
+        _add_scope_arguments(agent_run_record)
+        agent_run_record.add_argument("--run-id", required=True, type=_parse_uuid)
 
     goal = commands.add_parser("goal")
     goal_commands = goal.add_subparsers(dest="goal_command", required=True)
@@ -1130,6 +1227,22 @@ async def _dispatch(arguments: argparse.Namespace, commands: CommandFunctions) -
         await commands.relevance_backfill(
             arguments.user_id, arguments.workspace_id, arguments.limit
         )
+    elif arguments.area == "agent" and arguments.agent_command == "pull":
+        await commands.agent_pull()
+    elif (
+        arguments.area == "agent"
+        and arguments.agent_command == "run"
+        and arguments.agent_run_command == "list"
+    ):
+        await commands.agent_run_list(arguments.user_id, arguments.workspace_id, arguments.limit)
+    elif arguments.area == "agent" and arguments.agent_command == "run":
+        command = {
+            "show": commands.agent_run_show,
+            "retry": commands.agent_run_retry,
+        }.get(arguments.agent_run_command)
+        if command is None:
+            raise CliValidationError("Command is unavailable")
+        await command(arguments.user_id, arguments.workspace_id, arguments.run_id)
     elif arguments.area == "goal" and arguments.goal_command == "create":
         await commands.goal_create(
             GoalDraft(
