@@ -15,13 +15,23 @@ locals {
     EVA_GMAIL_TOPIC_ID    = var.gmail_topic_id
   }
 
-  worker_environment = merge(local.common_environment, {
+  # Backlog synchronization can cross Gmail quota windows. Keep the database lease
+  # valid while the client performs bounded exponential backoff instead of restarting
+  # the entire history range and immediately consuming the same quota again.
+  gmail_sync_environment = {
+    EVA_GMAIL_SYNC_LEASE_SECONDS            = "900"
+    EVA_GMAIL_RETRY_ATTEMPTS                = "8"
+    EVA_GMAIL_RETRY_INITIAL_BACKOFF_SECONDS = "1.0"
+    EVA_GMAIL_RETRY_MAX_BACKOFF_SECONDS     = "60.0"
+  }
+
+  worker_environment = merge(local.common_environment, local.gmail_sync_environment, {
     EVA_GMAIL_SUBSCRIPTION_ID     = local.gmail_subscription
     EVA_RELEVANCE_ENABLED         = "true"
     EVA_RELEVANCE_SUBSCRIPTION_ID = local.events_subscription
   })
 
-  maintenance_environment = merge(local.common_environment, {
+  maintenance_environment = merge(local.common_environment, local.gmail_sync_environment, {
     EVA_GMAIL_SUBSCRIPTION_ID = local.gmail_subscription
     EVA_RELEVANCE_ENABLED     = "false"
   })
