@@ -4,7 +4,7 @@ from typing import Any, cast
 from uuid import uuid7
 
 import pytest
-from agents import MaxTurnsExceeded, RunConfig
+from agents import AgentOutputSchema, MaxTurnsExceeded, RunConfig
 from openai import AsyncOpenAI
 
 from eva_ai.conversation.errors import ConversationPermanentError
@@ -59,6 +59,7 @@ async def test_conversation_adapter_registers_only_context_appropriate_read_tool
 
     async def fake_run(agent: Any, input: str, **kwargs: object) -> Run:
         captured["tool_names"] = tuple(tool.name for tool in agent.tools)
+        captured["output_type"] = agent.output_type
         captured["instructions"] = agent.instructions
         captured["run_config"] = kwargs["run_config"]
         captured["max_turns"] = kwargs["max_turns"]
@@ -78,6 +79,8 @@ async def test_conversation_adapter_registers_only_context_appropriate_read_tool
     result = await adapter.respond(_request(is_email_situation), Reader())
 
     assert captured["tool_names"] == expected_tools
+    assert isinstance(captured["output_type"], AgentOutputSchema)
+    assert captured["output_type"].is_strict_json_schema() is False
     assert "authenticated Eva user" in str(captured["instructions"])
     assert "untrusted evidence" in str(captured["instructions"])
     assert "Earlier answer" in str(captured["input"])

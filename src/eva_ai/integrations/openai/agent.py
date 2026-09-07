@@ -5,6 +5,7 @@ from typing import Literal
 
 from agents import (
     Agent,
+    AgentOutputSchema,
     MaxTurnsExceeded,
     ModelBehaviorError,
     ModelSettings,
@@ -139,7 +140,13 @@ class OpenAIAgentsInvestigationAgent:
                 store=False,
             ),
             tools=[read_thread, search],
-            output_type=AgentInvestigationResult,
+            # Proposed actions intentionally accept JSON-valued arguments. Open objects cannot
+            # be represented by the API's strict schema subset, so retain Pydantic validation
+            # while allowing the Agents SDK to submit the complete domain schema.
+            output_type=AgentOutputSchema(
+                AgentInvestigationResult,
+                strict_json_schema=False,
+            ),
         )
         try:
             run = await Runner.run(
