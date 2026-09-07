@@ -4,7 +4,7 @@ from typing import Any, cast
 from uuid import uuid7
 
 import pytest
-from agents import MaxTurnsExceeded, RunConfig
+from agents import AgentOutputSchema, MaxTurnsExceeded, RunConfig
 from openai import AsyncOpenAI
 
 from eva_ai.agent.errors import AgentPermanentError, AgentToolBudgetExceeded
@@ -51,6 +51,7 @@ async def test_adapter_registers_only_read_tools_and_returns_typed_result(monkey
 
     async def fake_run(agent: Any, input: str, **kwargs: object) -> Run:
         captured["tool_names"] = tuple(tool.name for tool in agent.tools)
+        captured["output_type"] = agent.output_type
         captured["instructions"] = agent.instructions
         captured["run_config"] = kwargs["run_config"]
         captured["max_turns"] = kwargs["max_turns"]
@@ -69,6 +70,8 @@ async def test_adapter_registers_only_read_tools_and_returns_typed_result(monkey
     result = await adapter.investigate(_request(), Reader())
 
     assert captured["tool_names"] == ("gmail_read_thread", "gmail_search")
+    assert isinstance(captured["output_type"], AgentOutputSchema)
+    assert captured["output_type"].is_strict_json_schema() is False
     assert "untrusted evidence" in str(captured["instructions"])
     assert result.result == expected
     assert result.provider_response_id == "response-1"
