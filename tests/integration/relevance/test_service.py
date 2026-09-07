@@ -120,13 +120,17 @@ def handler(
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
-    ("action", "expected_situations"),
-    [(RelevanceDisposition.RECORD, 0), (RelevanceDisposition.NOTIFY, 1)],
+    ("action", "expected_situations", "expected_agent_runs"),
+    [
+        (RelevanceDisposition.RECORD, 0, 0),
+        (RelevanceDisposition.NOTIFY, 1, 1),
+    ],
 )
 async def test_ai_routes_signal_and_only_actionable_mail_to_situation(
     database: Database,
     action: RelevanceDisposition,
     expected_situations: int,
+    expected_agent_runs: int,
 ) -> None:
     scope = await create_scope(database)
     message = await ingest(database, scope)
@@ -147,7 +151,7 @@ async def test_ai_routes_signal_and_only_actionable_mail_to_situation(
     assert await count(database, Situation, scope) == expected_situations
     assert await count(database, Signal, scope) == 1
     assert await count(database, RelevanceEvaluationAttempt, scope) == 1
-    assert await count(database, AgentRun, scope) == 0
+    assert await count(database, AgentRun, scope) == expected_agent_runs
 
 
 @pytest.mark.integration

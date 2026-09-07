@@ -201,12 +201,12 @@ safety boundaries, configuration, examples, and smoke testing.
 
 ### Milestone 6: Agent investigation
 
-Milestone 6 launches a full agent only after the relevance policy chooses `INVESTIGATE`:
+Milestone 6 launches a full agent after the relevance policy chooses `NOTIFY` or `INVESTIGATE`:
 
 ```text
-INVESTIGATE Signal -> AgentRun + transactional outbox -> eva-agent-runs
-                   -> scoped context + read-only Gmail tools
-                   -> strict proposal-only AgentInvestigationResult
+NOTIFY/INVESTIGATE Signal -> AgentRun + transactional outbox -> eva-agent-runs
+                          -> scoped context + read-only Gmail tools
+                          -> strict proposal-only AgentInvestigationResult
 ```
 
 The same Cloud Run worker process now hosts a fourth agent-pull loop. Runs are leased, retried,

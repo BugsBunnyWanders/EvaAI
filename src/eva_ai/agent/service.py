@@ -29,6 +29,7 @@ from eva_ai.integrations.gmail.api import (
 from eva_ai.memory.context import MemoryContextBuilder
 from eva_ai.memory.errors import MemoryNotFoundError
 from eva_ai.memory.types import AgentWorkingContext
+from eva_ai.relevance.types import RelevanceDisposition
 
 
 class AgentInvestigationService:
@@ -81,12 +82,15 @@ class AgentInvestigationService:
 
         try:
             subject = await self._runs.load_subject(claim, self._body_max_chars)
-            if not subject.signal_is_current or subject.signal_disposition.value != "INVESTIGATE":
+            if not subject.signal_is_current or subject.signal_disposition not in {
+                RelevanceDisposition.NOTIFY,
+                RelevanceDisposition.INVESTIGATE,
+            }:
                 await self._record_failure(
                     claim,
                     retryable=False,
                     code="OBSOLETE_SIGNAL",
-                    summary="The triggering Signal is no longer current for investigation.",
+                    summary="The triggering Signal is no longer current for agent processing.",
                 )
                 return InvestigationOutcome.TERMINAL
             context = await self._context_builder.build_for_situation(

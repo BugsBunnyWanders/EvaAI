@@ -123,7 +123,8 @@ class PreparedRelevanceCommit:
         )
         if (
             self.agent_runs is not None
-            and signal.disposition is RelevanceDisposition.INVESTIGATE
+            and signal.disposition
+            in {RelevanceDisposition.NOTIFY, RelevanceDisposition.INVESTIGATE}
             and signal.situation_id is not None
         ):
             # Scheduling shares the Signal transaction so a committed investigation always has a

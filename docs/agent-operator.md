@@ -1,13 +1,12 @@
 # Agent investigation operator guide
 
-Milestone 6 gives Eva a bounded investigating agent for mail that the relevance policy routes to
-`INVESTIGATE`. Relevance remains the gate; the full agent is not invoked for `IGNORE`, `RECORD`, or
-`NOTIFY`.
+Milestone 6 gives Eva a bounded agent for mail that the relevance policy routes to `NOTIFY` or
+`INVESTIGATE`. Relevance remains the gate; the full agent is not invoked for `IGNORE` or `RECORD`.
 
 ## Runtime architecture
 
 ```text
-INVESTIGATE Signal + Situation
+NOTIFY/INVESTIGATE Signal + Situation
     -> same transaction: AgentRun + outbox message
     -> continuous outbox relay -> eva-agent-runs
     -> agent pull consumer claims AgentRun
@@ -87,6 +86,24 @@ A successful AgentRun can propose:
 
 Milestone 6 stores these proposals but applies none of them. Telegram consumes notification
 proposals in Milestone 7. Policy, approval, and external execution arrive in Milestone 8.
+
+For Gmail draft/send, the intended Milestone 8 flow is:
+
+```text
+Agent proposes exact recipients, subject, body, and thread
+    -> immutable ActionProposal
+    -> Eva asks for approval in Telegram
+    -> user approves that exact proposal
+    -> policy validates the approval and proposal have not changed
+    -> a separate Gmail executor drafts or sends once using an idempotency key
+    -> the result becomes a new Event
+```
+
+The investigating agent will not receive unrestricted Gmail write tools. Approval authorizes only
+the immutable proposal shown to the user; changing a recipient, subject, body, or thread requires a
+new proposal and new approval. The current connector grants only `gmail.readonly`; Milestone 8 will
+add the least-privileged Gmail compose/send scopes through explicit reauthorization before its
+separate executor can draft or send mail.
 
 ## Inspection and retry
 

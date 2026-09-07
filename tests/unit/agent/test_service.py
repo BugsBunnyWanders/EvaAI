@@ -142,6 +142,19 @@ async def test_service_persists_success_and_closes_gmail_client() -> None:
     assert client.closed is True
 
 
+async def test_service_processes_current_notify_signal() -> None:
+    message, subject, context = _fixture(disposition=RelevanceDisposition.NOTIFY)
+    runs = Runs(subject)
+    client = Client()
+    service = _service(runs, context, client, Agent())
+
+    outcome = await service.process(message)
+
+    assert outcome is InvestigationOutcome.SUCCEEDED
+    assert runs.completed is True
+    assert client.closed is True
+
+
 async def test_service_classifies_transient_agent_failure_for_retry() -> None:
     message, subject, context = _fixture()
     runs = Runs(subject)
@@ -192,7 +205,9 @@ def _service(
     )
 
 
-def _fixture() -> tuple[AgentRunRequestedMessage, AgentRunSubject, AgentWorkingContext]:
+def _fixture(
+    *, disposition: RelevanceDisposition = RelevanceDisposition.INVESTIGATE
+) -> tuple[AgentRunRequestedMessage, AgentRunSubject, AgentWorkingContext]:
     user_id, workspace_id, event_id, signal_id, situation_id, run_id = (
         uuid7(),
         uuid7(),
@@ -269,6 +284,6 @@ def _fixture() -> tuple[AgentRunRequestedMessage, AgentRunSubject, AgentWorkingC
         secret_reference="secret",
         gmail_thread_id="thread-1",
         signal_is_current=True,
-        signal_disposition=RelevanceDisposition.INVESTIGATE,
+        signal_disposition=disposition,
     )
     return message, subject, context

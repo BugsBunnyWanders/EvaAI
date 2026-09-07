@@ -5,17 +5,17 @@
 
 ## Objective
 
-Add Eva's first bounded investigating agent. Relevance remains the inexpensive gate: only a current
-`INVESTIGATE` Signal creates an AgentRun. The agent receives Situation-first memory context and may
-use narrowly scoped, read-only Gmail tools before returning a strict proposal object for later
-application layers.
+Add Eva's first bounded investigating agent. Relevance remains the inexpensive gate: a current
+`NOTIFY` or `INVESTIGATE` Signal creates an AgentRun. The agent receives Situation-first memory
+context and may use narrowly scoped, read-only Gmail tools before returning a strict proposal
+object for later application layers.
 
 Milestone 6 makes investigations durable and inspectable. It does not notify Telegram, mutate a
 Situation from model output, write memory automatically, or execute external actions.
 
 ## Decisions
 
-- Invoke the full agent only for `INVESTIGATE`; `IGNORE`, `RECORD`, and `NOTIFY` do not schedule an
+- Invoke the full agent for `NOTIFY` and `INVESTIGATE`; `IGNORE` and `RECORD` do not schedule an
   AgentRun.
 - Schedule the AgentRun and its outbox message in the same transaction that persists the Signal and
   resolves its Situation. A committed investigation cannot exist without a durable delivery record.
@@ -44,7 +44,7 @@ Situation from model output, write memory automatically, or execute external act
 Milestone 6 includes:
 
 - `AgentRun` persistence, leasing, idempotency, attempts, outcomes, and audit metadata
-- transactional scheduling from a newly persisted `INVESTIGATE` Signal
+- transactional scheduling from a newly persisted `NOTIFY` or `INVESTIGATE` Signal
 - a typed `agent.run.requested` outbox/Pub/Sub envelope
 - a continuous agent pull worker with ack/nack and retry classification
 - Situation-first context assembly using the Milestone 5 Context Builder
@@ -70,7 +70,7 @@ Milestone 6 excludes:
 ```text
 Gmail Event
     -> relevance screen/classifier
-    -> disposition is INVESTIGATE
+    -> disposition is NOTIFY or INVESTIGATE
     -> one database transaction:
          persist Signal
          resolve/link Situation
@@ -152,7 +152,10 @@ The SDK output type is a strict provider-neutral `AgentInvestigationResult`:
 Allowed decisions are `NO_ACTION`, `NOTIFY_USER`, `ASK_USER`, `PROPOSE_ACTION`, and `FOLLOW_UP`.
 Proposed actions describe intent and bounded arguments but cannot execute. Memory proposals reuse
 the Milestone 5 contract and remain unaccepted. The reasoning summary is a concise decision
-rationale, not chain of thought.
+rationale, not chain of thought. In Milestone 8, a Gmail draft/send proposal can become an immutable
+ActionProposal, but only a separate executor may use Gmail write capabilities after Telegram
+approval of that exact proposal and explicit connector reauthorization for least-privileged Gmail
+compose/send scopes.
 
 ## Agent Input
 
@@ -310,11 +313,11 @@ same tenant boundary as its Situation.
 - no direct side effects from successful agent output
 - worker composition and cleanup with the fourth loop
 - Terraform validation and production environment wiring
-- end-to-end PostgreSQL flow from `INVESTIGATE` Signal to persisted AgentRun result
+- end-to-end PostgreSQL flow from `NOTIFY`/`INVESTIGATE` Signal to persisted AgentRun result
 
 ## Acceptance Criteria
 
-- Only a current `INVESTIGATE` Signal transactionally schedules one logical AgentRun.
+- Only a current `NOTIFY` or `INVESTIGATE` Signal transactionally schedules one logical AgentRun.
 - Replaying relevance or Pub/Sub delivery cannot duplicate a logical run or successful model call.
 - The agent can read only the Situation's Gmail thread and bounded searches from its own connector.
 - All tool and context reads enforce User and Workspace scope in code and database constraints.

@@ -1,7 +1,7 @@
 # Milestone 6 Agent Investigation Implementation Plan
 
-**Goal:** Add durable, bounded agent investigations for `INVESTIGATE` Signals with read-only Gmail
-tools and strict proposal-only results.
+**Goal:** Add durable, bounded agent processing for `NOTIFY` and `INVESTIGATE` Signals with
+read-only Gmail tools and strict proposal-only results.
 
 **Architecture:** Relevance transactionally creates one AgentRun and outbox message. The existing
 relay publishes to a dedicated agent topic. A fourth loop in the existing worker pool claims the
@@ -42,9 +42,10 @@ Google Pub/Sub, OpenAI Agents SDK 0.22.x, pytest, Ruff, strict mypy, Terraform, 
 
 ## Task 3 — Transactional investigation scheduling
 
-- [x] Make `PreparedRelevanceCommit` capture the persisted Signal and schedule only `INVESTIGATE`.
+- [x] Make `PreparedRelevanceCommit` capture the persisted Signal and schedule `NOTIFY` and
+  `INVESTIGATE`.
 - [x] Insert AgentRun and `agent.run.requested` outbox rows in the same relevance transaction.
-- [x] Preserve behavior for existing Signals and `IGNORE`, `RECORD`, and `NOTIFY` dispositions.
+- [x] Preserve behavior for existing Signals and keep `IGNORE` and `RECORD` out of agent processing.
 - [x] Test initial evaluation, explicit reevaluation, backfill, transaction rollback, and replay.
 
 ## Task 4 — Typed outbox routing and Pub/Sub
