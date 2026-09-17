@@ -1,7 +1,7 @@
 # Milestone 8 Actions and Approval Design
 
 **Date:** 2026-09-17
-**Status:** Approved in conversation; pending written-spec review
+**Status:** Approved
 
 ## 1. Objective
 
