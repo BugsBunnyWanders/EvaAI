@@ -7,6 +7,7 @@ from uuid import uuid7
 
 from eva_ai.actions.canonical import CanonicalEmail
 from eva_ai.actions.contracts import ActionProposalPreparer
+from eva_ai.actions.service import ActionRevisionService
 from eva_ai.actions.types import (
     ActionProposalPreparation,
     ActionRevisionContext,
@@ -212,7 +213,7 @@ async def test_active_revision_routes_exact_draft_and_instruction_to_revision_ag
     revisions = Revisions()
     revision_agent = RevisionAgent()
     service = object.__new__(ConversationService)
-    service._action_revisions = revisions
+    service._action_revisions = cast(ActionRevisionService, revisions)
     service._revision_agent = revision_agent
     service._clock = lambda: now
     claim = ConversationTurnClaim(

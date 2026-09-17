@@ -16,10 +16,14 @@ evaatyourservice.com                 eva-api (Cloud Run service)
                                        - agent investigation pull
                                        - Telegram conversation pull
                                        - Telegram delivery pull
+                                       - action dispatch pull
+                                     eva-action-executor (private Cloud Run service)
+                                     Cloud Tasks (bounded Gmail action execution)
                                      eva-migrate (Cloud Run job)
                                      eva-gmail-maintenance (scheduled job)
                                      Cloud SQL PostgreSQL 17 + pgvector
-                                     Pub/Sub (Gmail, events, agent runs, Telegram) + Secret Manager
+                                     Pub/Sub (Gmail, events, agent runs, Telegram, actions)
+                                     Secret Manager
 ```
 
 The API scales to zero. The worker pool uses one manually scaled instance because pull consumers
@@ -78,6 +82,7 @@ authenticate. An owner therefore applies the small local-state bootstrap stack e
      --body "$(terraform -chdir=terraform/bootstrap output -raw deployer_service_account)"
    gh variable set EVA_WORKER_INSTANCE_COUNT --body 0
    gh variable set EVA_TELEGRAM_ENABLED --body false
+   gh variable set EVA_ACTIONS_ENABLED --body false
    ```
 
 6. In GitHub, create a `production` environment and restrict its deployment branches to `main`.
@@ -88,6 +93,9 @@ authenticate. An owner therefore applies the small local-state bootstrap stack e
 
 Bootstrap state contains IAM resource identifiers but no application secret values. Keep its local
 `terraform.tfstate` private and backed up; repository ignore rules prevent accidental commits.
+Reapply the bootstrap stack after pulling a release that adds a required API or deployer role. In
+particular, Milestone 8 adds the Cloud Tasks API and queue-administration permission; production
+Terraform cannot create its first action queue until that bootstrap update has been applied.
 
 ## Merge-to-main release
 
@@ -99,8 +107,10 @@ The existing `CI` workflow runs first. When it succeeds on `main`, `Deploy Eva t
 4. resolves and deploys the image by digest, never by a mutable tag;
 5. applies Terraform with the worker count at zero;
 6. executes `alembic upgrade head` as the `eva-migrate` Cloud Run job;
-7. applies the configured worker count; and
-8. calls the API readiness endpoint.
+7. applies the configured worker count;
+8. verifies that the action executor accepts only internal ingress and has no `allUsers` binding;
+   and
+9. calls the API readiness endpoint.
 
 Static-site-only merges remain handled by the Pages workflow and do not redeploy the backend. A
 manual run of `Deploy Eva to GCP` always performs a deployment from `main`.
@@ -123,6 +133,18 @@ active, enable the worker and manually rerun the deploy workflow:
 gh variable set EVA_WORKER_INSTANCE_COUNT --body 1
 gh workflow run "Deploy Eva to GCP"
 ```
+
+Keep `EVA_ACTIONS_ENABLED=false` until the Gmail connector has been reauthorized for
+`gmail.compose` and the controlled action smoke test is ready. Then enable the action paths and
+redeploy deliberately:
+
+```bash
+gh variable set EVA_ACTIONS_ENABLED --body true
+gh workflow run "Deploy Eva to GCP"
+```
+
+This flag enables proposal, approval, dispatch, and execution code in the API, shared worker, and
+private executor. It does not bypass exact Telegram approval for sending.
 
 Do not enable the worker against an empty connector database. Gmail notifications for an unknown
 account are acknowledged deliberately and would not be replayed later.

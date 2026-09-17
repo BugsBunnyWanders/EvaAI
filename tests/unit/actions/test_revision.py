@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from uuid import uuid7
 
 import pytest
@@ -6,7 +7,7 @@ import pytest
 from eva_ai.actions.canonical import CanonicalEmail
 from eva_ai.actions.errors import ActionValidationError
 from eva_ai.actions.service import ActionRevisionService
-from eva_ai.actions.types import DraftRevisionCandidate
+from eva_ai.actions.types import AllowedActionCreation, DraftRevisionCandidate, RevisionLookup
 
 NOW = datetime(2030, 1, 1, tzinfo=UTC)
 
@@ -83,9 +84,12 @@ class Store:
     def __init__(self) -> None:
         self.completed: tuple[object, ...] | None = None
 
-    async def complete_revision(self, **values: object) -> object:
+    async def load_revision(self, **values: object) -> RevisionLookup:
+        raise AssertionError(f"revision lookup was not expected: {tuple(values)}")
+
+    async def complete_revision(self, **values: object) -> AllowedActionCreation:
         self.completed = tuple(values.values())
-        return object()
+        return cast(AllowedActionCreation, object())
 
 
 async def test_completion_passes_validated_message_to_atomic_store() -> None:

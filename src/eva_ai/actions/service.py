@@ -57,7 +57,7 @@ class ActionRevisionStore(Protocol):
         conversation_turn_id: UUID | None,
         destination: str,
         now: datetime,
-    ) -> object: ...
+    ) -> AllowedActionCreation: ...
 
 
 class ActionRevisionService:
@@ -116,7 +116,7 @@ class ActionRevisionService:
         candidate: DraftRevisionCandidate,
         conversation_turn_id: UUID | None = None,
         now: datetime,
-    ) -> object:
+    ) -> AllowedActionCreation:
         replacement = self.validate_replacement(current, candidate)
         return await self._store.complete_revision(
             session_id=session_id,

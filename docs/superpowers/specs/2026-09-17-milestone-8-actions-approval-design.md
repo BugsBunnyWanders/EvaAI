@@ -2,6 +2,8 @@
 
 **Date:** 2026-09-17
 **Status:** Approved
+**Implementation:** Complete pending the deliberate production reauthorization and controlled live
+smoke recorded in `docs/operations/gmail-actions-smoke-test.md`.
 
 ## 1. Objective
 
@@ -575,6 +577,12 @@ Milestone 8 is complete when:
 - OAuth and logs preserve the documented privacy boundaries;
 - Terraform and CI deploy the new resources; and
 - automated tests and the controlled live smoke pass.
+
+The implementation includes the closed Gmail capability registry, durable action and managed-draft
+state, exact Telegram approvals, natural-language draft replacement, transactional outbox dispatch,
+bounded Cloud Tasks delivery, and a private IAM-authenticated executor. Automated verification runs
+before merge. OAuth consent expansion and the controlled live smoke remain explicit operator gates
+because they mutate a real Gmail account and cannot safely run in CI.
 
 ## 17. References
 

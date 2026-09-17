@@ -9,9 +9,7 @@ def _read(name: str) -> str:
 
 
 def test_cloud_tasks_queue_and_filtered_dispatch_subscription_are_bounded() -> None:
-    infrastructure = "\n".join(
-        (_read("pubsub.tf"), _read("variables.tf"), _read("locals.tf"))
-    )
+    infrastructure = "\n".join((_read("pubsub.tf"), _read("variables.tf"), _read("locals.tf")))
 
     assert 'resource "google_cloud_tasks_queue" "actions"' in infrastructure
     assert "max_concurrent_dispatches" in infrastructure

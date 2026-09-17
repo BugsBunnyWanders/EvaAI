@@ -27,6 +27,9 @@ class Client:
             raise self.error
         return object()
 
+    async def close(self) -> None:
+        pass
+
 
 def _enqueuer(client: Client) -> GoogleCloudTaskEnqueuer:
     return GoogleCloudTaskEnqueuer(
