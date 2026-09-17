@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal, Self
@@ -19,6 +20,19 @@ class GmailActionCapability(StrEnum):
     UPDATE_DRAFT = "gmail.update_draft"
     SEND_DRAFT = "gmail.send_draft"
     DELETE_DRAFT = "gmail.delete_draft"
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedActionProposal:
+    capability: GmailActionCapability
+    description: str
+    message: CanonicalEmail
+
+
+@dataclass(frozen=True, slots=True)
+class ActionProposalPreparation:
+    proposals: tuple[PreparedActionProposal, ...] = ()
+    clarification: str | None = None
 
 
 class ActionOrigin(StrEnum):

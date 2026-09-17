@@ -1,12 +1,24 @@
 import asyncio
 from contextlib import suppress
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import cast
 from uuid import uuid7
 
-from eva_ai.conversation.repository import ConversationRepository, ConversationTurnClaim
+from eva_ai.actions.contracts import ActionProposalPreparer
+from eva_ai.actions.types import ActionProposalPreparation
+from eva_ai.agent.types import AgentUsage, ProposedAction
+from eva_ai.conversation.repository import (
+    ConversationRepository,
+    ConversationTurnClaim,
+    ConversationTurnSubject,
+)
 from eva_ai.conversation.service import ConversationService
-from eva_ai.conversation.types import ConversationOutcome
+from eva_ai.conversation.types import (
+    ConversationAgentResult,
+    ConversationInvocationResult,
+    ConversationOutcome,
+)
 from eva_ai.telegram.contracts import TelegramGateway
 
 
@@ -21,6 +33,53 @@ class Telegram:
         self.called.set()
         if self.fail:
             raise RuntimeError("provider unavailable")
+
+
+class ProposalPreparer:
+    def __init__(self) -> None:
+        self.values: dict[str, object] | None = None
+
+    async def prepare_model_proposals(
+        self, proposals: tuple[ProposedAction, ...], **values: object
+    ) -> ActionProposalPreparation:
+        self.values = {"proposals": proposals, **values}
+        return ActionProposalPreparation(clarification="Which address should I use?")
+
+
+async def test_conversation_prepares_reactive_action_with_scoped_subject() -> None:
+    preparer = ProposalPreparer()
+    service = object.__new__(ConversationService)
+    service._action_proposals = cast(ActionProposalPreparer, preparer)
+    proposal = ProposedAction(
+        capability="gmail.create_draft",
+        description="Create a draft",
+        arguments={},
+    )
+    invocation = ConversationInvocationResult(
+        result=ConversationAgentResult(
+            message="I can draft that.",
+            reasoning_summary="The user requested a draft.",
+            proposed_actions=(proposal,),
+        ),
+        usage=AgentUsage(),
+    )
+    subject = cast(
+        ConversationTurnSubject,
+        SimpleNamespace(
+            gmail_thread_id="thread-1",
+            connector_identity="owner@example.com",
+        ),
+    )
+
+    result = await service._prepare_actions(invocation, None, subject)
+
+    assert result.clarification == "Which address should I use?"
+    assert preparer.values == {
+        "proposals": (proposal,),
+        "reader": None,
+        "allowed_thread_id": "thread-1",
+        "account_identity": "owner@example.com",
+    }
 
 
 async def test_typing_refresh_starts_immediately_and_repeats() -> None:

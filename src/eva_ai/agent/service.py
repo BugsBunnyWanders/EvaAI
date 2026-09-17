@@ -3,6 +3,8 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
+from eva_ai.actions.contracts import ActionProposalPreparer
+from eva_ai.actions.types import ActionProposalPreparation
 from eva_ai.agent.contracts import AgentInvocationResult, InvestigationAgent
 from eva_ai.agent.errors import AgentPermanentError, AgentScopeError, AgentTransientError
 from eva_ai.agent.gmail import ScopedGmailInvestigationReader
@@ -50,6 +52,7 @@ class AgentInvestigationService:
         search_result_limit: int,
         body_max_chars: int,
         memory_learner: MemoryLearningService | None = None,
+        action_proposals: ActionProposalPreparer | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._runs = runs
@@ -65,6 +68,7 @@ class AgentInvestigationService:
         self._search_result_limit = search_result_limit
         self._body_max_chars = body_max_chars
         self._memory_learner = memory_learner
+        self._action_proposals = action_proposals
         self._clock = clock
 
     async def process(self, message: AgentRunRequestedMessage) -> InvestigationOutcome:
@@ -120,7 +124,7 @@ class AgentInvestigationService:
             grant = await self._credential_store.get(subject.secret_reference)
             gmail_client = await self._gmail_clients.create(grant)
 
-            async def investigate() -> AgentInvocationResult:
+            async def investigate() -> tuple[AgentInvocationResult, ActionProposalPreparation]:
                 reader = ScopedGmailInvestigationReader(
                     gmail_client,
                     connector_id=subject.connector_id,
@@ -131,9 +135,18 @@ class AgentInvestigationService:
                     search_result_limit=self._search_result_limit,
                     body_max_chars=self._body_max_chars,
                 )
-                return await self._agent.investigate(request, reader)
+                invocation = await self._agent.investigate(request, reader)
+                preparation = ActionProposalPreparation()
+                if self._action_proposals is not None:
+                    preparation = await self._action_proposals.prepare_model_proposals(
+                        invocation.result.proposed_actions,
+                        reader=reader,
+                        allowed_thread_id=subject.gmail_thread_id,
+                        account_identity=subject.account_identity,
+                    )
+                return invocation, preparation
 
-            invocation = await use_gmail_client(gmail_client, investigate)
+            invocation, preparation = await use_gmail_client(gmail_client, investigate)
             completed_at = self._clock()
             await self._runs.complete(
                 claim,
@@ -142,6 +155,7 @@ class AgentInvestigationService:
                 provider_response_id=invocation.provider_response_id,
                 usage=invocation.usage,
                 tool_audit=invocation.tool_audit,
+                prepared_actions=preparation.proposals,
                 completed_at=completed_at,
             )
             if self._memory_learner is not None:

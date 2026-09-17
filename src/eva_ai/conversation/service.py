@@ -3,6 +3,8 @@ from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 
+from eva_ai.actions.contracts import ActionProposalPreparer
+from eva_ai.actions.types import ActionProposalPreparation
 from eva_ai.agent.errors import AgentPermanentError, AgentToolBudgetExceeded
 from eva_ai.agent.gmail import ScopedGmailInvestigationReader
 from eva_ai.agent.types import AgentUsage
@@ -62,6 +64,7 @@ class ConversationService:
         search_result_limit: int,
         body_max_chars: int,
         memory_learner: MemoryLearningService | None = None,
+        action_proposals: ActionProposalPreparer | None = None,
         telegram: TelegramGateway | None = None,
         typing_refresh_seconds: float = 4.0,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -82,6 +85,7 @@ class ConversationService:
         self._search_result_limit = search_result_limit
         self._body_max_chars = body_max_chars
         self._memory_learner = memory_learner
+        self._action_proposals = action_proposals
         self._telegram = telegram
         self._typing_refresh_seconds = typing_refresh_seconds
         self._clock = clock
@@ -138,17 +142,18 @@ class ConversationService:
                 context=context,
                 is_email_situation=subject.situation_type is SituationType.EMAIL_THREAD,
             )
-            invocation = await self._respond(subject, request)
+            invocation, preparation = await self._respond(subject, request)
             completed_at = self._clock()
             await self._conversations.complete(
                 claim,
-                response_text=invocation.result.message,
+                response_text=preparation.clarification or invocation.result.message,
                 agent_version=self._agent_version,
                 provider_response_id=invocation.provider_response_id,
                 usage=invocation.usage,
                 tool_audit=invocation.tool_audit,
                 reasoning_summary=invocation.result.reasoning_summary,
                 proposed_actions=invocation.result.proposed_actions,
+                prepared_actions=preparation.proposals,
                 memory_proposals=invocation.result.memory_proposals,
                 completed_at=completed_at,
             )
@@ -206,18 +211,20 @@ class ConversationService:
 
     async def _respond(
         self, subject: ConversationTurnSubject, request: ConversationAgentRequest
-    ) -> ConversationInvocationResult:
+    ) -> tuple[ConversationInvocationResult, ActionProposalPreparation]:
         if subject.connector_id is None or subject.secret_reference is None:
-            return await self._agent.respond(request, None)
+            invocation = await self._agent.respond(request, None)
+            return invocation, await self._prepare_actions(invocation, None, subject)
         connector_id = subject.connector_id
         secret_reference = subject.secret_reference
         try:
             grant = await self._credential_store.get(secret_reference)
             gmail_client = await self._gmail_clients.create(grant)
         except AuthorizationRevoked, InvalidAuthorizedUserCredentials:
-            return await self._agent.respond(request, None)
+            invocation = await self._agent.respond(request, None)
+            return invocation, await self._prepare_actions(invocation, None, subject)
 
-        async def respond() -> ConversationInvocationResult:
+        async def respond() -> tuple[ConversationInvocationResult, ActionProposalPreparation]:
             reader = ScopedGmailInvestigationReader(
                 gmail_client,
                 connector_id=connector_id,
@@ -228,9 +235,25 @@ class ConversationService:
                 search_result_limit=self._search_result_limit,
                 body_max_chars=self._body_max_chars,
             )
-            return await self._agent.respond(request, reader)
+            invocation = await self._agent.respond(request, reader)
+            return invocation, await self._prepare_actions(invocation, reader, subject)
 
         return await use_gmail_client(gmail_client, respond)
+
+    async def _prepare_actions(
+        self,
+        invocation: ConversationInvocationResult,
+        reader: ScopedGmailInvestigationReader | None,
+        subject: ConversationTurnSubject,
+    ) -> ActionProposalPreparation:
+        if self._action_proposals is None:
+            return ActionProposalPreparation()
+        return await self._action_proposals.prepare_model_proposals(
+            invocation.result.proposed_actions,
+            reader=reader,
+            allowed_thread_id=subject.gmail_thread_id,
+            account_identity=subject.connector_identity or "",
+        )
 
     async def _retry(self, claim: ConversationTurnClaim, code: str) -> ConversationOutcome:
         if claim.attempt_count >= self._max_attempts:

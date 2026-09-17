@@ -7,6 +7,8 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from eva_ai.actions.contracts import ActionProposalWriter
+from eva_ai.actions.types import ActionOrigin, PreparedActionProposal
 from eva_ai.agent.errors import AgentConflictError, AgentNotFoundError, AgentScopeError
 from eva_ai.agent.types import (
     AgentEventContext,
@@ -46,13 +48,20 @@ class AgentRunSubject:
     gmail_thread_id: str
     signal_is_current: bool
     signal_disposition: RelevanceDisposition
+    account_identity: str = ""
 
 
 class AgentRunRepository:
-    def __init__(self, database: Database, notification_destination: str | None = None) -> None:
+    def __init__(
+        self,
+        database: Database,
+        notification_destination: str | None = None,
+        action_proposals: ActionProposalWriter | None = None,
+    ) -> None:
         self._database = database
         self._notification_destination = notification_destination
         self._notifications = NotificationRepository(database)
+        self._action_proposals = action_proposals
 
     async def schedule_in_session(
         self,
@@ -241,6 +250,7 @@ class AgentRunRepository:
             gmail_thread_id=thread_id,
             signal_is_current=signal.is_current,
             signal_disposition=RelevanceDisposition(signal.disposition),
+            account_identity=connector.account_identity,
         )
 
     async def complete(
@@ -252,6 +262,7 @@ class AgentRunRepository:
         provider_response_id: str | None,
         usage: AgentUsage,
         tool_audit: tuple[ToolCallAudit, ...],
+        prepared_actions: tuple[PreparedActionProposal, ...] = (),
         completed_at: datetime,
     ) -> AgentRunRecord:
         statement = (
@@ -299,6 +310,40 @@ class AgentRunRepository:
                         destination=self._notification_destination,
                         created_at=completed_at,
                     )
+                if prepared_actions and self._action_proposals is not None:
+                    connector_id = await session.scalar(
+                        select(ConnectorAccount.id)
+                        .join(
+                            Event,
+                            and_(
+                                Event.principal_id == ConnectorAccount.id,
+                                Event.workspace_id == ConnectorAccount.workspace_id,
+                                Event.user_id == ConnectorAccount.user_id,
+                            ),
+                        )
+                        .where(
+                            Event.id == row.event_id,
+                            Event.workspace_id == row.workspace_id,
+                            Event.user_id == row.user_id,
+                            ConnectorAccount.provider == "gmail",
+                        )
+                    )
+                    if connector_id is not None:
+                        # Completion, proposal, action, and outbox intent share one transaction.
+                        await self._action_proposals.create_from_model_proposals_in_session(
+                            session,
+                            proposals=prepared_actions,
+                            user_id=row.user_id,
+                            workspace_id=row.workspace_id,
+                            connector_account_id=connector_id,
+                            event_id=row.event_id,
+                            situation_id=row.situation_id,
+                            agent_run_id=row.id,
+                            conversation_turn_id=None,
+                            origin=ActionOrigin.AGENT_RUN,
+                            source_prefix=f"agent-run:{row.id}",
+                            created_at=completed_at,
+                        )
                 return _record(row)
 
     async def fail(
