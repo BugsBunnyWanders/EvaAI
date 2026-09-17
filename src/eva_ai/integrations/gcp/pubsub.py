@@ -29,12 +29,14 @@ class GooglePubSubPublisher:
     async def publish(self, message: OutboundMessage) -> str:
         topic = self._client.topic_path(self._project_id, message.destination)
         data = message.envelope.model_dump_json().encode("utf-8")
-        future = self._client.publish(
-            topic,
-            data,
-            message_type=message.envelope.message_type,
-            event_id=str(message.envelope.event_id),
-            workspace_id=str(message.envelope.workspace_id),
-        )
+        attributes = {
+            "message_type": message.envelope.message_type,
+            "workspace_id": str(message.envelope.workspace_id),
+        }
+        # Not every outbox envelope represents an Event; action dispatch is keyed by action_id.
+        event_id = getattr(message.envelope, "event_id", None)
+        if event_id is not None:
+            attributes["event_id"] = str(event_id)
+        future = self._client.publish(topic, data, **attributes)
         # Pub/Sub returns a blocking Future, so wait in a thread instead of blocking asyncio.
         return await asyncio.to_thread(future.result)
