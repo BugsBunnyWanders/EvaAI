@@ -7,7 +7,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from eva_ai.actions.canonical import CanonicalEmail
+from eva_ai.actions.canonical import CanonicalEmail, canonical_email_hash
 from eva_ai.actions.errors import ActionConflictError, ActionScopeError, ActionValidationError
 from eva_ai.actions.types import (
     ActionClaim,
@@ -19,6 +19,7 @@ from eva_ai.actions.types import (
     ActionProposalRecord,
     ActionProposalStatus,
     ActionRecord,
+    ActionRevisionContext,
     ActionStatus,
     ActionTaskRequest,
     AllowedActionCreation,
@@ -32,19 +33,25 @@ from eva_ai.actions.types import (
     ManagedGmailDraftRecord,
     NewActionProposal,
     PolicyDecision,
+    RevisionLookup,
+    RevisionLookupStatus,
+    RevisionSessionStatus,
     TelegramApprovalPrincipal,
 )
 from eva_ai.agent.types import NotificationUrgency
 from eva_ai.connectors.types import ConnectorStatus
+from eva_ai.conversation.types import ConversationKind, ConversationStatus
 from eva_ai.db.models import (
     Action,
     ActionApproval,
     ActionProposal,
     ActionResult,
+    ActionRevisionSession,
     ConnectorAccount,
     ManagedGmailDraft,
     OutboxMessage,
     TelegramAccount,
+    TelegramConversation,
 )
 from eva_ai.db.session import Database
 from eva_ai.events.types import OutboxState
@@ -57,6 +64,8 @@ _ACTION_NAMESPACE = UUID("764d2480-cac1-54f4-bc39-df6aac87faef")
 _OUTBOX_NAMESPACE = UUID("f6161c88-4f27-52c6-a4bd-91d49bb6d786")
 _DRAFT_NAMESPACE = UUID("98f8db31-dc4b-595f-b0c6-067d14438502")
 _APPROVAL_NAMESPACE = UUID("f1af2fa2-1528-531b-a7f8-2f3e65f63657")
+_REVISION_NAMESPACE = UUID("ea6b5ebc-d8d2-572a-8af5-22d09122c33b")
+_CONVERSATION_NAMESPACE = UUID("5307d944-4cb9-52aa-b66f-69010b43345a")
 
 
 class ActionRepository:
@@ -1033,6 +1042,314 @@ class ActionRepository:
                     proposal.terminal_at = now
                     await session.flush()
                 return _approval_record(approval)
+
+    async def open_revision(
+        self,
+        *,
+        callback_token_digest: str,
+        telegram_account_id: UUID,
+        chat_id: int,
+        revision_ttl: timedelta,
+        now: datetime,
+    ) -> ApprovalRecord:
+        if revision_ttl <= timedelta(0):
+            raise ActionValidationError("revision lifetime must be positive")
+        async with self._database.session() as session:
+            async with session.begin():
+                values = (
+                    await session.execute(
+                        select(ActionApproval, ActionProposal)
+                        .join(
+                            ActionProposal,
+                            and_(
+                                ActionProposal.id == ActionApproval.proposal_id,
+                                ActionProposal.workspace_id == ActionApproval.workspace_id,
+                                ActionProposal.user_id == ActionApproval.user_id,
+                            ),
+                        )
+                        .where(ActionApproval.callback_token_digest == callback_token_digest)
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if values is None:
+                    raise ActionScopeError("approval is unavailable")
+                approval, proposal = values
+                if (
+                    approval.telegram_account_id != telegram_account_id
+                    or approval.provider_chat_id != chat_id
+                ):
+                    raise ActionScopeError("approval is unavailable")
+                if approval.status != ApprovalStatus.PENDING:
+                    return _approval_record(approval)
+                if now >= approval.expires_at:
+                    approval.status = ApprovalStatus.EXPIRED
+                    approval.decided_at = now
+                    proposal.status = ActionProposalStatus.EXPIRED
+                    proposal.terminal_at = now
+                    await session.flush()
+                    return _approval_record(approval)
+                if proposal.situation_id is None:
+                    raise ActionValidationError("revision requires a scoped Situation")
+                managed = await session.scalar(
+                    select(ManagedGmailDraft)
+                    .where(
+                        ManagedGmailDraft.active_send_proposal_id == proposal.id,
+                        ManagedGmailDraft.workspace_id == proposal.workspace_id,
+                        ManagedGmailDraft.user_id == proposal.user_id,
+                    )
+                    .with_for_update()
+                )
+                if (
+                    managed is None
+                    or managed.current_content_hash != proposal.parameters_hash
+                    or approval.parameters_hash != proposal.parameters_hash
+                ):
+                    approval.status = ApprovalStatus.SUPERSEDED
+                    approval.decided_at = now
+                    proposal.status = ActionProposalStatus.SUPERSEDED
+                    proposal.terminal_at = now
+                    await session.flush()
+                    return _approval_record(approval)
+
+                conversation = await session.scalar(
+                    select(TelegramConversation)
+                    .where(
+                        TelegramConversation.telegram_account_id == telegram_account_id,
+                        TelegramConversation.situation_id == proposal.situation_id,
+                        TelegramConversation.workspace_id == proposal.workspace_id,
+                        TelegramConversation.user_id == proposal.user_id,
+                    )
+                    .with_for_update()
+                )
+                if conversation is None:
+                    conversation = TelegramConversation(
+                        id=uuid5(
+                            _CONVERSATION_NAMESPACE,
+                            f"situation:{telegram_account_id}:{proposal.situation_id}",
+                        ),
+                        user_id=proposal.user_id,
+                        workspace_id=proposal.workspace_id,
+                        telegram_account_id=telegram_account_id,
+                        situation_id=proposal.situation_id,
+                        kind=ConversationKind.SITUATION,
+                        status=ConversationStatus.ACTIVE,
+                        summary="",
+                        next_sequence=1,
+                        last_activity_at=now,
+                    )
+                    session.add(conversation)
+                    await session.flush()
+                else:
+                    conversation.status = ConversationStatus.ACTIVE
+                    conversation.last_activity_at = now
+
+                # Only one instruction may target an account at a time. Closing the prior session
+                # before the insert also satisfies the partial unique index atomically.
+                await session.execute(
+                    update(ActionRevisionSession)
+                    .where(
+                        ActionRevisionSession.telegram_account_id == telegram_account_id,
+                        ActionRevisionSession.workspace_id == proposal.workspace_id,
+                        ActionRevisionSession.user_id == proposal.user_id,
+                        ActionRevisionSession.status == RevisionSessionStatus.ACTIVE,
+                    )
+                    .values(
+                        status=RevisionSessionStatus.CANCELLED,
+                        completed_at=now,
+                    )
+                )
+                approval.status = ApprovalStatus.SUPERSEDED
+                approval.decided_at = now
+                proposal.status = ActionProposalStatus.SUPERSEDED
+                proposal.terminal_at = now
+                revision = ActionRevisionSession(
+                    id=uuid5(_REVISION_NAMESPACE, str(approval.id)),
+                    user_id=proposal.user_id,
+                    workspace_id=proposal.workspace_id,
+                    telegram_account_id=telegram_account_id,
+                    conversation_id=conversation.id,
+                    managed_draft_id=managed.id,
+                    active_send_proposal_id=proposal.id,
+                    status=RevisionSessionStatus.ACTIVE,
+                    created_at=now,
+                    expires_at=now + revision_ttl,
+                )
+                session.add(revision)
+                await session.flush()
+                if self._notification_destination is not None:
+                    await self._notifications.create_in_session(
+                        session,
+                        event_id=proposal.event_id,
+                        user_id=proposal.user_id,
+                        workspace_id=proposal.workspace_id,
+                        situation_id=proposal.situation_id,
+                        agent_run_id=proposal.agent_run_id,
+                        kind=NotificationKind.REACTIVE,
+                        urgency=NotificationUrgency.MEDIUM,
+                        message="Tell me what you’d like to change in this draft.",
+                        dedupe_key=f"action-revision:{revision.id}",
+                        destination=self._notification_destination,
+                        created_at=now,
+                    )
+                return _approval_record(approval)
+
+    async def load_revision(
+        self,
+        *,
+        telegram_account_id: UUID,
+        user_id: UUID,
+        workspace_id: UUID,
+        now: datetime,
+    ) -> RevisionLookup:
+        async with self._database.session() as session:
+            async with session.begin():
+                revision = await session.scalar(
+                    select(ActionRevisionSession)
+                    .where(
+                        ActionRevisionSession.telegram_account_id == telegram_account_id,
+                        ActionRevisionSession.user_id == user_id,
+                        ActionRevisionSession.workspace_id == workspace_id,
+                        ActionRevisionSession.status == RevisionSessionStatus.ACTIVE,
+                    )
+                    .with_for_update()
+                )
+                if revision is None:
+                    return RevisionLookup(status=RevisionLookupStatus.NONE)
+                if now >= revision.expires_at:
+                    revision.status = RevisionSessionStatus.EXPIRED
+                    revision.completed_at = now
+                    await session.flush()
+                    return RevisionLookup(status=RevisionLookupStatus.EXPIRED)
+                proposal = await session.scalar(
+                    select(ActionProposal).where(
+                        ActionProposal.id == revision.active_send_proposal_id,
+                        ActionProposal.user_id == user_id,
+                        ActionProposal.workspace_id == workspace_id,
+                    )
+                )
+                managed = await session.scalar(
+                    select(ManagedGmailDraft).where(
+                        ManagedGmailDraft.id == revision.managed_draft_id,
+                        ManagedGmailDraft.user_id == user_id,
+                        ManagedGmailDraft.workspace_id == workspace_id,
+                    )
+                )
+                if (
+                    proposal is None
+                    or managed is None
+                    or managed.active_send_proposal_id != proposal.id
+                    or managed.current_content_hash != proposal.parameters_hash
+                ):
+                    raise ActionScopeError("revision draft is unavailable")
+                return RevisionLookup(
+                    status=RevisionLookupStatus.ACTIVE,
+                    context=ActionRevisionContext(
+                        session_id=revision.id,
+                        conversation_id=revision.conversation_id,
+                        managed_draft_id=revision.managed_draft_id,
+                        active_send_proposal_id=revision.active_send_proposal_id,
+                        current_message=CanonicalEmail.model_validate(proposal.parameters_json),
+                        expires_at=revision.expires_at,
+                    ),
+                )
+
+    async def complete_revision(
+        self,
+        *,
+        session_id: UUID,
+        replacement: CanonicalEmail,
+        conversation_turn_id: UUID | None,
+        destination: str,
+        now: datetime,
+    ) -> AllowedActionCreation:
+        async with self._database.session() as session:
+            async with session.begin():
+                revision = await session.scalar(
+                    select(ActionRevisionSession)
+                    .where(
+                        ActionRevisionSession.id == session_id,
+                        ActionRevisionSession.status == RevisionSessionStatus.ACTIVE,
+                    )
+                    .with_for_update()
+                )
+                if revision is None:
+                    raise ActionScopeError("revision session is unavailable")
+                if now >= revision.expires_at:
+                    revision.status = RevisionSessionStatus.EXPIRED
+                    revision.completed_at = now
+                    raise ActionValidationError("revision session expired")
+                send_proposal = await session.scalar(
+                    select(ActionProposal)
+                    .where(
+                        ActionProposal.id == revision.active_send_proposal_id,
+                        ActionProposal.user_id == revision.user_id,
+                        ActionProposal.workspace_id == revision.workspace_id,
+                    )
+                    .with_for_update()
+                )
+                managed = await session.scalar(
+                    select(ManagedGmailDraft)
+                    .where(
+                        ManagedGmailDraft.id == revision.managed_draft_id,
+                        ManagedGmailDraft.user_id == revision.user_id,
+                        ManagedGmailDraft.workspace_id == revision.workspace_id,
+                    )
+                    .with_for_update()
+                )
+                if (
+                    send_proposal is None
+                    or managed is None
+                    or managed.active_send_proposal_id != send_proposal.id
+                    or managed.current_content_hash != send_proposal.parameters_hash
+                ):
+                    raise ActionScopeError("revision draft is unavailable")
+
+                source_key = f"revision:{revision.id}:update"
+                proposal_id = uuid5(
+                    _PROPOSAL_NAMESPACE,
+                    f"{revision.workspace_id}:{revision.user_id}:{source_key}",
+                )
+                update_proposal = ActionProposal(
+                    id=proposal_id,
+                    user_id=revision.user_id,
+                    workspace_id=revision.workspace_id,
+                    connector_account_id=send_proposal.connector_account_id,
+                    event_id=send_proposal.event_id,
+                    situation_id=send_proposal.situation_id,
+                    goal_id=send_proposal.goal_id,
+                    agent_run_id=send_proposal.agent_run_id,
+                    conversation_turn_id=conversation_turn_id,
+                    supersedes_proposal_id=send_proposal.id,
+                    source_key=source_key,
+                    proposal_family_key=f"managed-draft:{managed.id}:update",
+                    origin=ActionOrigin.TELEGRAM_USER,
+                    capability=GmailActionCapability.UPDATE_DRAFT,
+                    parameters_json=replacement.model_dump(mode="json"),
+                    parameters_hash=canonical_email_hash(replacement),
+                    description="Update the exact Eva-managed Gmail draft",
+                    risk_level="medium",
+                    policy_decision=PolicyDecision.ALLOW,
+                    status=ActionProposalStatus.QUEUED,
+                    version=managed.send_proposal_version + 1,
+                    created_at=now,
+                )
+                session.add(update_proposal)
+                await session.flush()
+                action = await self._queue_action_in_session(
+                    session,
+                    proposal=update_proposal,
+                    destination=destination,
+                    queued_at=now,
+                )
+                managed.status = ManagedDraftStatus.UPDATING
+                managed.updated_at = now
+                revision.status = RevisionSessionStatus.COMPLETED
+                revision.completed_at = now
+                await session.flush()
+                return AllowedActionCreation(
+                    proposal=_proposal_record(update_proposal),
+                    action=_action_record(action),
+                )
 
     async def discard_and_queue_delete(
         self,

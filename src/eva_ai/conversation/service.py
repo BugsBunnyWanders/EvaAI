@@ -4,7 +4,12 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 
 from eva_ai.actions.contracts import ActionProposalPreparer
-from eva_ai.actions.types import ActionProposalPreparation
+from eva_ai.actions.errors import ActionScopeError, ActionValidationError
+from eva_ai.actions.service import ActionRevisionService
+from eva_ai.actions.types import (
+    ActionProposalPreparation,
+    RevisionLookupStatus,
+)
 from eva_ai.agent.errors import AgentPermanentError, AgentToolBudgetExceeded
 from eva_ai.agent.gmail import ScopedGmailInvestigationReader
 from eva_ai.agent.types import AgentUsage
@@ -14,7 +19,7 @@ from eva_ai.connectors.gmail.contracts import (
     GmailClientFactory,
     use_gmail_client,
 )
-from eva_ai.conversation.contracts import ConversationAgent
+from eva_ai.conversation.contracts import ConversationAgent, DraftRevisionAgent
 from eva_ai.conversation.errors import (
     ConversationModelOutputError,
     ConversationPermanentError,
@@ -32,13 +37,15 @@ from eva_ai.conversation.types import (
     ConversationOutcome,
     ConversationTurnRecord,
     ConversationTurnStatus,
+    DraftRevisionInvocationResult,
+    DraftRevisionRequest,
 )
 from eva_ai.integrations.gcp.secret_manager import SecretManagerProviderError
 from eva_ai.integrations.gmail.api import GmailProviderError, InvalidAuthorizedUserCredentials
 from eva_ai.memory.context import MemoryContextBuilder
 from eva_ai.memory.errors import MemoryNotFoundError
 from eva_ai.memory.learning import MemoryLearningService
-from eva_ai.memory.types import MemoryEpisodeType, MemorySourceType
+from eva_ai.memory.types import AgentWorkingContext, MemoryEpisodeType, MemorySourceType
 from eva_ai.situations.types import SituationType
 from eva_ai.telegram.contracts import TelegramGateway
 from eva_ai.telegram.types import TelegramTurnRequestedMessage
@@ -65,6 +72,8 @@ class ConversationService:
         body_max_chars: int,
         memory_learner: MemoryLearningService | None = None,
         action_proposals: ActionProposalPreparer | None = None,
+        action_revisions: ActionRevisionService | None = None,
+        revision_agent: DraftRevisionAgent | None = None,
         telegram: TelegramGateway | None = None,
         typing_refresh_seconds: float = 4.0,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -86,6 +95,8 @@ class ConversationService:
         self._body_max_chars = body_max_chars
         self._memory_learner = memory_learner
         self._action_proposals = action_proposals
+        self._action_revisions = action_revisions
+        self._revision_agent = revision_agent
         self._telegram = telegram
         self._typing_refresh_seconds = typing_refresh_seconds
         self._clock = clock
@@ -134,6 +145,26 @@ class ConversationService:
                 situation_id=subject.conversation.situation_id,
                 focus=subject.turn.text,
             )
+            revision_status, revision_invocation = await self._process_revision(
+                claim,
+                subject,
+                context,
+            )
+            if revision_invocation is not None:
+                await self._conversations.complete(
+                    claim,
+                    response_text=(
+                        "I’m updating that draft now. I’ll show you the complete revised version "
+                        "for approval as soon as it’s ready."
+                    ),
+                    agent_version=self._agent_version,
+                    provider_response_id=revision_invocation.provider_response_id,
+                    usage=revision_invocation.usage,
+                    tool_audit=(),
+                    reasoning_summary=revision_invocation.reasoning_summary,
+                    completed_at=self._clock(),
+                )
+                return ConversationOutcome.SUCCEEDED
             request = ConversationAgentRequest(
                 turn_id=claim.turn_id,
                 conversation_id=claim.conversation_id,
@@ -146,7 +177,11 @@ class ConversationService:
             completed_at = self._clock()
             await self._conversations.complete(
                 claim,
-                response_text=preparation.clarification or invocation.result.message,
+                response_text=self._normal_response_text(
+                    invocation,
+                    preparation,
+                    revision_status,
+                ),
                 agent_version=self._agent_version,
                 provider_response_id=invocation.provider_response_id,
                 usage=invocation.usage,
@@ -196,6 +231,65 @@ class ConversationService:
                 typing_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await typing_task
+
+    async def _process_revision(
+        self,
+        claim: ConversationTurnClaim,
+        subject: ConversationTurnSubject,
+        context: AgentWorkingContext,
+    ) -> tuple[RevisionLookupStatus, DraftRevisionInvocationResult | None]:
+        revisions = self._action_revisions
+        revision_agent = self._revision_agent
+        if revisions is None or revision_agent is None:
+            return RevisionLookupStatus.NONE, None
+        lookup = await revisions.load(
+            telegram_account_id=subject.telegram_account_id,
+            user_id=claim.user_id,
+            workspace_id=claim.workspace_id,
+            now=self._clock(),
+        )
+        if lookup.status is not RevisionLookupStatus.ACTIVE:
+            return lookup.status, None
+        revision = lookup.context
+        assert revision is not None
+        if revision.conversation_id != claim.conversation_id:
+            raise ConversationScopeError("revision conversation is unavailable")
+        request = DraftRevisionRequest(
+            turn_id=claim.turn_id,
+            conversation_id=claim.conversation_id,
+            instruction=subject.turn.text,
+            current_message=revision.current_message,
+            history=subject.history,
+            context=context,
+        )
+        invocation = await revision_agent.revise(request)
+        try:
+            await revisions.complete(
+                session_id=revision.session_id,
+                current=revision.current_message,
+                candidate=invocation.candidate,
+                conversation_turn_id=claim.turn_id,
+                now=self._clock(),
+            )
+        except ActionValidationError as error:
+            raise ConversationModelOutputError("draft revision output is invalid") from error
+        except ActionScopeError as error:
+            raise ConversationScopeError("revision scope is unavailable") from error
+        return lookup.status, invocation
+
+    @staticmethod
+    def _normal_response_text(
+        invocation: ConversationInvocationResult,
+        preparation: ActionProposalPreparation,
+        revision_status: RevisionLookupStatus,
+    ) -> str:
+        response = preparation.clarification or invocation.result.message
+        if revision_status is RevisionLookupStatus.EXPIRED:
+            return (
+                "That draft revision window expired, so I treated this as a normal message. "
+                + response
+            )
+        return response
 
     async def _refresh_typing(self, chat_id: int) -> None:
         telegram = self._telegram

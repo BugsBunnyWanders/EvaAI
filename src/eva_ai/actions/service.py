@@ -1,6 +1,6 @@
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.utils import getaddresses
 from typing import Literal, Protocol
 from uuid import UUID
@@ -25,16 +25,106 @@ from eva_ai.actions.types import (
     ApprovalCallbackResult,
     ApprovalDecision,
     ApprovalRecord,
+    DraftRevisionCandidate,
     GmailActionCapability,
     NewActionProposal,
     PolicyDecision,
     PreparedActionProposal,
+    RevisionLookup,
 )
 from eva_ai.agent.contracts import GmailInvestigationReader
 from eva_ai.agent.types import GmailMessageEvidence, ProposedAction
 
 _RFC_MESSAGE_ID_PATTERN = re.compile(r"^<[^<>\s]+>$")
 _APPROVAL_CALLBACK_PATTERN = re.compile(r"^(send|change|discard):([A-Za-z0-9_-]{16,48})$")
+
+
+class ActionRevisionStore(Protocol):
+    async def load_revision(
+        self,
+        *,
+        telegram_account_id: UUID,
+        user_id: UUID,
+        workspace_id: UUID,
+        now: datetime,
+    ) -> RevisionLookup: ...
+
+    async def complete_revision(
+        self,
+        *,
+        session_id: UUID,
+        replacement: CanonicalEmail,
+        conversation_turn_id: UUID | None,
+        destination: str,
+        now: datetime,
+    ) -> object: ...
+
+
+class ActionRevisionService:
+    def __init__(self, store: ActionRevisionStore, *, destination: str) -> None:
+        self._store = store
+        self._destination = destination
+
+    async def load(
+        self,
+        *,
+        telegram_account_id: UUID,
+        user_id: UUID,
+        workspace_id: UUID,
+        now: datetime,
+    ) -> RevisionLookup:
+        return await self._store.load_revision(
+            telegram_account_id=telegram_account_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            now=now,
+        )
+
+    @staticmethod
+    def validate_replacement(
+        current: CanonicalEmail,
+        candidate: DraftRevisionCandidate,
+    ) -> CanonicalEmail:
+        if candidate.mode != current.mode:
+            raise ActionValidationError("revision cannot change the email mode")
+        if candidate.thread_id != current.thread_id:
+            raise ActionValidationError("revision cannot change the Gmail thread")
+        if candidate.attachments:
+            raise ActionValidationError("revision attachments are not supported")
+        try:
+            return CanonicalEmail(
+                mode=current.mode,
+                to=candidate.to,
+                cc=candidate.cc,
+                bcc=candidate.bcc,
+                subject=candidate.subject,
+                text_body=candidate.text_body,
+                html_body=candidate.html_body,
+                thread_id=current.thread_id,
+                # These provider-owned fields never come from model output.
+                in_reply_to=current.in_reply_to,
+                references=current.references,
+            )
+        except ValidationError as error:
+            raise ActionValidationError("revision produced an invalid email") from error
+
+    async def complete(
+        self,
+        *,
+        session_id: UUID,
+        current: CanonicalEmail,
+        candidate: DraftRevisionCandidate,
+        conversation_turn_id: UUID | None = None,
+        now: datetime,
+    ) -> object:
+        replacement = self.validate_replacement(current, candidate)
+        return await self._store.complete_revision(
+            session_id=session_id,
+            replacement=replacement,
+            conversation_turn_id=conversation_turn_id,
+            destination=self._destination,
+            now=now,
+        )
 
 
 class ActionApprovalStore(Protocol):
@@ -58,20 +148,28 @@ class ActionApprovalStore(Protocol):
         now: datetime,
     ) -> ApprovalDecision: ...
 
-    async def supersede_send_approval(
+    async def open_revision(
         self,
         *,
         callback_token_digest: str,
         telegram_account_id: UUID,
         chat_id: int,
+        revision_ttl: timedelta,
         now: datetime,
     ) -> ApprovalRecord: ...
 
 
 class ActionApprovalService:
-    def __init__(self, store: ActionApprovalStore, *, destination: str) -> None:
+    def __init__(
+        self,
+        store: ActionApprovalStore,
+        *,
+        destination: str,
+        revision_ttl: timedelta = timedelta(minutes=15),
+    ) -> None:
         self._store = store
         self._destination = destination
+        self._revision_ttl = revision_ttl
 
     async def process_callback(
         self,
@@ -87,10 +185,11 @@ class ActionApprovalService:
         operation, token = match.groups()
         digest = hashlib.sha256(token.encode()).hexdigest()
         if operation == "change":
-            await self._store.supersede_send_approval(
+            await self._store.open_revision(
                 callback_token_digest=digest,
                 telegram_account_id=telegram_account_id,
                 chat_id=chat_id,
+                revision_ttl=self._revision_ttl,
                 now=now,
             )
             return ApprovalCallbackResult(outcome=ApprovalCallbackOutcome.CHANGE_REQUESTED)

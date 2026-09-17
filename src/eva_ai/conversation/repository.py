@@ -71,6 +71,7 @@ class ConversationTurnSubject:
     connector_id: UUID | None
     secret_reference: str | None
     gmail_thread_id: str | None
+    telegram_account_id: UUID
     telegram_chat_id: int
     connector_identity: str | None = None
 
@@ -335,6 +336,7 @@ class ConversationRepository:
             connector_id=None if connector is None else connector.id,
             secret_reference=None if connector is None else connector.secret_reference,
             gmail_thread_id=thread_id,
+            telegram_account_id=telegram_account.id,
             telegram_chat_id=telegram_account.chat_id,
             connector_identity=None if connector is None else connector.account_identity,
         )

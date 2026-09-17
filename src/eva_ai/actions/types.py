@@ -94,6 +94,54 @@ class RevisionSessionStatus(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class RevisionLookupStatus(StrEnum):
+    NONE = "NONE"
+    ACTIVE = "ACTIVE"
+    EXPIRED = "EXPIRED"
+
+
+class DraftRevisionCandidate(BaseModel):
+    """A model-proposed complete replacement for an existing managed draft."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    mode: Literal["NEW", "REPLY"]
+    to: tuple[str, ...] = Field(default=(), max_length=50)
+    cc: tuple[str, ...] = Field(default=(), max_length=50)
+    bcc: tuple[str, ...] = Field(default=(), max_length=50)
+    subject: str = Field(max_length=998)
+    text_body: str = Field(max_length=100_000)
+    html_body: str | None = Field(default=None, max_length=200_000)
+    thread_id: str | None = Field(default=None, max_length=500)
+    attachments: tuple[str, ...] = Field(default=(), max_length=10)
+
+
+class ActionRevisionContext(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    session_id: UUID
+    conversation_id: UUID
+    managed_draft_id: UUID
+    active_send_proposal_id: UUID
+    current_message: CanonicalEmail
+    expires_at: datetime
+
+    _require_aware = field_validator("expires_at")(_aware)
+
+
+class RevisionLookup(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: RevisionLookupStatus
+    context: ActionRevisionContext | None = None
+
+    @model_validator(mode="after")
+    def validate_context(self) -> Self:
+        if (self.status is RevisionLookupStatus.ACTIVE) != (self.context is not None):
+            raise ValueError("only an active revision lookup may contain context")
+        return self
+
+
 class ActionClaimOutcome(StrEnum):
     CLAIMED = "CLAIMED"
     BUSY = "BUSY"
