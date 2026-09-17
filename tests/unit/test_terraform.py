@@ -59,11 +59,13 @@ def test_action_runtime_environment_and_output_use_executor_default_url() -> Non
 
 def test_deploy_pauses_worker_migrates_restores_and_verifies_private_executor() -> None:
     workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text()
+    verification = (ROOT / ".github" / "scripts" / "verify-private-action-executor.sh").read_text()
 
     paused = workflow.index("Apply infrastructure with workers paused")
     migrated = workflow.index("Run database migrations")
     restored = workflow.index("Apply desired worker count")
     assert paused < migrated < restored
     assert "Verify private action executor" in workflow
-    assert "eva-action-executor" in workflow
-    assert "allUsers" in workflow
+    assert "verify-private-action-executor.sh" in workflow
+    assert "eva-action-executor" in verification
+    assert "allUsers" in verification
