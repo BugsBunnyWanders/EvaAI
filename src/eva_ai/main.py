@@ -27,7 +27,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         application.state.database = database
         approvals = None
         telegram = None
-        if resolved_settings.actions_enabled:
+        if resolved_settings.action_approval_enabled:
             approvals = ActionApprovalService(
                 ActionRepository(
                     database,

@@ -139,6 +139,7 @@ class Settings(BaseSettings):
     conversation_max_turns: int = Field(default=6, ge=1, le=10)
     conversation_max_tool_calls: int = Field(default=4, ge=0, le=10)
     actions_enabled: bool = False
+    action_approval_enabled: bool = False
     action_executor_enabled: bool = False
     action_dispatch_subscription_id: str = "eva-action-dispatch-local"
     action_dispatch_pull_timeout_seconds: PositiveInt = 30

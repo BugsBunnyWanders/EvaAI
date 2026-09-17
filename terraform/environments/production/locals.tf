@@ -60,7 +60,12 @@ locals {
     EVA_TELEGRAM_DELIVERY_SUBSCRIPTION_ID = local.telegram_delivery_subscription
   })
 
-  api_environment = merge(local.common_environment, local.action_environment, var.telegram_bot_username == "" ? {} : {
+  api_environment = merge(local.common_environment, {
+    # The API processes Telegram approval callbacks but does not run the worker's
+    # proposal, dispatch, relevance, agent, or Telegram subscription loops.
+    EVA_ACTION_APPROVAL_ENABLED     = tostring(var.actions_enabled)
+    EVA_ACTION_REVISION_TTL_SECONDS = "900"
+    }, var.telegram_bot_username == "" ? {} : {
     EVA_TELEGRAM_BOT_USERNAME = var.telegram_bot_username
   })
 

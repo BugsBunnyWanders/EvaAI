@@ -72,20 +72,11 @@ def test_unsupported_update_is_acknowledged_without_service_call() -> None:
     assert service.updates == []
 
 
-def test_actions_enabled_wires_exact_approval_callback_service() -> None:
+def test_action_approval_enabled_wires_callback_without_worker_runtime() -> None:
     application = create_app(
         Settings(
             _env_file=None,
-            actions_enabled=True,
-            telegram_enabled=True,
-            relevance_enabled=True,
-            agent_enabled=True,
-            openai_api_key=SecretStr("test-key"),
-            action_tasks_project_id="eva-project",
-            action_tasks_location="asia-south1",
-            action_executor_url="https://executor.example/internal/actions/execute",
-            action_executor_audience="https://executor.example",
-            action_task_caller_service_account="caller@eva-project.iam.gserviceaccount.com",
+            action_approval_enabled=True,
         )
     )
 

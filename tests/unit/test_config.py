@@ -195,6 +195,7 @@ def test_action_runtime_has_safe_disabled_and_bounded_defaults() -> None:
     settings = Settings(_env_file=None)
 
     assert settings.actions_enabled is False
+    assert settings.action_approval_enabled is False
     assert settings.action_executor_enabled is False
     assert settings.action_dispatch_subscription_id == "eva-action-dispatch-local"
     assert settings.action_approval_ttl_hours == 24
@@ -202,6 +203,14 @@ def test_action_runtime_has_safe_disabled_and_bounded_defaults() -> None:
     assert settings.action_lease_seconds == 300
     assert settings.action_task_timeout_seconds == 300
     assert settings.action_task_max_attempts == 5
+
+
+def test_api_can_enable_action_approvals_without_worker_processing() -> None:
+    settings = Settings(_env_file=None, action_approval_enabled=True)
+
+    assert settings.action_approval_enabled is True
+    assert settings.actions_enabled is False
+    assert settings.telegram_enabled is False
 
 
 def test_action_approval_ttl_accepts_production_environment_string(
