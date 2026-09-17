@@ -134,6 +134,37 @@ class TelegramSendResult(BaseModel):
     chat_id: int
 
 
+class TelegramInlineKeyboardButton(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    text: str = Field(min_length=1, max_length=64)
+    callback_data: str = Field(min_length=1, max_length=64)
+
+    @field_validator("callback_data")
+    @classmethod
+    def validate_callback_size(cls, value: str) -> str:
+        # Telegram applies the 64-byte bound after UTF-8 encoding, not by code point count.
+        if len(value.encode("utf-8")) > 64:
+            raise ValueError("callback_data must not exceed 64 UTF-8 bytes")
+        return value
+
+
+class TelegramInlineKeyboardMarkup(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    inline_keyboard: tuple[tuple[TelegramInlineKeyboardButton, ...], ...]
+
+    @field_validator("inline_keyboard")
+    @classmethod
+    def validate_rows(
+        cls,
+        value: tuple[tuple[TelegramInlineKeyboardButton, ...], ...],
+    ) -> tuple[tuple[TelegramInlineKeyboardButton, ...], ...]:
+        if not value or any(not row for row in value):
+            raise ValueError("inline keyboard must contain non-empty rows")
+        return value
+
+
 class TelegramWebhookInfo(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -172,6 +203,7 @@ class WebhookDisposition(StrEnum):
     INGESTED = "INGESTED"
     DUPLICATE = "DUPLICATE"
     PAIRED = "PAIRED"
+    APPROVAL_PROCESSED = "APPROVAL_PROCESSED"
     IGNORED = "IGNORED"
 
 

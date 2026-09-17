@@ -7,8 +7,17 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from eva_ai.actions.canonical import CanonicalEmail
+from eva_ai.actions.types import ActionProposalStatus, ApprovalStatus
 from eva_ai.agent.types import NotificationUrgency
-from eva_ai.db.models import Notification, OutboxMessage, TelegramAccount
+from eva_ai.db.models import (
+    ActionApproval,
+    ActionProposal,
+    ManagedGmailDraft,
+    Notification,
+    OutboxMessage,
+    TelegramAccount,
+)
 from eva_ai.db.session import Database
 from eva_ai.events.types import OutboxState
 from eva_ai.notifications.errors import (
@@ -23,7 +32,7 @@ from eva_ai.notifications.types import (
     NotificationRecord,
     NotificationStatus,
 )
-from eva_ai.telegram.types import TelegramAccountStatus
+from eva_ai.telegram.types import TelegramAccountStatus, TelegramInlineKeyboardMarkup
 
 _NOTIFICATION_NAMESPACE = UUID("8e76fa34-5b80-53e6-83cd-b6678991d113")
 _OUTBOX_NAMESPACE = UUID("c73d6c50-2c75-58b8-a92b-45df53fa61b0")
@@ -45,6 +54,18 @@ class NotificationDeliverySubject:
     chat_id: int
 
 
+@dataclass(frozen=True, slots=True)
+class ApprovalCardSubject:
+    approval_id: UUID
+    mode: str
+    to: tuple[str, ...]
+    cc: tuple[str, ...]
+    bcc: tuple[str, ...]
+    subject: str
+    text_body: str
+    expires_at: datetime
+
+
 class NotificationRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
@@ -64,6 +85,8 @@ class NotificationRepository:
         dedupe_key: str,
         destination: str,
         created_at: datetime,
+        reply_markup: TelegramInlineKeyboardMarkup | None = None,
+        action_approval_id: UUID | None = None,
     ) -> NotificationRecord:
         notification_id = uuid5(_NOTIFICATION_NAMESPACE, f"{workspace_id}:{dedupe_key}")
         statement = (
@@ -75,10 +98,14 @@ class NotificationRepository:
                 workspace_id=workspace_id,
                 situation_id=situation_id,
                 agent_run_id=agent_run_id,
+                action_approval_id=action_approval_id,
                 channel=NotificationChannel.TELEGRAM,
                 kind=kind,
                 urgency=urgency,
                 message=message,
+                reply_markup=(
+                    None if reply_markup is None else reply_markup.model_dump(mode="json")
+                ),
                 dedupe_key=dedupe_key,
                 status=NotificationStatus.PENDING,
                 created_at=created_at,
@@ -197,6 +224,71 @@ class NotificationRepository:
             telegram_account_id=account.id,
             chat_id=account.chat_id,
         )
+
+    async def prepare_approval_card(
+        self,
+        claim: NotificationClaim,
+        *,
+        callback_token_digest: str,
+        now: datetime,
+    ) -> ApprovalCardSubject:
+        async with self._database.session() as session:
+            async with session.begin():
+                values = (
+                    await session.execute(
+                        select(Notification, ActionApproval, ActionProposal, ManagedGmailDraft)
+                        .join(
+                            ActionApproval,
+                            and_(
+                                ActionApproval.id == Notification.action_approval_id,
+                                ActionApproval.workspace_id == Notification.workspace_id,
+                                ActionApproval.user_id == Notification.user_id,
+                            ),
+                        )
+                        .join(
+                            ActionProposal,
+                            and_(
+                                ActionProposal.id == ActionApproval.proposal_id,
+                                ActionProposal.workspace_id == ActionApproval.workspace_id,
+                                ActionProposal.user_id == ActionApproval.user_id,
+                            ),
+                        )
+                        .join(
+                            ManagedGmailDraft,
+                            and_(
+                                ManagedGmailDraft.active_send_proposal_id == ActionProposal.id,
+                                ManagedGmailDraft.workspace_id == ActionProposal.workspace_id,
+                                ManagedGmailDraft.user_id == ActionProposal.user_id,
+                            ),
+                        )
+                        .where(_claim_predicate(claim))
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if values is None:
+                    raise NotificationScopeError("approval delivery subject is unavailable")
+                _, approval, proposal, managed = values
+                if (
+                    approval.status != ApprovalStatus.PENDING
+                    or proposal.status != ActionProposalStatus.WAITING_APPROVAL
+                    or approval.parameters_hash != proposal.parameters_hash
+                    or managed.current_content_hash != proposal.parameters_hash
+                    or now >= approval.expires_at
+                ):
+                    raise NotificationScopeError("approval delivery subject is unavailable")
+                approval.callback_token_digest = callback_token_digest
+                message = CanonicalEmail.model_validate(proposal.parameters_json)
+                await session.flush()
+                return ApprovalCardSubject(
+                    approval_id=approval.id,
+                    mode=message.mode,
+                    to=message.to,
+                    cc=message.cc,
+                    bcc=message.bcc,
+                    subject=message.subject,
+                    text_body=message.text_body,
+                    expires_at=approval.expires_at,
+                )
 
     async def mark_sent(
         self,
@@ -364,10 +456,16 @@ def _record(row: Notification) -> NotificationRecord:
         event_id=row.event_id,
         situation_id=row.situation_id,
         agent_run_id=row.agent_run_id,
+        action_approval_id=row.action_approval_id,
         channel=NotificationChannel(row.channel),
         kind=NotificationKind(row.kind),
         urgency=NotificationUrgency(row.urgency),
         message=row.message,
+        reply_markup=(
+            None
+            if row.reply_markup is None
+            else TelegramInlineKeyboardMarkup.model_validate(row.reply_markup)
+        ),
         dedupe_key=row.dedupe_key,
         status=NotificationStatus(row.status),
         attempt_count=row.attempt_count,

@@ -15,6 +15,7 @@ from eva_ai.actions.types import (
     ActionClaimResult,
     ActionExecutionRequestedMessage,
     ActionExecutionSubject,
+    ActionOrigin,
     ActionProposalRecord,
     ActionProposalStatus,
     ActionRecord,
@@ -33,6 +34,7 @@ from eva_ai.actions.types import (
     PolicyDecision,
     TelegramApprovalPrincipal,
 )
+from eva_ai.agent.types import NotificationUrgency
 from eva_ai.connectors.types import ConnectorStatus
 from eva_ai.db.models import (
     Action,
@@ -46,6 +48,8 @@ from eva_ai.db.models import (
 )
 from eva_ai.db.session import Database
 from eva_ai.events.types import OutboxState
+from eva_ai.notifications.repository import NotificationRepository
+from eva_ai.notifications.types import NotificationKind
 from eva_ai.telegram.types import TelegramAccountStatus
 
 _PROPOSAL_NAMESPACE = UUID("bf60a20d-3227-55b9-b4d0-ff7f60c63fe7")
@@ -56,8 +60,14 @@ _APPROVAL_NAMESPACE = UUID("f1af2fa2-1528-531b-a7f8-2f3e65f63657")
 
 
 class ActionRepository:
-    def __init__(self, database: Database) -> None:
+    def __init__(
+        self,
+        database: Database,
+        notification_destination: str | None = None,
+    ) -> None:
         self._database = database
+        self._notifications = NotificationRepository(database)
+        self._notification_destination = notification_destination
 
     async def create_allowed_action(
         self,
@@ -619,6 +629,12 @@ class ActionRepository:
                 await session.flush()
                 session.add_all((approval, managed_draft))
                 await session.flush()
+                await self._create_approval_notification(
+                    session,
+                    approval=approval,
+                    proposal=send_proposal,
+                    created_at=completed_at,
+                )
                 return CreateDraftCompletion(
                     managed_draft=_managed_draft_record(managed_draft),
                     send_proposal=_proposal_record(send_proposal),
@@ -754,6 +770,12 @@ class ActionRepository:
                 managed_draft.updated_at = completed_at
                 session.add(approval)
                 await session.flush()
+                await self._create_approval_notification(
+                    session,
+                    approval=approval,
+                    proposal=send_proposal,
+                    created_at=completed_at,
+                )
                 return CreateDraftCompletion(
                     managed_draft=_managed_draft_record(managed_draft),
                     send_proposal=_proposal_record(send_proposal),
@@ -1012,6 +1034,151 @@ class ActionRepository:
                     await session.flush()
                 return _approval_record(approval)
 
+    async def discard_and_queue_delete(
+        self,
+        *,
+        callback_token_digest: str,
+        telegram_account_id: UUID,
+        chat_id: int,
+        destination: str,
+        now: datetime,
+    ) -> ApprovalDecision:
+        async with self._database.session() as session:
+            async with session.begin():
+                values = (
+                    await session.execute(
+                        select(ActionApproval, ActionProposal)
+                        .join(
+                            ActionProposal,
+                            and_(
+                                ActionProposal.id == ActionApproval.proposal_id,
+                                ActionProposal.workspace_id == ActionApproval.workspace_id,
+                                ActionProposal.user_id == ActionApproval.user_id,
+                            ),
+                        )
+                        .where(ActionApproval.callback_token_digest == callback_token_digest)
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if values is None:
+                    raise ActionScopeError("approval is unavailable")
+                approval, send_proposal = values
+                if (
+                    approval.telegram_account_id != telegram_account_id
+                    or approval.provider_chat_id != chat_id
+                ):
+                    raise ActionScopeError("approval is unavailable")
+
+                existing_delete = await session.scalar(
+                    select(ActionProposal).where(
+                        ActionProposal.supersedes_proposal_id == send_proposal.id,
+                        ActionProposal.workspace_id == send_proposal.workspace_id,
+                        ActionProposal.user_id == send_proposal.user_id,
+                        ActionProposal.capability == GmailActionCapability.DELETE_DRAFT,
+                    )
+                )
+                existing_action = (
+                    None
+                    if existing_delete is None
+                    else await session.scalar(
+                        select(Action).where(Action.proposal_id == existing_delete.id)
+                    )
+                )
+                if approval.status != ApprovalStatus.PENDING:
+                    return ApprovalDecision(
+                        outcome=ApprovalDecisionOutcome.ALREADY_DECIDED,
+                        approval=_approval_record(approval),
+                        action=(
+                            None if existing_action is None else _action_record(existing_action)
+                        ),
+                    )
+                if now >= approval.expires_at:
+                    approval.status = ApprovalStatus.EXPIRED
+                    approval.decided_at = now
+                    send_proposal.status = ActionProposalStatus.EXPIRED
+                    send_proposal.terminal_at = now
+                    await session.flush()
+                    return ApprovalDecision(
+                        outcome=ApprovalDecisionOutcome.EXPIRED,
+                        approval=_approval_record(approval),
+                    )
+
+                managed = await session.scalar(
+                    select(ManagedGmailDraft)
+                    .where(
+                        ManagedGmailDraft.active_send_proposal_id == send_proposal.id,
+                        ManagedGmailDraft.workspace_id == send_proposal.workspace_id,
+                        ManagedGmailDraft.user_id == send_proposal.user_id,
+                    )
+                    .with_for_update()
+                )
+                if (
+                    managed is None
+                    or managed.current_content_hash != send_proposal.parameters_hash
+                    or approval.parameters_hash != send_proposal.parameters_hash
+                ):
+                    approval.status = ApprovalStatus.SUPERSEDED
+                    approval.decided_at = now
+                    send_proposal.status = ActionProposalStatus.SUPERSEDED
+                    send_proposal.terminal_at = now
+                    await session.flush()
+                    return ApprovalDecision(
+                        outcome=ApprovalDecisionOutcome.STALE,
+                        approval=_approval_record(approval),
+                    )
+
+                # Invalidate send authority before the delete action becomes dispatchable.
+                approval.status = ApprovalStatus.REJECTED
+                approval.decided_at = now
+                send_proposal.status = ActionProposalStatus.CANCELLED
+                send_proposal.terminal_at = now
+
+                source_key = f"managed-draft:{managed.id}:delete"
+                delete_proposal_id = uuid5(
+                    _PROPOSAL_NAMESPACE,
+                    f"{send_proposal.workspace_id}:{send_proposal.user_id}:{source_key}",
+                )
+                delete_proposal = ActionProposal(
+                    id=delete_proposal_id,
+                    user_id=send_proposal.user_id,
+                    workspace_id=send_proposal.workspace_id,
+                    connector_account_id=send_proposal.connector_account_id,
+                    event_id=send_proposal.event_id,
+                    situation_id=send_proposal.situation_id,
+                    goal_id=send_proposal.goal_id,
+                    agent_run_id=send_proposal.agent_run_id,
+                    conversation_turn_id=send_proposal.conversation_turn_id,
+                    supersedes_proposal_id=send_proposal.id,
+                    source_key=source_key,
+                    proposal_family_key=source_key,
+                    origin=ActionOrigin.TELEGRAM_USER,
+                    capability=GmailActionCapability.DELETE_DRAFT,
+                    parameters_json=send_proposal.parameters_json,
+                    parameters_hash=send_proposal.parameters_hash,
+                    description="Discard the exact managed Gmail draft",
+                    risk_level="medium",
+                    policy_decision=PolicyDecision.ALLOW,
+                    status=ActionProposalStatus.QUEUED,
+                    version=1,
+                    created_at=now,
+                )
+                session.add(delete_proposal)
+                await session.flush()
+                action = await self._queue_action_in_session(
+                    session,
+                    proposal=delete_proposal,
+                    destination=destination,
+                    queued_at=now,
+                )
+                managed.status = ManagedDraftStatus.DELETING
+                managed.updated_at = now
+                await session.flush()
+                return ApprovalDecision(
+                    outcome=ApprovalDecisionOutcome.QUEUED,
+                    approval=_approval_record(approval),
+                    action=_action_record(action),
+                )
+
     async def get_action(self, action_id: UUID) -> ActionRecord | None:
         async with self._database.session() as session:
             row = await session.scalar(select(Action).where(Action.id == action_id))
@@ -1076,6 +1243,36 @@ class ActionRepository:
             )
         )
         return action
+
+    async def _create_approval_notification(
+        self,
+        session: AsyncSession,
+        *,
+        approval: ActionApproval,
+        proposal: ActionProposal,
+        created_at: datetime,
+    ) -> None:
+        if self._notification_destination is None:
+            return
+        await self._notifications.create_in_session(
+            session,
+            event_id=proposal.event_id,
+            user_id=proposal.user_id,
+            workspace_id=proposal.workspace_id,
+            situation_id=proposal.situation_id,
+            agent_run_id=proposal.agent_run_id,
+            kind=(
+                NotificationKind.PROACTIVE
+                if proposal.origin == ActionOrigin.AGENT_RUN
+                else NotificationKind.REACTIVE
+            ),
+            urgency=NotificationUrgency.HIGH,
+            message="Email draft ready for your approval.",
+            dedupe_key=f"action-approval:{approval.id}",
+            destination=self._notification_destination,
+            created_at=created_at,
+            action_approval_id=approval.id,
+        )
 
 
 def _claim_predicate(claim: ActionClaim) -> Any:

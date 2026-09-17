@@ -108,6 +108,14 @@ class ApprovalDecisionOutcome(StrEnum):
     STALE = "STALE"
 
 
+class ApprovalCallbackOutcome(StrEnum):
+    QUEUED = "QUEUED"
+    ALREADY_DECIDED = "ALREADY_DECIDED"
+    EXPIRED = "EXPIRED"
+    STALE = "STALE"
+    CHANGE_REQUESTED = "CHANGE_REQUESTED"
+
+
 class ActionExecutionOutcome(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     TERMINAL = "TERMINAL"
@@ -302,6 +310,13 @@ class ApprovalDecision(BaseModel):
     outcome: ApprovalDecisionOutcome
     approval: ApprovalRecord
     action: ActionRecord | None = None
+
+
+class ApprovalCallbackResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    outcome: ApprovalCallbackOutcome
+    action_id: UUID | None = None
 
 
 class ActionExecutionRequestedMessage(BaseModel):

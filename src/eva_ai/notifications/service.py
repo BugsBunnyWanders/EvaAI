@@ -1,8 +1,15 @@
+import hashlib
+import secrets
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from eva_ai.notifications.errors import NotificationScopeError
-from eva_ai.notifications.repository import NotificationClaim, NotificationRepository
+from eva_ai.notifications.repository import (
+    ApprovalCardSubject,
+    NotificationClaim,
+    NotificationRepository,
+)
 from eva_ai.notifications.types import (
     DeliveryOutcome,
     NotificationDeliveryRequestedMessage,
@@ -11,6 +18,18 @@ from eva_ai.notifications.types import (
 )
 from eva_ai.telegram.contracts import TelegramGateway
 from eva_ai.telegram.errors import TelegramProviderError
+from eva_ai.telegram.types import (
+    TelegramInlineKeyboardButton,
+    TelegramInlineKeyboardMarkup,
+)
+
+_TELEGRAM_SEGMENT_UNITS = 4000
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalCard:
+    segments: tuple[str, ...]
+    reply_markup: TelegramInlineKeyboardMarkup
 
 
 class NotificationDeliveryService:
@@ -51,12 +70,33 @@ class NotificationDeliveryService:
             return DeliveryOutcome.DEFERRED
         try:
             subject = await self._notifications.load_delivery_subject(claim)
-            sent = await self._telegram.send_message(
-                chat_id=subject.chat_id,
-                text=subject.notification.message,
-            )
-            if sent.chat_id != subject.chat_id:
-                return await self._terminal(claim, "INVALID_DELIVERY_TARGET")
+            messages: tuple[tuple[str, TelegramInlineKeyboardMarkup | None], ...]
+            approval_delivery = subject.notification.action_approval_id is not None
+            if approval_delivery:
+                token = secrets.token_urlsafe(18)
+                approval = await self._notifications.prepare_approval_card(
+                    claim,
+                    callback_token_digest=hashlib.sha256(token.encode()).hexdigest(),
+                    now=self._clock(),
+                )
+                card = build_approval_card(approval, callback_token=token)
+                messages = tuple(
+                    (segment, card.reply_markup if index == len(card.segments) - 1 else None)
+                    for index, segment in enumerate(card.segments)
+                )
+            else:
+                messages = ((subject.notification.message, subject.notification.reply_markup),)
+            sent = None
+            for text, reply_markup in messages:
+                sent = await self._telegram.send_message(
+                    chat_id=subject.chat_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    preserve_text=approval_delivery,
+                )
+                if sent.chat_id != subject.chat_id:
+                    return await self._terminal(claim, "INVALID_DELIVERY_TARGET")
+            assert sent is not None
             await self._notifications.mark_sent(
                 claim,
                 telegram_account_id=subject.telegram_account_id,
@@ -104,3 +144,59 @@ class NotificationDeliveryService:
             if record.status is NotificationStatus.RETRYABLE_FAILURE
             else DeliveryOutcome.TERMINAL
         )
+
+
+def build_approval_card(
+    subject: ApprovalCardSubject,
+    *,
+    callback_token: str,
+) -> ApprovalCard:
+    mode = "New email" if subject.mode == "NEW" else "Reply"
+    text = (
+        "Review this Gmail draft before I send it.\n\n"
+        f"Mode: {mode}\n"
+        f"To: {_addresses(subject.to)}\n"
+        f"Cc: {_addresses(subject.cc)}\n"
+        f"Bcc: {_addresses(subject.bcc)}\n"
+        f"Subject: {subject.subject}\n\n"
+        f"Body:\n{subject.text_body}\n\n"
+        f"Expires: {subject.expires_at.isoformat()}"
+    )
+    keyboard = TelegramInlineKeyboardMarkup(
+        inline_keyboard=(
+            (
+                TelegramInlineKeyboardButton(
+                    text="Send",
+                    callback_data=f"send:{callback_token}",
+                ),
+                TelegramInlineKeyboardButton(
+                    text="Change",
+                    callback_data=f"change:{callback_token}",
+                ),
+                TelegramInlineKeyboardButton(
+                    text="Discard",
+                    callback_data=f"discard:{callback_token}",
+                ),
+            ),
+        )
+    )
+    return ApprovalCard(segments=_split_telegram_text(text), reply_markup=keyboard)
+
+
+def _addresses(values: tuple[str, ...]) -> str:
+    return ", ".join(values) if values else "(none)"
+
+
+def _split_telegram_text(value: str) -> tuple[str, ...]:
+    segments: list[str] = []
+    start = 0
+    units = 0
+    for index, character in enumerate(value):
+        width = len(character.encode("utf-16-le")) // 2
+        if units + width > _TELEGRAM_SEGMENT_UNITS:
+            segments.append(value[start:index])
+            start = index
+            units = 0
+        units += width
+    segments.append(value[start:])
+    return tuple(segments)

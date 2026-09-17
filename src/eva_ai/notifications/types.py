@@ -6,6 +6,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from eva_ai.agent.types import NotificationUrgency
+from eva_ai.telegram.types import TelegramInlineKeyboardMarkup
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -40,10 +41,12 @@ class NotificationRecord(BaseModel):
     event_id: UUID
     situation_id: UUID | None
     agent_run_id: UUID | None
+    action_approval_id: UUID | None = None
     channel: NotificationChannel
     kind: NotificationKind
     urgency: NotificationUrgency
     message: str = Field(max_length=4000)
+    reply_markup: TelegramInlineKeyboardMarkup | None = None
     dedupe_key: str = Field(max_length=500)
     status: NotificationStatus
     attempt_count: int = Field(ge=0)

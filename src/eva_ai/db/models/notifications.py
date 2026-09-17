@@ -56,6 +56,12 @@ class Notification(UUIDPrimaryKeyMixin, Base):
             name="fk_notifications_telegram_account_scope",
             ondelete="RESTRICT",
         ),
+        ForeignKeyConstraint(
+            ["action_approval_id", "workspace_id", "user_id"],
+            ["action_approvals.id", "action_approvals.workspace_id", "action_approvals.user_id"],
+            name="fk_notifications_action_approval_scope",
+            ondelete="RESTRICT",
+        ),
         UniqueConstraint("id", "workspace_id", "user_id", name="uq_notifications_id_scope"),
         UniqueConstraint("workspace_id", "dedupe_key", name="uq_notifications_scope_dedupe"),
         UniqueConstraint(
@@ -87,6 +93,7 @@ class Notification(UUIDPrimaryKeyMixin, Base):
     event_id: Mapped[UUID]
     situation_id: Mapped[UUID | None]
     agent_run_id: Mapped[UUID | None]
+    action_approval_id: Mapped[UUID | None]
     channel: Mapped[NotificationChannel] = mapped_column(String(20))
     kind: Mapped[NotificationKind] = mapped_column(String(20))
     urgency: Mapped[NotificationUrgency] = mapped_column(String(20))

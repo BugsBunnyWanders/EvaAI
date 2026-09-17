@@ -47,7 +47,9 @@ async def test_action_schema_has_every_durable_boundary(database: Database) -> N
         "managed_gmail_drafts",
         "action_revision_sessions",
     } <= tables
-    assert "reply_markup" in notification_columns
+    assert {"reply_markup", "action_approval_id"} <= notification_columns
+    notification_fks, _, _ = await _schema_details(database, "notifications")
+    assert "fk_notifications_action_approval_scope" in notification_fks
 
 
 @pytest.mark.integration

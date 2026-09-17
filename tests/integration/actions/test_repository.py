@@ -27,6 +27,7 @@ from eva_ai.db.models import (
     ActionProposal,
     ConnectorAccount,
     Event,
+    Notification,
     OutboxMessage,
     TelegramAccount,
 )
@@ -167,7 +168,7 @@ async def test_create_completion_creates_distinct_send_proposal_and_exact_approv
     database: Database,
 ) -> None:
     scope, connector_id, event_id, telegram_account_id, chat_id = await _seed_action_scope(database)
-    repository = ActionRepository(database)
+    repository = ActionRepository(database, notification_destination="eva-telegram-delivery")
     now = datetime.now(UTC)
     created = await repository.create_allowed_action(
         proposal=_new_create_proposal(
@@ -204,6 +205,25 @@ async def test_create_completion_creates_distinct_send_proposal_and_exact_approv
     assert completion.approval.status is ApprovalStatus.PENDING
     assert completion.approval.parameters_hash == completion.managed_draft.current_content_hash
     assert completion.managed_draft.active_send_proposal_id == completion.send_proposal.id
+    async with database.session() as session:
+        notification = await session.scalar(
+            select(Notification).where(
+                Notification.action_approval_id == completion.approval.id,
+            )
+        )
+        assert notification is not None
+        delivery_count = await session.scalar(
+            select(func.count())
+            .select_from(OutboxMessage)
+            .where(
+                OutboxMessage.message_type == "notification.delivery.requested",
+                OutboxMessage.payload["notification_id"].astext == str(notification.id),
+            )
+        )
+    assert notification is not None
+    assert notification.reply_markup is None
+    assert notification.message == "Email draft ready for your approval."
+    assert delivery_count == 1
 
 
 @pytest.mark.integration

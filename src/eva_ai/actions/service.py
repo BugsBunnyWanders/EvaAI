@@ -1,7 +1,8 @@
+import hashlib
 import re
 from datetime import datetime
 from email.utils import getaddresses
-from typing import Literal
+from typing import Literal, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from eva_ai.actions.canonical import CanonicalEmail
 from eva_ai.actions.contracts import ActionProposalSessionStore
+from eva_ai.actions.errors import ActionValidationError
 from eva_ai.actions.policy import ActionPolicyContext, ActionPolicyEngine
 from eva_ai.actions.recipients import (
     RecipientCandidate,
@@ -19,6 +21,10 @@ from eva_ai.actions.types import (
     ActionOrigin,
     ActionProposalPreparation,
     AllowedActionCreation,
+    ApprovalCallbackOutcome,
+    ApprovalCallbackResult,
+    ApprovalDecision,
+    ApprovalRecord,
     GmailActionCapability,
     NewActionProposal,
     PolicyDecision,
@@ -28,6 +34,86 @@ from eva_ai.agent.contracts import GmailInvestigationReader
 from eva_ai.agent.types import GmailMessageEvidence, ProposedAction
 
 _RFC_MESSAGE_ID_PATTERN = re.compile(r"^<[^<>\s]+>$")
+_APPROVAL_CALLBACK_PATTERN = re.compile(r"^(send|change|discard):([A-Za-z0-9_-]{16,48})$")
+
+
+class ActionApprovalStore(Protocol):
+    async def grant_and_queue_send(
+        self,
+        *,
+        callback_token_digest: str,
+        telegram_account_id: UUID,
+        chat_id: int,
+        destination: str,
+        now: datetime,
+    ) -> ApprovalDecision: ...
+
+    async def discard_and_queue_delete(
+        self,
+        *,
+        callback_token_digest: str,
+        telegram_account_id: UUID,
+        chat_id: int,
+        destination: str,
+        now: datetime,
+    ) -> ApprovalDecision: ...
+
+    async def supersede_send_approval(
+        self,
+        *,
+        callback_token_digest: str,
+        telegram_account_id: UUID,
+        chat_id: int,
+        now: datetime,
+    ) -> ApprovalRecord: ...
+
+
+class ActionApprovalService:
+    def __init__(self, store: ActionApprovalStore, *, destination: str) -> None:
+        self._store = store
+        self._destination = destination
+
+    async def process_callback(
+        self,
+        callback_data: str,
+        *,
+        telegram_account_id: UUID,
+        chat_id: int,
+        now: datetime,
+    ) -> ApprovalCallbackResult:
+        match = _APPROVAL_CALLBACK_PATTERN.fullmatch(callback_data)
+        if match is None:
+            raise ActionValidationError("approval callback is invalid")
+        operation, token = match.groups()
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        if operation == "change":
+            await self._store.supersede_send_approval(
+                callback_token_digest=digest,
+                telegram_account_id=telegram_account_id,
+                chat_id=chat_id,
+                now=now,
+            )
+            return ApprovalCallbackResult(outcome=ApprovalCallbackOutcome.CHANGE_REQUESTED)
+        if operation == "send":
+            decision = await self._store.grant_and_queue_send(
+                callback_token_digest=digest,
+                telegram_account_id=telegram_account_id,
+                chat_id=chat_id,
+                destination=self._destination,
+                now=now,
+            )
+        else:
+            decision = await self._store.discard_and_queue_delete(
+                callback_token_digest=digest,
+                telegram_account_id=telegram_account_id,
+                chat_id=chat_id,
+                destination=self._destination,
+                now=now,
+            )
+        return ApprovalCallbackResult(
+            outcome=ApprovalCallbackOutcome(decision.outcome.value),
+            action_id=None if decision.action is None else decision.action.id,
+        )
 
 
 class _DraftArguments(BaseModel):

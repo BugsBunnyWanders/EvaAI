@@ -5,14 +5,18 @@ from uuid import uuid7
 import pytest
 from pydantic import ValidationError
 
+from eva_ai.actions.service import ActionApprovalService
+from eva_ai.actions.types import ApprovalCallbackOutcome, ApprovalCallbackResult
 from eva_ai.events.service import IngestResult
 from eva_ai.events.types import NewEvent
+from eva_ai.telegram.contracts import TelegramGateway
 from eva_ai.telegram.ingestion import TelegramEventService
 from eva_ai.telegram.repository import TelegramAccountRepository
 from eva_ai.telegram.types import (
     PairingConsumeCommand,
     TelegramAccountRecord,
     TelegramAccountStatus,
+    TelegramSendResult,
     TelegramUpdate,
     WebhookDisposition,
 )
@@ -79,6 +83,44 @@ class Events:
         return IngestResult(event_id=command.id, created=True)
 
 
+class Approvals:
+    def __init__(self, sequence: list[str]) -> None:
+        self.sequence = sequence
+        self.calls: list[tuple[str, object, int]] = []
+
+    async def process_callback(
+        self,
+        callback_data: str,
+        *,
+        telegram_account_id: object,
+        chat_id: int,
+        now: datetime,
+    ) -> ApprovalCallbackResult:
+        assert now == NOW
+        self.sequence.append("transition")
+        self.calls.append((callback_data, telegram_account_id, chat_id))
+        return ApprovalCallbackResult(outcome=ApprovalCallbackOutcome.QUEUED)
+
+
+class Telegram:
+    def __init__(self, sequence: list[str]) -> None:
+        self.sequence = sequence
+        self.answered: list[str] = []
+
+    async def answer_callback_query(self, *, callback_query_id: str) -> None:
+        self.sequence.append("answered")
+        self.answered.append(callback_query_id)
+
+    async def send_message(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        **kwargs: object,
+    ) -> TelegramSendResult:
+        raise AssertionError("callback handling must not send a message synchronously")
+
+
 def _update(text: str, *, reply_to: int | None = None) -> TelegramUpdate:
     message: dict[str, object] = {
         "message_id": 9,
@@ -135,3 +177,70 @@ async def test_unpaired_and_group_messages_are_safely_ignored() -> None:
 
     assert result.disposition is WebhookDisposition.IGNORED
     assert events.command is None
+
+
+async def test_action_callback_is_answered_before_durable_transition() -> None:
+    account = _account()
+    sequence: list[str] = []
+    approvals = Approvals(sequence)
+    telegram = Telegram(sequence)
+    service = TelegramWebhookService(
+        cast(TelegramAccountRepository, Accounts(account)),
+        cast(TelegramEventService, Events()),
+        approvals=cast(ActionApprovalService, approvals),
+        telegram=cast(TelegramGateway, telegram),
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 78,
+            "callback_query": {
+                "id": "callback-1",
+                "from": {"id": 123, "first_name": "User"},
+                "message": {
+                    "message_id": 12,
+                    "date": int(NOW.timestamp()),
+                    "chat": {"id": 123, "type": "private"},
+                },
+                "data": "send:opaque_random_token",
+            },
+        }
+    )
+
+    result = await service.handle(update, received_at=NOW)
+
+    assert result.disposition is WebhookDisposition.APPROVAL_PROCESSED
+    assert sequence == ["answered", "transition"]
+    assert approvals.calls == [("send:opaque_random_token", account.id, 123)]
+
+
+async def test_action_callback_from_unpaired_user_never_transitions() -> None:
+    sequence: list[str] = []
+    approvals = Approvals(sequence)
+    telegram = Telegram(sequence)
+    service = TelegramWebhookService(
+        cast(TelegramAccountRepository, Accounts(None)),
+        cast(TelegramEventService, Events()),
+        approvals=cast(ActionApprovalService, approvals),
+        telegram=cast(TelegramGateway, telegram),
+    )
+    update = TelegramUpdate.model_validate(
+        {
+            "update_id": 79,
+            "callback_query": {
+                "id": "callback-2",
+                "from": {"id": 999, "first_name": "Other"},
+                "message": {
+                    "message_id": 13,
+                    "date": int(NOW.timestamp()),
+                    "chat": {"id": 999, "type": "private"},
+                },
+                "data": "discard:opaque_random_token",
+            },
+        }
+    )
+
+    result = await service.handle(update, received_at=NOW)
+
+    assert result.disposition is WebhookDisposition.IGNORED
+    assert telegram.answered == ["callback-2"]
+    assert approvals.calls == []
