@@ -14,6 +14,7 @@ from eva_ai.actions.types import (
     ActionClaimOutcome,
     ActionClaimResult,
     ActionExecutionRequestedMessage,
+    ActionExecutionSubject,
     ActionProposalRecord,
     ActionProposalStatus,
     ActionRecord,
@@ -30,17 +31,22 @@ from eva_ai.actions.types import (
     ManagedGmailDraftRecord,
     NewActionProposal,
     PolicyDecision,
+    TelegramApprovalPrincipal,
 )
+from eva_ai.connectors.types import ConnectorStatus
 from eva_ai.db.models import (
     Action,
     ActionApproval,
     ActionProposal,
     ActionResult,
+    ConnectorAccount,
     ManagedGmailDraft,
     OutboxMessage,
+    TelegramAccount,
 )
 from eva_ai.db.session import Database
 from eva_ai.events.types import OutboxState
+from eva_ai.telegram.types import TelegramAccountStatus
 
 _PROPOSAL_NAMESPACE = UUID("bf60a20d-3227-55b9-b4d0-ff7f60c63fe7")
 _ACTION_NAMESPACE = UUID("764d2480-cac1-54f4-bc39-df6aac87faef")
@@ -240,6 +246,251 @@ class ActionRepository:
             async with session.begin():
                 return (await session.scalar(statement)) is not None
 
+    async def load_execution_subject(self, claim: ActionClaim) -> ActionExecutionSubject:
+        async with self._database.session() as session:
+            values = (
+                await session.execute(
+                    select(Action, ActionProposal, ConnectorAccount)
+                    .join(
+                        ActionProposal,
+                        and_(
+                            ActionProposal.id == Action.proposal_id,
+                            ActionProposal.workspace_id == Action.workspace_id,
+                            ActionProposal.user_id == Action.user_id,
+                        ),
+                    )
+                    .join(
+                        ConnectorAccount,
+                        and_(
+                            ConnectorAccount.id == ActionProposal.connector_account_id,
+                            ConnectorAccount.workspace_id == Action.workspace_id,
+                            ConnectorAccount.user_id == Action.user_id,
+                        ),
+                    )
+                    .where(_claim_predicate(claim))
+                )
+            ).one_or_none()
+            if values is None:
+                raise ActionConflictError("action execution subject is unavailable")
+            _, proposal, connector = values
+
+            managed_draft: ManagedGmailDraft | None = None
+            if claim.capability == GmailActionCapability.SEND_DRAFT:
+                managed_draft = await session.scalar(
+                    select(ManagedGmailDraft).where(
+                        ManagedGmailDraft.active_send_proposal_id == proposal.id,
+                        ManagedGmailDraft.workspace_id == claim.workspace_id,
+                        ManagedGmailDraft.user_id == claim.user_id,
+                    )
+                )
+            elif (
+                claim.capability
+                in {
+                    GmailActionCapability.UPDATE_DRAFT,
+                    GmailActionCapability.DELETE_DRAFT,
+                }
+                and proposal.supersedes_proposal_id is not None
+            ):
+                managed_draft = await session.scalar(
+                    select(ManagedGmailDraft).where(
+                        ManagedGmailDraft.active_send_proposal_id
+                        == proposal.supersedes_proposal_id,
+                        ManagedGmailDraft.workspace_id == claim.workspace_id,
+                        ManagedGmailDraft.user_id == claim.user_id,
+                    )
+                )
+
+            approval: ActionApproval | None = None
+            if claim.capability == GmailActionCapability.SEND_DRAFT:
+                approval = await session.scalar(
+                    select(ActionApproval).where(
+                        ActionApproval.proposal_id == proposal.id,
+                        ActionApproval.workspace_id == claim.workspace_id,
+                        ActionApproval.user_id == claim.user_id,
+                    )
+                )
+            telegram = await session.scalar(
+                select(TelegramAccount)
+                .where(
+                    TelegramAccount.workspace_id == claim.workspace_id,
+                    TelegramAccount.user_id == claim.user_id,
+                    TelegramAccount.status == TelegramAccountStatus.ACTIVE,
+                )
+                .limit(1)
+            )
+
+        return ActionExecutionSubject(
+            claim=claim,
+            proposal=_proposal_record(proposal),
+            connector_id=connector.id,
+            connector_identity=connector.account_identity,
+            connector_status=connector.status,
+            connector_scopes=tuple(connector.granted_scopes),
+            secret_reference=connector.secret_reference,
+            managed_draft=None if managed_draft is None else _managed_draft_record(managed_draft),
+            approval=None if approval is None else _approval_record(approval),
+            telegram_principal=(
+                None
+                if telegram is None
+                else TelegramApprovalPrincipal(
+                    telegram_account_id=telegram.id,
+                    provider_chat_id=telegram.chat_id,
+                )
+            ),
+        )
+
+    async def release_pre_provider_failure(
+        self,
+        claim: ActionClaim,
+        *,
+        failed_at: datetime,
+    ) -> None:
+        del failed_at
+        statement = (
+            update(Action)
+            .where(_claim_predicate(claim), Action.provider_call_started_at.is_(None))
+            .values(
+                status=ActionStatus.QUEUED,
+                claim_id=None,
+                lease_expires_at=None,
+                failure_code="pre_provider_failure",
+                failure_summary="execution will be retried",
+            )
+        )
+        async with self._database.session() as session:
+            async with session.begin():
+                await session.execute(statement)
+
+    async def fail_validation(self, claim: ActionClaim, *, failed_at: datetime) -> None:
+        await self._finish_failed(
+            claim,
+            failed_at=failed_at,
+            action_status=ActionStatus.FAILED,
+            failure_code="validation_failed",
+            failure_summary="action validation failed",
+            provider_status_category="validation",
+        )
+
+    async def mark_execution_unknown(self, claim: ActionClaim, *, failed_at: datetime) -> None:
+        await self._finish_failed(
+            claim,
+            failed_at=failed_at,
+            action_status=ActionStatus.UNKNOWN,
+            failure_code="provider_outcome_unknown",
+            failure_summary="provider outcome requires reconciliation",
+            provider_status_category="unknown",
+        )
+
+    async def mark_execution_unavailable(
+        self,
+        claim: ActionClaim,
+        *,
+        connector_id: UUID,
+        failed_at: datetime,
+    ) -> None:
+        async with self._database.session() as session:
+            async with session.begin():
+                action = await session.scalar(
+                    select(Action).where(_claim_predicate(claim)).with_for_update()
+                )
+                if action is None:
+                    return
+                proposal = await session.scalar(
+                    select(ActionProposal).where(
+                        ActionProposal.id == claim.proposal_id,
+                        ActionProposal.workspace_id == claim.workspace_id,
+                        ActionProposal.user_id == claim.user_id,
+                    )
+                )
+                connector = await session.scalar(
+                    select(ConnectorAccount).where(
+                        ConnectorAccount.id == connector_id,
+                        ConnectorAccount.workspace_id == claim.workspace_id,
+                        ConnectorAccount.user_id == claim.user_id,
+                    )
+                )
+                action.status = ActionStatus.FAILED
+                action.finished_at = failed_at
+                action.claim_id = None
+                action.lease_expires_at = None
+                action.failure_code = "action_reauthorization_required"
+                action.failure_summary = "Gmail action authorization is unavailable"
+                if proposal is not None:
+                    proposal.status = ActionProposalStatus.FAILED
+                    proposal.terminal_at = failed_at
+                if connector is not None:
+                    # Preserve the secret reference and Gmail sync cursor so read ingestion can be
+                    # resumed or continue after the user expands the OAuth grant.
+                    connector.status = ConnectorStatus.REAUTHORIZATION_REQUIRED
+                    connector.last_error_type = "ActionAuthorizationUnavailable"
+                    connector.last_error_summary = "operation failed"
+                session.add(
+                    ActionResult(
+                        action_id=claim.action_id,
+                        user_id=claim.user_id,
+                        workspace_id=claim.workspace_id,
+                        outcome=ActionStatus.FAILED,
+                        provider_status_category="authorization",
+                        result_metadata={},
+                        created_at=failed_at,
+                    )
+                )
+
+    async def _finish_failed(
+        self,
+        claim: ActionClaim,
+        *,
+        failed_at: datetime,
+        action_status: ActionStatus,
+        failure_code: str,
+        failure_summary: str,
+        provider_status_category: str,
+    ) -> None:
+        async with self._database.session() as session:
+            async with session.begin():
+                action = await session.scalar(
+                    select(Action).where(_claim_predicate(claim)).with_for_update()
+                )
+                if action is None:
+                    return
+                proposal = await session.scalar(
+                    select(ActionProposal).where(
+                        ActionProposal.id == claim.proposal_id,
+                        ActionProposal.workspace_id == claim.workspace_id,
+                        ActionProposal.user_id == claim.user_id,
+                    )
+                )
+                action.status = action_status
+                action.finished_at = failed_at
+                action.claim_id = None
+                action.lease_expires_at = None
+                action.failure_code = failure_code
+                action.failure_summary = failure_summary
+                if proposal is not None:
+                    proposal.status = ActionProposalStatus.FAILED
+                    proposal.terminal_at = failed_at
+                managed = await session.scalar(
+                    select(ManagedGmailDraft).where(
+                        ManagedGmailDraft.active_send_proposal_id == claim.proposal_id,
+                        ManagedGmailDraft.workspace_id == claim.workspace_id,
+                        ManagedGmailDraft.user_id == claim.user_id,
+                    )
+                )
+                if managed is not None and action_status == ActionStatus.UNKNOWN:
+                    managed.status = ManagedDraftStatus.UNKNOWN
+                    managed.updated_at = failed_at
+                session.add(
+                    ActionResult(
+                        action_id=claim.action_id,
+                        user_id=claim.user_id,
+                        workspace_id=claim.workspace_id,
+                        outcome=action_status,
+                        provider_status_category=provider_status_category,
+                        result_metadata={},
+                        created_at=failed_at,
+                    )
+                )
+
     async def complete_create_draft(
         self,
         claim: ActionClaim,
@@ -372,6 +623,251 @@ class ActionRepository:
                     managed_draft=_managed_draft_record(managed_draft),
                     send_proposal=_proposal_record(send_proposal),
                     approval=_approval_record(approval),
+                )
+
+    async def complete_update_draft(
+        self,
+        claim: ActionClaim,
+        *,
+        provider_draft_id: str,
+        provider_message_id: str | None,
+        provider_thread_id: str | None,
+        callback_token_digest: str,
+        telegram_account_id: UUID,
+        provider_chat_id: int,
+        approval_expires_at: datetime,
+        completed_at: datetime,
+    ) -> CreateDraftCompletion:
+        async with self._database.session() as session:
+            async with session.begin():
+                values = (
+                    await session.execute(
+                        select(Action, ActionProposal)
+                        .join(
+                            ActionProposal,
+                            and_(
+                                ActionProposal.id == Action.proposal_id,
+                                ActionProposal.workspace_id == Action.workspace_id,
+                                ActionProposal.user_id == Action.user_id,
+                            ),
+                        )
+                        .where(_claim_predicate(claim))
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if values is None:
+                    raise ActionConflictError("action claim is stale")
+                action_row, update_proposal = values
+                if (
+                    action_row.capability != GmailActionCapability.UPDATE_DRAFT
+                    or update_proposal.supersedes_proposal_id is None
+                ):
+                    raise ActionValidationError("action is not a managed Gmail draft update")
+                managed_draft = await session.scalar(
+                    select(ManagedGmailDraft)
+                    .where(
+                        ManagedGmailDraft.active_send_proposal_id
+                        == update_proposal.supersedes_proposal_id,
+                        ManagedGmailDraft.workspace_id == claim.workspace_id,
+                        ManagedGmailDraft.user_id == claim.user_id,
+                    )
+                    .with_for_update()
+                )
+                if managed_draft is None or managed_draft.provider_draft_id != provider_draft_id:
+                    raise ActionValidationError("managed Gmail draft is unavailable")
+
+                message = CanonicalEmail.model_validate(update_proposal.parameters_json)
+                action_row.status = ActionStatus.SUCCEEDED
+                action_row.finished_at = completed_at
+                action_row.claim_id = None
+                action_row.lease_expires_at = None
+                update_proposal.status = ActionProposalStatus.COMPLETED
+                update_proposal.terminal_at = completed_at
+                session.add(
+                    ActionResult(
+                        action_id=action_row.id,
+                        user_id=action_row.user_id,
+                        workspace_id=action_row.workspace_id,
+                        outcome=ActionStatus.SUCCEEDED,
+                        provider_status_category="success",
+                        provider_draft_id=provider_draft_id,
+                        provider_message_id=provider_message_id,
+                        provider_thread_id=provider_thread_id,
+                        result_metadata={},
+                        created_at=completed_at,
+                    )
+                )
+
+                send_version = managed_draft.send_proposal_version + 1
+                send_source_key = f"managed-draft:{managed_draft.id}:send:{send_version}"
+                send_proposal_id = uuid5(
+                    _PROPOSAL_NAMESPACE,
+                    f"{action_row.workspace_id}:{action_row.user_id}:{send_source_key}",
+                )
+                send_proposal = ActionProposal(
+                    id=send_proposal_id,
+                    user_id=action_row.user_id,
+                    workspace_id=action_row.workspace_id,
+                    connector_account_id=update_proposal.connector_account_id,
+                    event_id=update_proposal.event_id,
+                    situation_id=update_proposal.situation_id,
+                    goal_id=update_proposal.goal_id,
+                    agent_run_id=update_proposal.agent_run_id,
+                    conversation_turn_id=update_proposal.conversation_turn_id,
+                    supersedes_proposal_id=update_proposal.supersedes_proposal_id,
+                    source_key=send_source_key,
+                    proposal_family_key=f"managed-draft:{managed_draft.id}:send",
+                    origin=update_proposal.origin,
+                    capability=GmailActionCapability.SEND_DRAFT,
+                    parameters_json=message.model_dump(mode="json"),
+                    parameters_hash=update_proposal.parameters_hash,
+                    description="Send the exact revised managed Gmail draft",
+                    risk_level="high",
+                    policy_decision=PolicyDecision.REQUIRE_APPROVAL,
+                    status=ActionProposalStatus.WAITING_APPROVAL,
+                    version=send_version,
+                    created_at=completed_at,
+                    expires_at=approval_expires_at,
+                )
+                approval = ActionApproval(
+                    id=uuid5(_APPROVAL_NAMESPACE, str(send_proposal_id)),
+                    proposal_id=send_proposal_id,
+                    user_id=action_row.user_id,
+                    workspace_id=action_row.workspace_id,
+                    parameters_hash=update_proposal.parameters_hash,
+                    principal_type="TELEGRAM",
+                    telegram_account_id=telegram_account_id,
+                    provider_chat_id=provider_chat_id,
+                    status=ApprovalStatus.PENDING,
+                    callback_token_digest=callback_token_digest,
+                    requested_at=completed_at,
+                    expires_at=approval_expires_at,
+                )
+                session.add(send_proposal)
+                await session.flush()
+                managed_draft.provider_message_id = provider_message_id
+                managed_draft.gmail_thread_id = provider_thread_id
+                managed_draft.active_send_proposal_id = send_proposal_id
+                managed_draft.send_proposal_version = send_version
+                managed_draft.current_content_hash = update_proposal.parameters_hash
+                managed_draft.status = ManagedDraftStatus.READY
+                managed_draft.updated_at = completed_at
+                session.add(approval)
+                await session.flush()
+                return CreateDraftCompletion(
+                    managed_draft=_managed_draft_record(managed_draft),
+                    send_proposal=_proposal_record(send_proposal),
+                    approval=_approval_record(approval),
+                )
+
+    async def complete_delete_draft(
+        self,
+        claim: ActionClaim,
+        *,
+        provider_draft_id: str,
+        completed_at: datetime,
+    ) -> None:
+        await self._complete_managed_action(
+            claim,
+            provider_draft_id=provider_draft_id,
+            provider_message_id=None,
+            provider_thread_id=None,
+            managed_status=ManagedDraftStatus.DELETED,
+            completed_at=completed_at,
+        )
+
+    async def complete_send_draft(
+        self,
+        claim: ActionClaim,
+        *,
+        provider_draft_id: str,
+        provider_message_id: str,
+        provider_thread_id: str,
+        completed_at: datetime,
+    ) -> None:
+        await self._complete_managed_action(
+            claim,
+            provider_draft_id=provider_draft_id,
+            provider_message_id=provider_message_id,
+            provider_thread_id=provider_thread_id,
+            managed_status=ManagedDraftStatus.SENT,
+            completed_at=completed_at,
+        )
+
+    async def _complete_managed_action(
+        self,
+        claim: ActionClaim,
+        *,
+        provider_draft_id: str,
+        provider_message_id: str | None,
+        provider_thread_id: str | None,
+        managed_status: ManagedDraftStatus,
+        completed_at: datetime,
+    ) -> None:
+        async with self._database.session() as session:
+            async with session.begin():
+                values = (
+                    await session.execute(
+                        select(Action, ActionProposal)
+                        .join(
+                            ActionProposal,
+                            and_(
+                                ActionProposal.id == Action.proposal_id,
+                                ActionProposal.workspace_id == Action.workspace_id,
+                                ActionProposal.user_id == Action.user_id,
+                            ),
+                        )
+                        .where(_claim_predicate(claim))
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if values is None:
+                    raise ActionConflictError("action claim is stale")
+                action, proposal = values
+                managed_predicate = (
+                    ManagedGmailDraft.active_send_proposal_id == proposal.id
+                    if claim.capability == GmailActionCapability.SEND_DRAFT
+                    else ManagedGmailDraft.active_send_proposal_id
+                    == proposal.supersedes_proposal_id
+                )
+                managed = await session.scalar(
+                    select(ManagedGmailDraft)
+                    .where(
+                        managed_predicate,
+                        ManagedGmailDraft.workspace_id == claim.workspace_id,
+                        ManagedGmailDraft.user_id == claim.user_id,
+                    )
+                    .with_for_update()
+                )
+                if managed is None or managed.provider_draft_id != provider_draft_id:
+                    raise ActionValidationError("managed Gmail draft is unavailable")
+                action.status = ActionStatus.SUCCEEDED
+                action.finished_at = completed_at
+                action.claim_id = None
+                action.lease_expires_at = None
+                proposal.status = ActionProposalStatus.COMPLETED
+                proposal.terminal_at = completed_at
+                managed.status = managed_status
+                managed.updated_at = completed_at
+                if managed_status == ManagedDraftStatus.SENT:
+                    managed.provider_message_id = provider_message_id
+                    managed.gmail_thread_id = provider_thread_id
+                    managed.sent_at = completed_at
+                elif managed_status == ManagedDraftStatus.DELETED:
+                    managed.deleted_at = completed_at
+                session.add(
+                    ActionResult(
+                        action_id=action.id,
+                        user_id=action.user_id,
+                        workspace_id=action.workspace_id,
+                        outcome=ActionStatus.SUCCEEDED,
+                        provider_status_category="success",
+                        provider_draft_id=provider_draft_id,
+                        provider_message_id=provider_message_id,
+                        provider_thread_id=provider_thread_id,
+                        result_metadata={},
+                        created_at=completed_at,
+                    )
                 )
 
     async def grant_and_queue_send(

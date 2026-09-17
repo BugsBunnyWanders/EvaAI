@@ -108,6 +108,14 @@ class ApprovalDecisionOutcome(StrEnum):
     STALE = "STALE"
 
 
+class ActionExecutionOutcome(StrEnum):
+    SUCCEEDED = "SUCCEEDED"
+    TERMINAL = "TERMINAL"
+    RETRY = "RETRY"
+    UNKNOWN = "UNKNOWN"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
 class NewActionProposal(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -312,3 +320,35 @@ class ActionTaskRequest(BaseModel):
 
     action_id: UUID
     schema_version: int = Field(default=1, gt=0)
+
+
+class TelegramApprovalPrincipal(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    telegram_account_id: UUID
+    provider_chat_id: int
+
+
+class ActionExecutionSubject(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    claim: ActionClaim
+    proposal: ActionProposalRecord
+    connector_id: UUID
+    connector_identity: str
+    connector_status: str
+    connector_scopes: tuple[str, ...]
+    secret_reference: str | None
+    managed_draft: ManagedGmailDraftRecord | None = None
+    approval: ApprovalRecord | None = None
+    telegram_principal: TelegramApprovalPrincipal | None = None
+
+
+class ActionExecutionResult(BaseModel):
+    """Sanitized executor result safe for Cloud Tasks HTTP responses and logs."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    action_id: UUID
+    outcome: ActionExecutionOutcome
+    provider_status_category: str | None = Field(default=None, max_length=100)

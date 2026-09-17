@@ -90,7 +90,7 @@ class GmailResources:
         return self._request(operation, kwargs)
 
     def get(self, **kwargs: object) -> ExecutableRequest:
-        is_draft = kwargs.get("format") == "full" and str(kwargs.get("id", "")).startswith("draft-")
+        is_draft = kwargs.get("format") == "raw" and str(kwargs.get("id", "")).startswith("draft-")
         operation = "get_draft" if is_draft else "get_message"
         return self._request(operation, kwargs)
 
@@ -353,7 +353,7 @@ async def test_gmail_action_client_uses_only_users_drafts_endpoints() -> None:
                 "body": {"message": {"raw": "encoded-update", "threadId": "thread-1"}},
             },
         ),
-        ("get_draft", {"userId": "me", "id": "draft-1", "format": "full"}),
+        ("get_draft", {"userId": "me", "id": "draft-1", "format": "raw"}),
         ("send_draft", {"userId": "me", "body": {"id": "draft-1"}}),
         ("delete_draft", {"userId": "me", "id": "draft-1"}),
     ]

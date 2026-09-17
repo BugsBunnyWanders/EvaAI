@@ -472,7 +472,9 @@ class GoogleGmailClient:
             lambda: (
                 self._service.users()
                 .drafts()
-                .get(userId="me", id=draft_id, format="full")
+                # Raw RFC content is required to prove that the provider draft still matches the
+                # exact immutable proposal approved by the user immediately before send.
+                .get(userId="me", id=draft_id, format="raw")
                 .execute()
             ),
             message_request=True,
