@@ -63,6 +63,7 @@ class ApprovalCardSubject:
     bcc: tuple[str, ...]
     subject: str
     text_body: str
+    html_body: str | None
     expires_at: datetime
 
 
@@ -287,6 +288,7 @@ class NotificationRepository:
                     bcc=message.bcc,
                     subject=message.subject,
                     text_body=message.text_body,
+                    html_body=message.html_body,
                     expires_at=approval.expires_at,
                 )
 

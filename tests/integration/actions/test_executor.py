@@ -19,6 +19,7 @@ from eva_ai.connectors.gmail.contracts import (
     GmailDraftResult,
     GmailSendResult,
 )
+from eva_ai.connectors.repository import ConnectorRepository
 from eva_ai.connectors.types import ConnectorStatus
 from eva_ai.db import Database
 from eva_ai.db.models import (
@@ -27,7 +28,10 @@ from eva_ai.db.models import (
     ConnectorAccount,
     GmailSyncState,
     ManagedGmailDraft,
+    Notification,
+    OutboxMessage,
 )
+from eva_ai.integrations.gmail.api import GmailActionReauthorizationRequired
 from eva_ai.integrations.gmail.oauth import GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE
 from tests.integration.actions.test_repository import _new_create_proposal, _seed_action_scope
 
@@ -81,6 +85,7 @@ async def _create_executor_action(
     database: Database,
     *,
     now: datetime,
+    notification_destination: str | None = None,
 ) -> tuple[ActionRepository, ConnectorAccount, Action]:
     scope, connector_id, event_id, _, _ = await _seed_action_scope(database)
     async with database.session() as session:
@@ -88,7 +93,10 @@ async def _create_executor_action(
             connector = await session.get(ConnectorAccount, connector_id)
             assert connector is not None
             connector.granted_scopes = [GMAIL_READONLY_SCOPE, GMAIL_COMPOSE_SCOPE]
-    repository = ActionRepository(database)
+    repository = ActionRepository(
+        database,
+        notification_destination=notification_destination,
+    )
     created = await repository.create_allowed_action(
         proposal=_new_create_proposal(
             scope,
@@ -156,9 +164,13 @@ async def test_create_execution_is_atomic_and_task_replay_is_terminal(database: 
 
 
 @pytest.mark.integration
-async def test_revocation_preserves_ingestion_secret_and_cursor(database: Database) -> None:
+async def test_action_authorization_failure_preserves_read_ingestion(database: Database) -> None:
     now = datetime.now(UTC)
-    repository, connector, action = await _create_executor_action(database, now=now)
+    repository, connector, action = await _create_executor_action(
+        database,
+        now=now,
+        notification_destination="eva-telegram-delivery",
+    )
     async with database.session() as session:
         async with session.begin():
             session.add(
@@ -169,7 +181,7 @@ async def test_revocation_preserves_ingestion_secret_and_cursor(database: Databa
             )
     executor = _executor(
         repository,
-        Client(error=AuthorizationRevoked("revoked")),
+        Client(error=GmailActionReauthorizationRequired("compose scope missing")),
         now=now,
     )
 
@@ -179,10 +191,45 @@ async def test_revocation_preserves_ingestion_secret_and_cursor(database: Databa
     async with database.session() as session:
         stored_connector = await session.get(ConnectorAccount, connector.id)
         sync = await session.get(GmailSyncState, connector.id)
+        notification = await session.scalar(
+            select(Notification).where(Notification.dedupe_key == f"action:{action.id}:failed")
+        )
+        delivery = (
+            None
+            if notification is None
+            else await session.scalar(
+                select(OutboxMessage).where(
+                    OutboxMessage.payload["notification_id"].astext == str(notification.id)
+                )
+            )
+        )
     assert stored_connector is not None
-    assert stored_connector.status == ConnectorStatus.REAUTHORIZATION_REQUIRED
+    assert stored_connector.status == ConnectorStatus.ACTIVE
+    assert stored_connector.last_error_type == "ActionAuthorizationUnavailable"
     assert stored_connector.secret_reference == connector.secret_reference
     assert sync is not None and sync.history_id == "history-42"
+    assert notification is not None and "Mail reading remains active" in notification.message
+    assert delivery is not None
+    assert await ConnectorRepository(database).claim_sync(connector.id, now, 60) is not None
+
+
+@pytest.mark.integration
+async def test_revoked_grant_requires_full_connector_reauthorization(database: Database) -> None:
+    now = datetime.now(UTC)
+    repository, connector, action = await _create_executor_action(database, now=now)
+    executor = _executor(
+        repository,
+        Client(error=AuthorizationRevoked("revoked")),
+        now=now,
+    )
+
+    result = await executor.execute(ActionTaskRequest(action_id=action.id))
+
+    assert result.outcome is ActionExecutionOutcome.UNAVAILABLE
+    async with database.session() as session:
+        stored = await session.get(ConnectorAccount, connector.id)
+    assert stored is not None
+    assert stored.status == ConnectorStatus.REAUTHORIZATION_REQUIRED
 
 
 @pytest.mark.integration

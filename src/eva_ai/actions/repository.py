@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid5, uuid7
 
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -223,6 +223,36 @@ class ActionRepository:
                                 created_at=now,
                             )
                         )
+                        proposal = await session.scalar(
+                            select(ActionProposal).where(
+                                ActionProposal.id == row.proposal_id,
+                                ActionProposal.workspace_id == row.workspace_id,
+                                ActionProposal.user_id == row.user_id,
+                            )
+                        )
+                        if proposal is not None:
+                            proposal.status = ActionProposalStatus.FAILED
+                            proposal.terminal_at = now
+                            managed = await self._managed_draft_for_proposal(
+                                session,
+                                proposal=proposal,
+                                for_update=True,
+                            )
+                            if managed is not None:
+                                managed.status = ManagedDraftStatus.UNKNOWN
+                                managed.updated_at = now
+                            await self._create_action_status_notification(
+                                session,
+                                action=row,
+                                proposal=proposal,
+                                status_key="unknown",
+                                message=(
+                                    "I can’t confirm whether Gmail completed that action. "
+                                    "I won’t retry it automatically."
+                                ),
+                                urgency=NotificationUrgency.HIGH,
+                                created_at=now,
+                            )
                         await session.flush()
                         return ActionClaimResult(outcome=ActionClaimOutcome.UNKNOWN)
 
@@ -405,6 +435,7 @@ class ActionRepository:
         claim: ActionClaim,
         *,
         connector_id: UUID,
+        read_access_preserved: bool,
         failed_at: datetime,
     ) -> None:
         async with self._database.session() as session:
@@ -438,9 +469,10 @@ class ActionRepository:
                     proposal.status = ActionProposalStatus.FAILED
                     proposal.terminal_at = failed_at
                 if connector is not None:
-                    # Preserve the secret reference and Gmail sync cursor so read ingestion can be
-                    # resumed or continue after the user expands the OAuth grant.
-                    connector.status = ConnectorStatus.REAUTHORIZATION_REQUIRED
+                    # Missing compose authority is action-specific; a revoked or malformed grant
+                    # is not. Preserve ingestion only when readonly remains known to be usable.
+                    if not read_access_preserved:
+                        connector.status = ConnectorStatus.REAUTHORIZATION_REQUIRED
                     connector.last_error_type = "ActionAuthorizationUnavailable"
                     connector.last_error_summary = "operation failed"
                 session.add(
@@ -454,6 +486,31 @@ class ActionRepository:
                         created_at=failed_at,
                     )
                 )
+                if proposal is not None:
+                    managed = await self._managed_draft_for_proposal(
+                        session,
+                        proposal=proposal,
+                        for_update=True,
+                    )
+                    if managed is not None:
+                        managed.status = ManagedDraftStatus.READY
+                        managed.updated_at = failed_at
+                    await self._create_action_status_notification(
+                        session,
+                        action=action,
+                        proposal=proposal,
+                        status_key="failed",
+                        message=(
+                            (
+                                "Gmail needs compose authorization before I can complete that "
+                                "action. Mail reading remains active."
+                            )
+                            if read_access_preserved
+                            else "Reconnect Gmail before I can complete that action."
+                        ),
+                        urgency=NotificationUrgency.HIGH,
+                        created_at=failed_at,
+                    )
 
     async def _finish_failed(
         self,
@@ -488,15 +545,21 @@ class ActionRepository:
                 if proposal is not None:
                     proposal.status = ActionProposalStatus.FAILED
                     proposal.terminal_at = failed_at
-                managed = await session.scalar(
-                    select(ManagedGmailDraft).where(
-                        ManagedGmailDraft.active_send_proposal_id == claim.proposal_id,
-                        ManagedGmailDraft.workspace_id == claim.workspace_id,
-                        ManagedGmailDraft.user_id == claim.user_id,
+                managed = (
+                    None
+                    if proposal is None
+                    else await self._managed_draft_for_proposal(
+                        session,
+                        proposal=proposal,
+                        for_update=True,
                     )
                 )
-                if managed is not None and action_status == ActionStatus.UNKNOWN:
-                    managed.status = ManagedDraftStatus.UNKNOWN
+                if managed is not None:
+                    managed.status = (
+                        ManagedDraftStatus.UNKNOWN
+                        if action_status == ActionStatus.UNKNOWN
+                        else ManagedDraftStatus.READY
+                    )
                     managed.updated_at = failed_at
                 session.add(
                     ActionResult(
@@ -509,6 +572,24 @@ class ActionRepository:
                         created_at=failed_at,
                     )
                 )
+                if proposal is not None:
+                    unknown = action_status == ActionStatus.UNKNOWN
+                    await self._create_action_status_notification(
+                        session,
+                        action=action,
+                        proposal=proposal,
+                        status_key="unknown" if unknown else "failed",
+                        message=(
+                            "I can’t confirm whether Gmail completed that action. "
+                            "I won’t retry it automatically."
+                            if unknown
+                            else "I couldn’t complete that Gmail action."
+                        ),
+                        urgency=(
+                            NotificationUrgency.HIGH if unknown else NotificationUrgency.MEDIUM
+                        ),
+                        created_at=failed_at,
+                    )
 
     async def complete_create_draft(
         self,
@@ -568,7 +649,6 @@ class ActionRepository:
                         created_at=completed_at,
                     )
                 )
-
                 draft_id = uuid5(_DRAFT_NAMESPACE, str(action_row.id))
                 send_version = 1
                 send_source_key = f"managed-draft:{draft_id}:send:{send_version}"
@@ -900,6 +980,19 @@ class ActionRepository:
                         created_at=completed_at,
                     )
                 )
+                await self._create_action_status_notification(
+                    session,
+                    action=action,
+                    proposal=proposal,
+                    status_key="completed",
+                    message=(
+                        "Email sent."
+                        if managed_status == ManagedDraftStatus.SENT
+                        else "Gmail draft discarded."
+                    ),
+                    urgency=NotificationUrgency.MEDIUM,
+                    created_at=completed_at,
+                )
 
     async def grant_and_queue_send(
         self,
@@ -955,6 +1048,14 @@ class ActionRepository:
                     approval.decided_at = now
                     proposal.status = ActionProposalStatus.EXPIRED
                     proposal.terminal_at = now
+                    await self._create_approval_status_notification(
+                        session,
+                        approval=approval,
+                        proposal=proposal,
+                        status_key="expired",
+                        message="This email approval expired without being sent.",
+                        created_at=now,
+                    )
                     await session.flush()
                     return ApprovalDecision(
                         outcome=ApprovalDecisionOutcome.EXPIRED,
@@ -995,6 +1096,15 @@ class ActionRepository:
                 )
                 managed_draft.status = ManagedDraftStatus.SENDING
                 managed_draft.updated_at = now
+                await self._create_action_status_notification(
+                    session,
+                    action=action,
+                    proposal=proposal,
+                    status_key="queued",
+                    message="Approved. I’ve queued this email to send.",
+                    urgency=NotificationUrgency.MEDIUM,
+                    created_at=now,
+                )
                 await session.flush()
                 return ApprovalDecision(
                     outcome=ApprovalDecisionOutcome.QUEUED,
@@ -1086,6 +1196,14 @@ class ActionRepository:
                     approval.decided_at = now
                     proposal.status = ActionProposalStatus.EXPIRED
                     proposal.terminal_at = now
+                    await self._create_approval_status_notification(
+                        session,
+                        approval=approval,
+                        proposal=proposal,
+                        status_key="expired",
+                        message="This email approval expired without being sent.",
+                        created_at=now,
+                    )
                     await session.flush()
                     return _approval_record(approval)
                 if proposal.situation_id is None:
@@ -1414,6 +1532,14 @@ class ActionRepository:
                     approval.decided_at = now
                     send_proposal.status = ActionProposalStatus.EXPIRED
                     send_proposal.terminal_at = now
+                    await self._create_approval_status_notification(
+                        session,
+                        approval=approval,
+                        proposal=send_proposal,
+                        status_key="expired",
+                        message="This email approval expired without being sent.",
+                        created_at=now,
+                    )
                     await session.flush()
                     return ApprovalDecision(
                         outcome=ApprovalDecisionOutcome.EXPIRED,
@@ -1489,6 +1615,15 @@ class ActionRepository:
                 )
                 managed.status = ManagedDraftStatus.DELETING
                 managed.updated_at = now
+                await self._create_action_status_notification(
+                    session,
+                    action=action,
+                    proposal=delete_proposal,
+                    status_key="queued",
+                    message="Discarded. I’ve queued the Gmail draft for deletion.",
+                    urgency=NotificationUrgency.MEDIUM,
+                    created_at=now,
+                )
                 await session.flush()
                 return ApprovalDecision(
                     outcome=ApprovalDecisionOutcome.QUEUED,
@@ -1500,6 +1635,32 @@ class ActionRepository:
         async with self._database.session() as session:
             row = await session.scalar(select(Action).where(Action.id == action_id))
         return None if row is None else _action_record(row)
+
+    async def record_cloud_task_name(
+        self,
+        *,
+        action_id: UUID,
+        user_id: UUID,
+        workspace_id: UUID,
+        cloud_task_name: str,
+    ) -> bool:
+        statement = (
+            update(Action)
+            .where(
+                Action.id == action_id,
+                Action.user_id == user_id,
+                Action.workspace_id == workspace_id,
+                or_(
+                    Action.cloud_task_name.is_(None),
+                    Action.cloud_task_name == cloud_task_name,
+                ),
+            )
+            .values(cloud_task_name=cloud_task_name)
+            .returning(Action.id)
+        )
+        async with self._database.session() as session:
+            async with session.begin():
+                return (await session.scalar(statement)) is not None
 
     async def get_approval(
         self,
@@ -1561,6 +1722,62 @@ class ActionRepository:
         )
         return action
 
+    async def _managed_draft_for_proposal(
+        self,
+        session: AsyncSession,
+        *,
+        proposal: ActionProposal,
+        for_update: bool,
+    ) -> ManagedGmailDraft | None:
+        active_send_proposal_id = (
+            proposal.id
+            if proposal.capability == GmailActionCapability.SEND_DRAFT
+            else proposal.supersedes_proposal_id
+        )
+        if active_send_proposal_id is None:
+            return None
+        statement = select(ManagedGmailDraft).where(
+            ManagedGmailDraft.active_send_proposal_id == active_send_proposal_id,
+            ManagedGmailDraft.workspace_id == proposal.workspace_id,
+            ManagedGmailDraft.user_id == proposal.user_id,
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        managed: ManagedGmailDraft | None = await session.scalar(statement)
+        return managed
+
+    async def _create_action_status_notification(
+        self,
+        session: AsyncSession,
+        *,
+        action: Action,
+        proposal: ActionProposal,
+        status_key: str,
+        message: str,
+        urgency: NotificationUrgency,
+        created_at: datetime,
+    ) -> None:
+        if self._notification_destination is None:
+            return
+        await self._notifications.create_in_session(
+            session,
+            event_id=proposal.event_id,
+            user_id=proposal.user_id,
+            workspace_id=proposal.workspace_id,
+            situation_id=proposal.situation_id,
+            agent_run_id=proposal.agent_run_id,
+            kind=(
+                NotificationKind.PROACTIVE
+                if proposal.origin == ActionOrigin.AGENT_RUN
+                else NotificationKind.REACTIVE
+            ),
+            urgency=urgency,
+            message=message,
+            dedupe_key=f"action:{action.id}:{status_key}",
+            destination=self._notification_destination,
+            created_at=created_at,
+        )
+
     async def _create_approval_notification(
         self,
         session: AsyncSession,
@@ -1589,6 +1806,37 @@ class ActionRepository:
             destination=self._notification_destination,
             created_at=created_at,
             action_approval_id=approval.id,
+        )
+
+    async def _create_approval_status_notification(
+        self,
+        session: AsyncSession,
+        *,
+        approval: ActionApproval,
+        proposal: ActionProposal,
+        status_key: str,
+        message: str,
+        created_at: datetime,
+    ) -> None:
+        if self._notification_destination is None:
+            return
+        await self._notifications.create_in_session(
+            session,
+            event_id=proposal.event_id,
+            user_id=proposal.user_id,
+            workspace_id=proposal.workspace_id,
+            situation_id=proposal.situation_id,
+            agent_run_id=proposal.agent_run_id,
+            kind=(
+                NotificationKind.PROACTIVE
+                if proposal.origin == ActionOrigin.AGENT_RUN
+                else NotificationKind.REACTIVE
+            ),
+            urgency=NotificationUrgency.MEDIUM,
+            message=message,
+            dedupe_key=f"action-approval:{approval.id}:{status_key}",
+            destination=self._notification_destination,
+            created_at=created_at,
         )
 
 

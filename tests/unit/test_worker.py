@@ -98,7 +98,7 @@ def test_disabled_actions_refuse_dispatcher_and_executor_composition() -> None:
 
     with pytest.raises(ValueError, match="action execution is disabled"):
         build_action_dispatch_dependencies(settings)
-    with pytest.raises(ValueError, match="action execution is disabled"):
+    with pytest.raises(ValueError, match="action executor is disabled"):
         build_action_executor_dependencies(settings)
 
 
@@ -117,7 +117,7 @@ def test_action_application_composition_shares_repository_across_proposal_and_re
 def test_action_executor_publishes_follow_up_approvals_without_telegram_routes() -> None:
     settings = Settings(
         _env_file=None,
-        actions_enabled=True,
+        action_executor_enabled=True,
         pubsub_project_id="eva-project",
         action_tasks_project_id="eva-project",
         action_tasks_location="asia-south1",

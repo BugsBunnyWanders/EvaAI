@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -49,6 +50,9 @@ def test_action_runtime_environment_and_output_use_executor_default_url() -> Non
     assert "EVA_ACTION_EXECUTOR_URL" in locals
     assert "EVA_ACTION_EXECUTOR_AUDIENCE" in locals
     assert "EVA_ACTION_TASK_CALLER_SERVICE_ACCOUNT" in locals
+    executor_environment = locals.split("action_executor_environment", maxsplit=1)[1]
+    assert re.search(r'EVA_ACTIONS_ENABLED\s*=\s*"false"', executor_environment)
+    assert re.search(r'EVA_ACTION_EXECUTOR_ENABLED\s*=\s*"true"', executor_environment)
     assert 'output "action_executor_url"' in outputs
     assert "google_cloud_run_v2_service.action_executor.uri" in outputs
 

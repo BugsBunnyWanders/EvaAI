@@ -155,9 +155,10 @@ class Repository:
         claim: ActionClaim,
         *,
         connector_id: UUID,
+        read_access_preserved: bool,
         failed_at: datetime,
     ) -> None:
-        self.calls.append(("unavailable", (claim, connector_id, failed_at)))
+        self.calls.append(("unavailable", (claim, connector_id, read_access_preserved, failed_at)))
 
     async def fail_validation(self, claim: ActionClaim, *, failed_at: datetime) -> None:
         self.calls.append(("invalid", (claim, failed_at)))

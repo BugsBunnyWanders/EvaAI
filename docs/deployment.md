@@ -143,8 +143,11 @@ gh variable set EVA_ACTIONS_ENABLED --body true
 gh workflow run "Deploy Eva to GCP"
 ```
 
-This flag enables proposal, approval, dispatch, and execution code in the API, shared worker, and
-private executor. It does not bypass exact Telegram approval for sending.
+This flag enables proposal, approval, and dispatch code in the API and shared worker, and therefore
+requires Telegram processing and delivery to be enabled. The private executor uses
+`EVA_ACTION_EXECUTOR_ENABLED=true` in its own Cloud Run environment, so it remains bootable and can
+finish already-authorized durable tasks if the public feature is switched off. Only the dedicated
+task-caller identity can invoke it, and neither flag bypasses exact Telegram approval for sending.
 
 Do not enable the worker against an empty connector database. Gmail notifications for an unknown
 account are acknowledged deliberately and would not be replayed later.

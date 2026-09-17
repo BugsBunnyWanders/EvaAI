@@ -427,7 +427,8 @@ class GoogleGmailClient:
                 .drafts()
                 .create(userId="me", body={"message": _draft_message(raw, thread_id)})
                 .execute()
-            )
+            ),
+            retry_transient=False,
         )
         return _draft_result(response)
 
@@ -460,7 +461,8 @@ class GoogleGmailClient:
         response = await self._execute(
             lambda: (
                 self._service.users().drafts().send(userId="me", body={"id": draft_id}).execute()
-            )
+            ),
+            retry_transient=False,
         )
         return GmailSendResult(
             message_id=_required_string(response, "id", "draft send"),
@@ -486,6 +488,7 @@ class GoogleGmailClient:
         *,
         history_request: bool = False,
         message_request: bool = False,
+        retry_transient: bool = True,
     ) -> Mapping[str, object]:
         result: Mapping[str, object] | _RequestFailure = _RequestFailure.PROVIDER
         for attempt in range(self._retry_attempts):
@@ -512,8 +515,10 @@ class GoogleGmailClient:
             except httplib2.HttpLib2Error, OSError, TransportError:
                 result = _RequestFailure.TRANSIENT
 
+            # Refresh failures happen before Gmail accepts the request. Ambiguous transport/server
+            # failures do not earn an adapter retry for non-idempotent create/send mutations.
             retryable = result is _RequestFailure.AUTHORIZATION_REFRESH or (
-                result is _RequestFailure.TRANSIENT
+                retry_transient and result is _RequestFailure.TRANSIENT
             )
             if not retryable or attempt + 1 >= self._retry_attempts:
                 break

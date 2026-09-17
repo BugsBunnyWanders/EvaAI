@@ -84,6 +84,7 @@ class ActionExecutorStore(Protocol):
         claim: ActionClaim,
         *,
         connector_id: UUID,
+        read_access_preserved: bool,
         failed_at: datetime,
     ) -> None: ...
 
@@ -134,6 +135,7 @@ class ActionExecutor:
             await self._repository.mark_execution_unavailable(
                 claim,
                 connector_id=subject.connector_id,
+                read_access_preserved=True,
                 failed_at=self._clock(),
             )
             return _result(request, ActionExecutionOutcome.UNAVAILABLE, "authorization")
@@ -150,10 +152,19 @@ class ActionExecutor:
         try:
             authorized_user_json = await self._credentials.get(subject.secret_reference)
             client = await self._gmail_factory.create_action(authorized_user_json)
-        except GmailActionReauthorizationRequired, InvalidAuthorizedUserCredentials:
+        except GmailActionReauthorizationRequired:
             await self._repository.mark_execution_unavailable(
                 claim,
                 connector_id=subject.connector_id,
+                read_access_preserved=True,
+                failed_at=self._clock(),
+            )
+            return _result(request, ActionExecutionOutcome.UNAVAILABLE, "authorization")
+        except InvalidAuthorizedUserCredentials:
+            await self._repository.mark_execution_unavailable(
+                claim,
+                connector_id=subject.connector_id,
+                read_access_preserved=False,
                 failed_at=self._clock(),
             )
             return _result(request, ActionExecutionOutcome.UNAVAILABLE, "authorization")
@@ -182,10 +193,19 @@ class ActionExecutor:
             provider_result = await self._execute_provider(adapter, subject)
             await self._complete(claim, subject, provider_result)
             return _result(request, ActionExecutionOutcome.SUCCEEDED, "success")
-        except AuthorizationRevoked, GmailActionReauthorizationRequired:
+        except GmailActionReauthorizationRequired:
             await self._repository.mark_execution_unavailable(
                 claim,
                 connector_id=subject.connector_id,
+                read_access_preserved=True,
+                failed_at=self._clock(),
+            )
+            return _result(request, ActionExecutionOutcome.UNAVAILABLE, "authorization")
+        except AuthorizationRevoked:
+            await self._repository.mark_execution_unavailable(
+                claim,
+                connector_id=subject.connector_id,
+                read_access_preserved=False,
                 failed_at=self._clock(),
             )
             return _result(request, ActionExecutionOutcome.UNAVAILABLE, "authorization")

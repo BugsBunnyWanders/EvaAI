@@ -77,7 +77,9 @@ async def test_reserve_gmail_normalizes_identity_and_is_stable_within_workspace(
     assert first.status == ConnectorStatus.CONNECTING
     assert first.secret_reference is None and first.connected_at is None
     assert state is not None and state.history_id is None
-    assert found == first
+    assert first.granted_scopes == ("scope-a",)
+    assert second.granted_scopes == ("scope-b",)
+    assert found == second
     assert missing is None
 
     other_scope = await create_scope(database)

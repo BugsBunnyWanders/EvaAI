@@ -368,3 +368,53 @@ async def test_schedule_claim_complete_is_scoped_and_idempotent(database: Databa
     assert notification is not None
     assert notification.message == "The meeting time changed. Would you like the details?"
     assert delivery_count == 1
+
+    clarification_runs = AgentRunRepository(database, "eva-telegram-delivery")
+    async with database.session() as session:
+        async with session.begin():
+            clarification = await clarification_runs.schedule_in_session(
+                session,
+                event_id=event_id,
+                signal_id=signal.id,
+                situation_id=situation_id,
+                user_id=scope.user_id,
+                workspace_id=scope.workspace_id,
+                destination="eva-agent-runs",
+                provider="openai",
+                model="gpt-5.6-sol",
+                agent_version="v3",
+                prompt_version="p3",
+                queued_at=NOW + timedelta(minutes=4),
+            )
+    clarification_message = proactive_message.model_copy(update={"agent_run_id": clarification.id})
+    clarification_claim = await clarification_runs.claim(
+        clarification_message,
+        now=NOW + timedelta(minutes=4),
+        lease_seconds=60,
+    )
+    assert clarification_claim is not None
+
+    await clarification_runs.complete(
+        clarification_claim,
+        result=AgentInvestigationResult(
+            decision=AgentDecision.NOTIFY_USER,
+            reasoning_summary="The recipient is ambiguous.",
+            notification=NotificationProposal(
+                urgency=NotificationUrgency.LOW,
+                message="This model notification must be replaced.",
+            ),
+        ),
+        input_digest="d" * 64,
+        provider_response_id="response-3",
+        usage=AgentUsage(),
+        tool_audit=(),
+        prepared_clarification="Which email address should I use for Jane Doe?",
+        completed_at=NOW + timedelta(minutes=5),
+    )
+
+    async with database.session() as session:
+        clarification_notification = await session.scalar(
+            select(Notification).where(Notification.agent_run_id == clarification.id)
+        )
+    assert clarification_notification is not None
+    assert clarification_notification.message == "Which email address should I use for Jane Doe?"

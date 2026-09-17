@@ -142,10 +142,25 @@ async def test_allowed_action_and_outbox_are_atomic_and_replay_safe(database: Da
         proposal=proposal_input,
         destination="eva-events",
     )
+    task_name = f"projects/eva/locations/test/queues/actions/tasks/{first.action.id}"
+    assert await repository.record_cloud_task_name(
+        action_id=first.action.id,
+        user_id=scope.user_id,
+        workspace_id=scope.workspace_id,
+        cloud_task_name=task_name,
+    )
+    assert await repository.record_cloud_task_name(
+        action_id=first.action.id,
+        user_id=scope.user_id,
+        workspace_id=scope.workspace_id,
+        cloud_task_name=task_name,
+    )
 
     assert replay == first
     assert first.proposal.status is ActionProposalStatus.QUEUED
     assert first.action.status is ActionStatus.QUEUED
+    persisted_action = await repository.get_action(first.action.id)
+    assert persisted_action is not None and persisted_action.cloud_task_name == task_name
     async with database.session() as session:
         proposal_count = await session.scalar(
             select(func.count())
@@ -340,7 +355,7 @@ async def test_expired_approval_never_queues_send(database: Database) -> None:
 @pytest.mark.integration
 async def test_expired_lease_after_provider_boundary_becomes_unknown(database: Database) -> None:
     scope, connector_id, event_id, _, _ = await _seed_action_scope(database)
-    repository = ActionRepository(database)
+    repository = ActionRepository(database, notification_destination="eva-telegram-delivery")
     now = datetime.now(UTC)
     created = await repository.create_allowed_action(
         proposal=_new_create_proposal(
@@ -372,6 +387,28 @@ async def test_expired_lease_after_provider_boundary_becomes_unknown(database: D
     stored = await repository.get_action(created.action.id)
     assert stored is not None
     assert stored.status is ActionStatus.UNKNOWN
+    async with database.session() as session:
+        proposal_status = await session.scalar(
+            select(ActionProposal.status).where(ActionProposal.id == created.proposal.id)
+        )
+        notification = await session.scalar(
+            select(Notification).where(
+                Notification.dedupe_key == f"action:{created.action.id}:unknown"
+            )
+        )
+        outbox = (
+            None
+            if notification is None
+            else await session.scalar(
+                select(OutboxMessage).where(
+                    OutboxMessage.payload["notification_id"].astext == str(notification.id)
+                )
+            )
+        )
+    assert proposal_status == ActionProposalStatus.FAILED
+    assert notification is not None
+    assert "can’t confirm" in notification.message
+    assert outbox is not None
 
 
 @pytest.mark.integration

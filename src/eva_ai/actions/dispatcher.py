@@ -22,6 +22,15 @@ _TERMINAL_STATUSES = {ActionStatus.SUCCEEDED, ActionStatus.FAILED, ActionStatus.
 class ActionDispatchStore(Protocol):
     async def get_action(self, action_id: UUID) -> ActionRecord | None: ...
 
+    async def record_cloud_task_name(
+        self,
+        *,
+        action_id: UUID,
+        user_id: UUID,
+        workspace_id: UUID,
+        cloud_task_name: str,
+    ) -> bool: ...
+
 
 class ActionTaskEnqueuer(Protocol):
     async def enqueue(
@@ -120,13 +129,21 @@ class ActionDispatchPullWorker:
             if action.status in _TERMINAL_STATUSES:
                 _log_outcome(message, "terminal_acknowledged")
                 return True
-            await self._enqueuer.enqueue(
+            cloud_task_name = await self._enqueuer.enqueue(
                 ActionTaskRequest(
                     action_id=action.id,
                     schema_version=envelope.schema_version,
                 ),
                 action.capability,
             )
+            recorded = await self._store.record_cloud_task_name(
+                action_id=action.id,
+                user_id=action.user_id,
+                workspace_id=action.workspace_id,
+                cloud_task_name=cloud_task_name,
+            )
+            if not recorded:
+                raise ActionDispatchTransportError("action task audit update failed")
         except asyncio.CancelledError:
             raise
         except Exception:

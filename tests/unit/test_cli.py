@@ -1599,15 +1599,8 @@ async def test_worker_run_adds_action_dispatch_loop_when_enabled(
 
         monkeypatch.setattr(cli_module, function_name, command)
 
-    settings = Settings(
-        _env_file=None,
-        environment="test",
-        actions_enabled=True,
-        action_tasks_project_id="eva-project",
-        action_tasks_location="asia-south1",
-        action_executor_url="https://executor.example/internal/actions/execute",
-        action_executor_audience="https://executor.example",
-        action_task_caller_service_account="caller@eva-project.iam.gserviceaccount.com",
+    settings = Settings(_env_file=None, environment="test").model_copy(
+        update={"actions_enabled": True}
     )
     task = asyncio.create_task(worker_run_command(settings=settings))
 

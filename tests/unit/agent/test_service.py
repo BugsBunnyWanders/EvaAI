@@ -155,15 +155,16 @@ class Agent:
 
 
 class ProposalPreparer:
-    def __init__(self) -> None:
+    def __init__(self, preparation: ActionProposalPreparation | None = None) -> None:
         self.calls = 0
+        self.preparation = preparation
 
     async def prepare_model_proposals(self, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
         del args, kwargs
         self.calls += 1
         from eva_ai.actions.canonical import CanonicalEmail
 
-        return ActionProposalPreparation(
+        return self.preparation or ActionProposalPreparation(
             proposals=(
                 PreparedActionProposal(
                     capability=GmailActionCapability.CREATE_DRAFT,
@@ -225,6 +226,31 @@ async def test_service_prepares_and_commits_proactive_action_intent() -> None:
     assert preparer.calls == 1
     prepared = runs.completion_values["prepared_actions"]
     assert isinstance(prepared, tuple) and len(prepared) == 1
+
+
+async def test_service_commits_proactive_recipient_clarification() -> None:
+    message, subject, context = _fixture()
+    runs = Runs(subject)
+    client = Client()
+    preparer = ProposalPreparer(
+        ActionProposalPreparation(clarification="Which address should I use for Jane Doe?")
+    )
+    service = _service(
+        runs,
+        context,
+        client,
+        Agent(propose=True),
+        action_proposals=cast(ActionProposalPreparer, preparer),
+    )
+
+    outcome = await service.process(message)
+
+    assert outcome is InvestigationOutcome.SUCCEEDED
+    assert runs.completion_values["prepared_actions"] == ()
+    assert (
+        runs.completion_values["prepared_clarification"]
+        == "Which address should I use for Jane Doe?"
+    )
 
 
 async def test_service_classifies_transient_agent_failure_for_retry() -> None:

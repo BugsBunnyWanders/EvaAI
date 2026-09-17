@@ -17,6 +17,7 @@ from eva_ai.agent.types import (
     AgentRunRequestedMessage,
     AgentRunStatus,
     AgentUsage,
+    NotificationUrgency,
     ToolCallAudit,
 )
 from eva_ai.db.models import AgentRun, ConnectorAccount, Event, OutboxMessage, Signal
@@ -263,6 +264,7 @@ class AgentRunRepository:
         usage: AgentUsage,
         tool_audit: tuple[ToolCallAudit, ...],
         prepared_actions: tuple[PreparedActionProposal, ...] = (),
+        prepared_clarification: str | None = None,
         completed_at: datetime,
     ) -> AgentRunRecord:
         statement = (
@@ -291,9 +293,19 @@ class AgentRunRepository:
                 row = (await session.scalars(statement)).one_or_none()
                 if row is None:
                     raise AgentConflictError("AgentRun claim is stale")
-                if result.notification is not None and self._notification_destination is not None:
+                notification = result.notification
+                if (
+                    prepared_clarification is not None or notification is not None
+                ) and self._notification_destination is not None:
                     # Agent completion and proactive delivery intent commit together. A crash can
                     # delay publication, but cannot leave a successful user-facing run invisible.
+                    if prepared_clarification is not None:
+                        notification_urgency = NotificationUrgency.MEDIUM
+                        notification_message = prepared_clarification
+                    else:
+                        assert notification is not None
+                        notification_urgency = notification.urgency
+                        notification_message = notification.message
                     await self._notifications.create_in_session(
                         session,
                         event_id=row.event_id,
@@ -302,8 +314,8 @@ class AgentRunRepository:
                         situation_id=row.situation_id,
                         agent_run_id=row.id,
                         kind=NotificationKind.PROACTIVE,
-                        urgency=result.notification.urgency,
-                        message=result.notification.message,
+                        urgency=notification_urgency,
+                        message=notification_message,
                         dedupe_key=(
                             f"agent-run:{row.id}:notification:v{row.output_schema_version}"
                         ),

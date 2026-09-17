@@ -49,8 +49,8 @@ class ActionExecutorDependencies:
 
 
 def build_action_executor_dependencies(settings: Settings) -> ActionExecutorDependencies:
-    if not settings.actions_enabled:
-        raise ValueError("action execution is disabled")
+    if not settings.action_executor_enabled:
+        raise ValueError("action executor is disabled")
     project_id = settings.pubsub_project_id
     if project_id is None or not project_id.strip():
         raise ValueError("Pub/Sub project configuration is incomplete")

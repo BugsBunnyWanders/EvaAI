@@ -210,6 +210,7 @@ async def test_approval_delivery_generates_ephemeral_token_and_keyboard_only_on_
         bcc=("bcc@example.com",),
         subject="Exact subject",
         text_body=body.rstrip(),
+        html_body="<p>Different HTML alternative</p>",
         expires_at=NOW,
     )
     telegram = FakeTelegram()
@@ -235,6 +236,7 @@ async def test_approval_delivery_generates_ephemeral_token_and_keyboard_only_on_
     assert raw_token != repository.bound_digest
     rendered = "".join(text for _, text, _, _ in telegram.calls)
     assert body.rstrip() in rendered
+    assert "HTML body (source):\n<p>Different HTML alternative</p>" in rendered
     assert "Mode: New email" in rendered
     assert "To: to@example.com" in rendered
     assert "Cc: cc@example.com" in rendered
@@ -254,6 +256,7 @@ def test_approval_card_splits_without_truncating_complete_body() -> None:
             bcc=(),
             subject="Re: Exact subject",
             text_body=body.rstrip(),
+            html_body=None,
             expires_at=NOW,
         ),
         callback_token="opaque-token",

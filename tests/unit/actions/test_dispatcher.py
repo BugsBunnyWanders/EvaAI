@@ -38,10 +38,22 @@ class Store:
     def __init__(self, action: ActionRecord | None) -> None:
         self.action = action
         self.requested: list[UUID] = []
+        self.task_names: list[tuple[UUID, UUID, UUID, str]] = []
 
     async def get_action(self, action_id: UUID) -> ActionRecord | None:
         self.requested.append(action_id)
         return self.action
+
+    async def record_cloud_task_name(
+        self,
+        *,
+        action_id: UUID,
+        user_id: UUID,
+        workspace_id: UUID,
+        cloud_task_name: str,
+    ) -> bool:
+        self.task_names.append((action_id, user_id, workspace_id, cloud_task_name))
+        return True
 
 
 class Enqueuer:
@@ -128,6 +140,14 @@ async def test_successful_enqueue_is_acknowledged_with_opaque_task_body() -> Non
         (
             ActionTaskRequest(action_id=envelope.action_id),
             GmailActionCapability.CREATE_DRAFT,
+        )
+    ]
+    assert store.task_names == [
+        (
+            envelope.action_id,
+            envelope.user_id,
+            envelope.workspace_id,
+            f"tasks/{envelope.action_id}",
         )
     ]
 

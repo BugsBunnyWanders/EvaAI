@@ -2,7 +2,7 @@ import hashlib
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import NamedTuple, cast
-from uuid import UUID
+from uuid import UUID, uuid7
 
 import pytest
 from sqlalchemy import func, select
@@ -12,13 +12,17 @@ from eva_ai.actions.repository import ActionRepository
 from eva_ai.actions.service import ActionApprovalService
 from eva_ai.actions.types import (
     ActionClaimOutcome,
+    ActionOrigin,
     ActionProposalStatus,
+    ActionStatus,
     ActionTaskRequest,
     ApprovalCallbackOutcome,
+    ApprovalDecisionOutcome,
     ApprovalStatus,
     CreateDraftCompletion,
     GmailActionCapability,
     ManagedDraftStatus,
+    PolicyDecision,
 )
 from eva_ai.db import Database
 from eva_ai.db.models import (
@@ -193,6 +197,7 @@ async def test_send_callback_grants_once_and_queues_one_action(database: Databas
     scope, repository, completion, telegram_account_id, chat_id, now = await _pending_approval(
         database,
         raw_token=raw_token,
+        notification_destination="eva-telegram-delivery",
     )
     service = ActionApprovalService(repository, destination="eva-events")
 
@@ -218,7 +223,14 @@ async def test_send_callback_grants_once_and_queues_one_action(database: Databas
             .select_from(Action)
             .where(Action.proposal_id == completion.send_proposal.id)
         )
+        queued_notification = await session.scalar(
+            select(Notification).where(
+                Notification.dedupe_key == f"action:{first.action_id}:queued"
+            )
+        )
     assert action_count == 1
+    assert queued_notification is not None
+    assert queued_notification.message == "Approved. I’ve queued this email to send."
     assert scope.user_id == completion.approval.user_id
 
 
@@ -230,6 +242,7 @@ async def test_discard_invalidates_approval_then_queues_one_exact_delete(
     _, repository, completion, telegram_account_id, chat_id, now = await _pending_approval(
         database,
         raw_token=raw_token,
+        notification_destination="eva-telegram-delivery",
     )
     service = ActionApprovalService(repository, destination="eva-events")
 
@@ -273,12 +286,257 @@ async def test_discard_invalidates_approval_then_queues_one_exact_delete(
                 OutboxMessage.payload["action_id"].astext == str(first.action_id),
             )
         )
+        queued_notification = await session.scalar(
+            select(Notification).where(
+                Notification.dedupe_key == f"action:{first.action_id}:queued"
+            )
+        )
     assert approval is not None and approval.status == ApprovalStatus.REJECTED
     assert send_proposal is not None and send_proposal.status == ActionProposalStatus.CANCELLED
     assert managed is not None and managed.status == ManagedDraftStatus.DELETING
     assert len(delete_proposals) == 1
     assert delete_action_count == 1
     assert delete_outbox_count == 1
+    assert queued_notification is not None
+    assert queued_notification.message == "Discarded. I’ve queued the Gmail draft for deletion."
+
+
+@pytest.mark.integration
+async def test_unknown_delete_updates_managed_projection_and_notifies(database: Database) -> None:
+    raw_token = secrets.token_urlsafe(18)
+    _, repository, completion, telegram_account_id, chat_id, now = await _pending_approval(
+        database,
+        raw_token=raw_token,
+        notification_destination="eva-telegram-delivery",
+    )
+    decision = await repository.discard_and_queue_delete(
+        callback_token_digest=hashlib.sha256(raw_token.encode()).hexdigest(),
+        telegram_account_id=telegram_account_id,
+        chat_id=chat_id,
+        destination="eva-events",
+        now=now + timedelta(minutes=1),
+    )
+    assert decision.action is not None
+    claimed = await repository.claim_action(
+        ActionTaskRequest(action_id=decision.action.id),
+        now=now + timedelta(minutes=2),
+        lease_seconds=60,
+    )
+    assert claimed.claim is not None
+    await repository.mark_provider_call_started(
+        claimed.claim,
+        started_at=now + timedelta(minutes=2, seconds=1),
+    )
+
+    await repository.mark_execution_unknown(
+        claimed.claim,
+        failed_at=now + timedelta(minutes=2, seconds=2),
+    )
+
+    async with database.session() as session:
+        managed = await session.get(ManagedGmailDraft, completion.managed_draft.id)
+        proposal = await session.get(ActionProposal, decision.action.proposal_id)
+        notification = await session.scalar(
+            select(Notification).where(
+                Notification.dedupe_key == f"action:{decision.action.id}:unknown"
+            )
+        )
+    assert managed is not None and managed.status == ManagedDraftStatus.UNKNOWN
+    assert proposal is not None and proposal.status == ActionProposalStatus.FAILED
+    assert notification is not None and "won’t retry" in notification.message
+
+
+@pytest.mark.integration
+async def test_expired_update_lease_marks_proposal_and_managed_draft_unknown(
+    database: Database,
+) -> None:
+    raw_token = secrets.token_urlsafe(18)
+    _, repository, completion, _, _, now = await _pending_approval(
+        database,
+        raw_token=raw_token,
+        notification_destination="eva-telegram-delivery",
+    )
+    proposal_id = uuid7()
+    action_id = uuid7()
+    async with database.session() as session:
+        async with session.begin():
+            send_proposal = await session.get(ActionProposal, completion.send_proposal.id)
+            managed = await session.get(ManagedGmailDraft, completion.managed_draft.id)
+            assert send_proposal is not None and managed is not None
+            session.add(
+                ActionProposal(
+                    id=proposal_id,
+                    user_id=send_proposal.user_id,
+                    workspace_id=send_proposal.workspace_id,
+                    connector_account_id=send_proposal.connector_account_id,
+                    event_id=send_proposal.event_id,
+                    situation_id=send_proposal.situation_id,
+                    goal_id=send_proposal.goal_id,
+                    agent_run_id=send_proposal.agent_run_id,
+                    conversation_turn_id=send_proposal.conversation_turn_id,
+                    supersedes_proposal_id=send_proposal.id,
+                    source_key=f"test-update:{proposal_id}",
+                    proposal_family_key=f"test-update:{proposal_id}",
+                    origin=ActionOrigin.TELEGRAM_USER,
+                    capability=GmailActionCapability.UPDATE_DRAFT,
+                    parameters_json=send_proposal.parameters_json,
+                    parameters_hash=send_proposal.parameters_hash,
+                    description="Update an Eva-managed draft",
+                    risk_level="medium",
+                    policy_decision=PolicyDecision.ALLOW,
+                    status=ActionProposalStatus.QUEUED,
+                    version=1,
+                    created_at=now,
+                )
+            )
+            await session.flush()
+            session.add(
+                Action(
+                    id=action_id,
+                    proposal_id=proposal_id,
+                    event_id=send_proposal.event_id,
+                    user_id=send_proposal.user_id,
+                    workspace_id=send_proposal.workspace_id,
+                    capability=GmailActionCapability.UPDATE_DRAFT,
+                    idempotency_key=f"test-update:{action_id}",
+                    status=ActionStatus.QUEUED,
+                    created_at=now,
+                )
+            )
+            managed.status = ManagedDraftStatus.UPDATING
+    claimed = await repository.claim_action(
+        ActionTaskRequest(action_id=action_id),
+        now=now + timedelta(minutes=1),
+        lease_seconds=1,
+    )
+    assert claimed.claim is not None
+    await repository.mark_provider_call_started(
+        claimed.claim,
+        started_at=now + timedelta(minutes=1),
+    )
+
+    result = await repository.claim_action(
+        ActionTaskRequest(action_id=action_id),
+        now=now + timedelta(minutes=2),
+        lease_seconds=60,
+    )
+
+    assert result.outcome is ActionClaimOutcome.UNKNOWN
+    async with database.session() as session:
+        managed = await session.get(ManagedGmailDraft, completion.managed_draft.id)
+        proposal = await session.get(ActionProposal, proposal_id)
+    assert managed is not None and managed.status == ManagedDraftStatus.UNKNOWN
+    assert proposal is not None and proposal.status == ActionProposalStatus.FAILED
+
+
+@pytest.mark.integration
+async def test_send_and_delete_completion_emit_durable_status_notifications(
+    database: Database,
+) -> None:
+    send_token = secrets.token_urlsafe(18)
+    _, send_repository, send_completion, telegram_id, chat_id, now = await _pending_approval(
+        database,
+        raw_token=send_token,
+        notification_destination="eva-telegram-delivery",
+    )
+    send_decision = await send_repository.grant_and_queue_send(
+        callback_token_digest=hashlib.sha256(send_token.encode()).hexdigest(),
+        telegram_account_id=telegram_id,
+        chat_id=chat_id,
+        destination="eva-events",
+        now=now + timedelta(minutes=1),
+    )
+    assert send_decision.action is not None
+    send_claim = await send_repository.claim_action(
+        ActionTaskRequest(action_id=send_decision.action.id),
+        now=now + timedelta(minutes=2),
+        lease_seconds=60,
+    )
+    assert send_claim.claim is not None
+    await send_repository.mark_provider_call_started(
+        send_claim.claim,
+        started_at=now + timedelta(minutes=2, seconds=1),
+    )
+    await send_repository.complete_send_draft(
+        send_claim.claim,
+        provider_draft_id=send_completion.managed_draft.provider_draft_id,
+        provider_message_id="sent-message",
+        provider_thread_id="sent-thread",
+        completed_at=now + timedelta(minutes=2, seconds=2),
+    )
+
+    delete_token = secrets.token_urlsafe(18)
+    _, delete_repository, delete_completion, telegram_id, chat_id, later = await _pending_approval(
+        database,
+        raw_token=delete_token,
+        notification_destination="eva-telegram-delivery",
+    )
+    delete_decision = await delete_repository.discard_and_queue_delete(
+        callback_token_digest=hashlib.sha256(delete_token.encode()).hexdigest(),
+        telegram_account_id=telegram_id,
+        chat_id=chat_id,
+        destination="eva-events",
+        now=later + timedelta(minutes=1),
+    )
+    assert delete_decision.action is not None
+    delete_claim = await delete_repository.claim_action(
+        ActionTaskRequest(action_id=delete_decision.action.id),
+        now=later + timedelta(minutes=2),
+        lease_seconds=60,
+    )
+    assert delete_claim.claim is not None
+    await delete_repository.mark_provider_call_started(
+        delete_claim.claim,
+        started_at=later + timedelta(minutes=2, seconds=1),
+    )
+    await delete_repository.complete_delete_draft(
+        delete_claim.claim,
+        provider_draft_id=delete_completion.managed_draft.provider_draft_id,
+        completed_at=later + timedelta(minutes=2, seconds=2),
+    )
+
+    async with database.session() as session:
+        messages = set(
+            await session.scalars(
+                select(Notification.message).where(
+                    Notification.dedupe_key.in_(
+                        (
+                            f"action:{send_decision.action.id}:completed",
+                            f"action:{delete_decision.action.id}:completed",
+                        )
+                    )
+                )
+            )
+        )
+    assert messages == {"Email sent.", "Gmail draft discarded."}
+
+
+@pytest.mark.integration
+async def test_expired_approval_notifies_without_queuing_send(database: Database) -> None:
+    raw_token = secrets.token_urlsafe(18)
+    _, repository, completion, telegram_id, chat_id, now = await _pending_approval(
+        database,
+        raw_token=raw_token,
+        notification_destination="eva-telegram-delivery",
+    )
+
+    decision = await repository.grant_and_queue_send(
+        callback_token_digest=hashlib.sha256(raw_token.encode()).hexdigest(),
+        telegram_account_id=telegram_id,
+        chat_id=chat_id,
+        destination="eva-events",
+        now=now + timedelta(days=2),
+    )
+
+    assert decision.outcome is ApprovalDecisionOutcome.EXPIRED
+    async with database.session() as session:
+        notification = await session.scalar(
+            select(Notification).where(
+                Notification.dedupe_key == f"action-approval:{completion.approval.id}:expired"
+            )
+        )
+    assert notification is not None
+    assert notification.message == "This email approval expired without being sent."
 
 
 @pytest.mark.integration

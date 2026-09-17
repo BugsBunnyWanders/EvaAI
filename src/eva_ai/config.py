@@ -139,6 +139,7 @@ class Settings(BaseSettings):
     conversation_max_turns: int = Field(default=6, ge=1, le=10)
     conversation_max_tool_calls: int = Field(default=4, ge=0, le=10)
     actions_enabled: bool = False
+    action_executor_enabled: bool = False
     action_dispatch_subscription_id: str = "eva-action-dispatch-local"
     action_dispatch_pull_timeout_seconds: PositiveInt = 30
     action_tasks_project_id: str | None = None
@@ -254,6 +255,8 @@ class Settings(BaseSettings):
             if self.openai_api_key is None or not self.openai_api_key.get_secret_value().strip():
                 raise ValueError("OpenAI API key is required when Telegram processing is enabled")
         if self.actions_enabled:
+            if not self.telegram_enabled:
+                raise ValueError("Telegram processing is required when Gmail actions are enabled")
             action_values = (
                 self.action_tasks_project_id,
                 self.action_tasks_location,

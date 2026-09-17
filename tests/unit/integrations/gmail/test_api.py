@@ -513,6 +513,43 @@ async def test_gmail_client_stops_after_retry_attempt_limit() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "invoke"),
+    [
+        pytest.param(
+            "create_draft",
+            lambda client: client.create_draft("encoded-message", None),
+            id="create-draft",
+        ),
+        pytest.param(
+            "send_draft",
+            lambda client: client.send_draft("draft-1"),
+            id="send-draft",
+        ),
+    ],
+)
+async def test_non_idempotent_gmail_mutations_do_not_retry_ambiguous_transport_failures(
+    operation: str,
+    invoke: object,
+) -> None:
+    """Fails if an ambiguous create/send result can cross the provider boundary twice."""
+    service = GmailResources(threading.get_ident())
+    service.errors[operation] = OSError("private-lost-response")
+    delays: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    client = GoogleGmailClient(service, retry_attempts=3, sleep=record_sleep)
+
+    with pytest.raises(GmailProviderError, match="Gmail API request failed"):
+        await invoke(client)  # type: ignore[operator]
+
+    assert [name for name, _ in service.calls] == [operation]
+    assert delays == []
+
+
+@pytest.mark.asyncio
 async def test_gmail_client_retry_sleep_propagates_cancellation_unchanged() -> None:
     """Fails if shutdown is delayed or reclassified after a transient Gmail failure."""
     service = GmailResources(threading.get_ident())

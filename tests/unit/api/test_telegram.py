@@ -77,6 +77,10 @@ def test_actions_enabled_wires_exact_approval_callback_service() -> None:
         Settings(
             _env_file=None,
             actions_enabled=True,
+            telegram_enabled=True,
+            relevance_enabled=True,
+            agent_enabled=True,
+            openai_api_key=SecretStr("test-key"),
             action_tasks_project_id="eva-project",
             action_tasks_location="asia-south1",
             action_executor_url="https://executor.example/internal/actions/execute",

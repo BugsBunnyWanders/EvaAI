@@ -195,6 +195,7 @@ def test_action_runtime_has_safe_disabled_and_bounded_defaults() -> None:
     settings = Settings(_env_file=None)
 
     assert settings.actions_enabled is False
+    assert settings.action_executor_enabled is False
     assert settings.action_dispatch_subscription_id == "eva-action-dispatch-local"
     assert settings.action_approval_ttl_hours == 24
     assert settings.action_revision_ttl_seconds == 900
@@ -205,11 +206,22 @@ def test_action_runtime_has_safe_disabled_and_bounded_defaults() -> None:
 
 def test_enabled_actions_require_complete_cloud_tasks_configuration() -> None:
     with pytest.raises(ValidationError, match="action execution configuration"):
-        Settings(_env_file=None, actions_enabled=True)
+        Settings(
+            _env_file=None,
+            actions_enabled=True,
+            telegram_enabled=True,
+            relevance_enabled=True,
+            agent_enabled=True,
+            openai_api_key=SecretStr("test-key"),
+        )
 
     settings = Settings(
         _env_file=None,
         actions_enabled=True,
+        telegram_enabled=True,
+        relevance_enabled=True,
+        agent_enabled=True,
+        openai_api_key=SecretStr("test-key"),
         action_tasks_project_id="eva-project",
         action_tasks_location="asia-south1",
         action_tasks_queue_id="eva-actions",
@@ -218,6 +230,20 @@ def test_enabled_actions_require_complete_cloud_tasks_configuration() -> None:
         action_task_caller_service_account="caller@eva-project.iam.gserviceaccount.com",
     )
     assert settings.actions_enabled is True
+
+
+def test_enabled_actions_require_telegram_approval_delivery() -> None:
+    with pytest.raises(ValidationError, match="Telegram processing"):
+        Settings(
+            _env_file=None,
+            actions_enabled=True,
+            action_tasks_project_id="eva-project",
+            action_tasks_location="asia-south1",
+            action_tasks_queue_id="eva-actions",
+            action_executor_url="https://executor.example/internal/actions/execute",
+            action_executor_audience="https://executor.example",
+            action_task_caller_service_account=("caller@eva-project.iam.gserviceaccount.com"),
+        )
 
 
 def test_action_runtime_rejects_non_24_hour_approval_and_incoherent_retry_bounds() -> None:

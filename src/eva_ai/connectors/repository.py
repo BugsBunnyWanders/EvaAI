@@ -75,6 +75,13 @@ class ConnectorRepository:
                     raise ConnectorScopeMismatchError(
                         "connector user does not match persisted owner"
                     )
+                # OAuth reauthorization preserves connector identity and ingestion history while
+                # replacing the durable view of scopes with the newly granted token's scopes.
+                account.granted_scopes = list(granted_scopes)
+                account.updated_at = now
+                if account.last_error_type == "ActionAuthorizationUnavailable":
+                    account.last_error_type = None
+                    account.last_error_summary = None
                 if account.status == ConnectorStatus.ERROR:
                     account.status = ConnectorStatus.CONNECTING
                     account.last_error_type = None

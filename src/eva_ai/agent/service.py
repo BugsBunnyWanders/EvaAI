@@ -156,6 +156,7 @@ class AgentInvestigationService:
                 usage=invocation.usage,
                 tool_audit=invocation.tool_audit,
                 prepared_actions=preparation.proposals,
+                prepared_clarification=preparation.clarification,
                 completed_at=completed_at,
             )
             if self._memory_learner is not None:

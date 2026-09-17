@@ -71,8 +71,12 @@ locals {
   })
 
   action_executor_environment = merge(local.common_environment, local.action_environment, {
-    EVA_RELEVANCE_ENABLED = "false"
-    EVA_AGENT_ENABLED     = "false"
-    EVA_TELEGRAM_ENABLED  = "false"
+    # The private executor has its own boot gate so proposal/dispatch can remain disabled while it
+    # stays healthy and can finish already-authorized durable tasks.
+    EVA_ACTIONS_ENABLED         = "false"
+    EVA_ACTION_EXECUTOR_ENABLED = "true"
+    EVA_RELEVANCE_ENABLED       = "false"
+    EVA_AGENT_ENABLED           = "false"
+    EVA_TELEGRAM_ENABLED        = "false"
   })
 }

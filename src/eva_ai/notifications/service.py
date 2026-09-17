@@ -152,6 +152,11 @@ def build_approval_card(
     callback_token: str,
 ) -> ApprovalCard:
     mode = "New email" if subject.mode == "NEW" else "Reply"
+    body = f"Plain-text body:\n{subject.text_body}"
+    if subject.html_body is not None:
+        # The HTML alternative is independently sent by Gmail, so exact approval must expose its
+        # complete source rather than letting recipients receive content the user never reviewed.
+        body += f"\n\nHTML body (source):\n{subject.html_body}"
     text = (
         "Review this Gmail draft before I send it.\n\n"
         f"Mode: {mode}\n"
@@ -159,7 +164,7 @@ def build_approval_card(
         f"Cc: {_addresses(subject.cc)}\n"
         f"Bcc: {_addresses(subject.bcc)}\n"
         f"Subject: {subject.subject}\n\n"
-        f"Body:\n{subject.text_body}\n\n"
+        f"{body}\n\n"
         f"Expires: {subject.expires_at.isoformat()}"
     )
     keyboard = TelegramInlineKeyboardMarkup(

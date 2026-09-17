@@ -38,7 +38,8 @@ production runtime with Terraform. Pull requests receive no Google credential; a
 `main`, GitHub Actions authenticates through Workload Identity Federation, applies Terraform with
 workers paused, runs migrations, restores the configured worker count, and checks API readiness.
 The same stack provisions a bounded Cloud Tasks queue and a private, IAM-authenticated action
-executor; it is enabled independently with `EVA_ACTIONS_ENABLED`.
+executor. Proposal and dispatch paths use `EVA_ACTIONS_ENABLED`; the private runtime uses the
+separate `EVA_ACTION_EXECUTOR_ENABLED` boot gate.
 The one-time bootstrap and first Gmail activation steps are in the
 [GCP deployment guide](docs/deployment.md).
 

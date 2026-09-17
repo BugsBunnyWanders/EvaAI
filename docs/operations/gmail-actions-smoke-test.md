@@ -54,8 +54,10 @@ WHERE connector_account_id = :'connector_id';
 
 ## Runtime configuration
 
-Actions are disabled by default. When `EVA_ACTIONS_ENABLED=true`, every runtime must receive a
-complete action configuration:
+Actions are disabled by default in the proposal and dispatch runtimes. When
+`EVA_ACTIONS_ENABLED=true`, Telegram processing/delivery must also be enabled and every public API
+or worker runtime must receive a complete action configuration. The private Cloud Run service uses
+`EVA_ACTION_EXECUTOR_ENABLED=true` independently:
 
 | Variable | Purpose |
 | --- | --- |
@@ -89,7 +91,9 @@ gh workflow run "Deploy Eva to GCP"
 
 The production workflow pauses the shared worker, applies infrastructure, migrates the database,
 restores the desired worker count, and verifies that `eva-action-executor` uses internal ingress
-with no `allUsers` IAM grant.
+with no `allUsers` IAM grant. The private executor itself remains bootable while proposal/dispatch
+is disabled, allowing deployment health checks and completion of already-authorized durable tasks;
+it is still callable only by the task-caller identity.
 
 ## Approval and revision semantics
 
