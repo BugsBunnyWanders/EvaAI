@@ -204,6 +204,17 @@ def test_action_runtime_has_safe_disabled_and_bounded_defaults() -> None:
     assert settings.action_task_max_attempts == 5
 
 
+def test_action_approval_ttl_accepts_production_environment_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cloud Run supplies every environment variable as text."""
+    monkeypatch.setenv("EVA_ACTION_APPROVAL_TTL_HOURS", "24")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.action_approval_ttl_hours == 24
+
+
 def test_enabled_actions_require_complete_cloud_tasks_configuration() -> None:
     with pytest.raises(ValidationError, match="action execution configuration"):
         Settings(

@@ -148,7 +148,7 @@ class Settings(BaseSettings):
     action_executor_url: str | None = None
     action_executor_audience: str | None = None
     action_task_caller_service_account: str | None = None
-    action_approval_ttl_hours: Literal[24] = 24
+    action_approval_ttl_hours: int = Field(default=24, ge=24, le=24)
     action_revision_ttl_seconds: PositiveInt = 900
     action_lease_seconds: PositiveInt = 300
     action_task_timeout_seconds: PositiveInt = 300
