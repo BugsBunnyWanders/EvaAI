@@ -4,6 +4,9 @@ import hashlib
 import secrets
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from email import policy
+from email.message import Message
+from email.parser import BytesParser
 from typing import Protocol
 from uuid import UUID
 
@@ -412,11 +415,106 @@ def _provider_draft_matches(
         rfc_message_id=managed.rfc_message_id,
     )
     try:
-        actual_bytes = base64.urlsafe_b64decode(raw + ("=" * (-len(raw) % 4)))
-        expected_bytes = base64.urlsafe_b64decode(expected.raw + ("=" * (-len(expected.raw) % 4)))
+        actual_bytes = base64.b64decode(
+            raw + ("=" * (-len(raw) % 4)), altchars=b"-_", validate=True
+        )
+        expected_bytes = base64.b64decode(
+            expected.raw + ("=" * (-len(expected.raw) % 4)), altchars=b"-_", validate=True
+        )
+        actual_projection = _mime_projection(
+            BytesParser(policy=policy.default).parsebytes(actual_bytes),
+            root=True,
+        )
+        expected_projection = _mime_projection(
+            BytesParser(policy=policy.default).parsebytes(expected_bytes),
+            root=True,
+        )
     except ValueError, TypeError:
         return False
-    return secrets.compare_digest(actual_bytes, expected_bytes)
+    return actual_projection is not None and actual_projection == expected_projection
+
+
+_GMAIL_OWNED_DRAFT_HEADERS = frozenset({"date", "message-id", "received"})
+_STRUCTURAL_MIME_HEADERS = frozenset({"content-disposition", "content-type"})
+
+
+def _mime_projection(message: Message, *, root: bool) -> object | None:
+    """Return send-relevant MIME content while excluding Gmail-owned transport metadata."""
+
+    if message.defects:
+        return None
+    ignored_headers = _STRUCTURAL_MIME_HEADERS
+    if root:
+        ignored_headers = ignored_headers | _GMAIL_OWNED_DRAFT_HEADERS
+    headers = tuple(
+        sorted(
+            (
+                name.lower(),
+                # Parsed header values remove harmless folding while preserving semantic content.
+                " ".join(str(value).split()),
+            )
+            for name, value in message.items()
+            if name.lower() not in ignored_headers
+        )
+    )
+    content_type_parameters = _mime_parameters(
+        message,
+        header="content-type",
+        excluded=frozenset({"boundary"}),
+    )
+    disposition_parameters = _mime_parameters(
+        message,
+        header="content-disposition",
+        excluded=frozenset(),
+    )
+    if message.is_multipart():
+        payload = message.get_payload()
+        if not isinstance(payload, list):
+            return None
+        child_projections: list[object] = []
+        for part in payload:
+            if not isinstance(part, Message):
+                return None
+            child_projection = _mime_projection(part, root=False)
+            if child_projection is None:
+                return None
+            child_projections.append(child_projection)
+        body: object = tuple(child_projections)
+    else:
+        decoded = message.get_payload(decode=True)
+        if not isinstance(decoded, bytes):
+            return None
+        # Gmail may normalize RFC line endings while retaining identical text content.
+        body = (
+            decoded.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            if message.get_content_maintype() == "text"
+            else decoded
+        )
+    return (
+        headers,
+        message.get_content_type().lower(),
+        content_type_parameters,
+        message.get_content_disposition(),
+        disposition_parameters,
+        message.get_filename(),
+        body,
+    )
+
+
+def _mime_parameters(
+    message: Message,
+    *,
+    header: str,
+    excluded: frozenset[str],
+) -> tuple[tuple[str, str], ...]:
+    parameters = message.get_params(failobj=[], header=header) or []
+    return tuple(
+        sorted(
+            (str(name).lower(), "" if value is None else str(value))
+            for name, value in parameters[1:]
+            if str(name).lower() not in excluded
+        )
+    )
 
 
 def _new_rfc_message_id(action_id: object) -> str:
