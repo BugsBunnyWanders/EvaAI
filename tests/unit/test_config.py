@@ -189,3 +189,69 @@ def test_enabled_telegram_allows_runtime_specific_secret_injection() -> None:
 
     assert settings.telegram_bot_token is None
     assert settings.telegram_webhook_secret is None
+
+
+def test_action_runtime_has_safe_disabled_and_bounded_defaults() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.actions_enabled is False
+    assert settings.action_executor_enabled is False
+    assert settings.action_dispatch_subscription_id == "eva-action-dispatch-local"
+    assert settings.action_approval_ttl_hours == 24
+    assert settings.action_revision_ttl_seconds == 900
+    assert settings.action_lease_seconds == 300
+    assert settings.action_task_timeout_seconds == 300
+    assert settings.action_task_max_attempts == 5
+
+
+def test_enabled_actions_require_complete_cloud_tasks_configuration() -> None:
+    with pytest.raises(ValidationError, match="action execution configuration"):
+        Settings(
+            _env_file=None,
+            actions_enabled=True,
+            telegram_enabled=True,
+            relevance_enabled=True,
+            agent_enabled=True,
+            openai_api_key=SecretStr("test-key"),
+        )
+
+    settings = Settings(
+        _env_file=None,
+        actions_enabled=True,
+        telegram_enabled=True,
+        relevance_enabled=True,
+        agent_enabled=True,
+        openai_api_key=SecretStr("test-key"),
+        action_tasks_project_id="eva-project",
+        action_tasks_location="asia-south1",
+        action_tasks_queue_id="eva-actions",
+        action_executor_url="https://executor.example/internal/actions/execute",
+        action_executor_audience="https://executor.example",
+        action_task_caller_service_account="caller@eva-project.iam.gserviceaccount.com",
+    )
+    assert settings.actions_enabled is True
+
+
+def test_enabled_actions_require_telegram_approval_delivery() -> None:
+    with pytest.raises(ValidationError, match="Telegram processing"):
+        Settings(
+            _env_file=None,
+            actions_enabled=True,
+            action_tasks_project_id="eva-project",
+            action_tasks_location="asia-south1",
+            action_tasks_queue_id="eva-actions",
+            action_executor_url="https://executor.example/internal/actions/execute",
+            action_executor_audience="https://executor.example",
+            action_task_caller_service_account=("caller@eva-project.iam.gserviceaccount.com"),
+        )
+
+
+def test_action_runtime_rejects_non_24_hour_approval_and_incoherent_retry_bounds() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, action_approval_ttl_hours=12)
+    with pytest.raises(ValidationError, match="action task retry maximum"):
+        Settings(
+            _env_file=None,
+            action_task_retry_initial_backoff_seconds=20,
+            action_task_retry_max_backoff_seconds=10,
+        )

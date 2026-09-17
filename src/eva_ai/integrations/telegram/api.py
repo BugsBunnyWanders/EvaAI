@@ -4,7 +4,11 @@ from typing import Any, cast
 import httpx
 
 from eva_ai.telegram.errors import TelegramProviderError
-from eva_ai.telegram.types import TelegramSendResult, TelegramWebhookInfo
+from eva_ai.telegram.types import (
+    TelegramInlineKeyboardMarkup,
+    TelegramSendResult,
+    TelegramWebhookInfo,
+)
 
 
 class TelegramBotAPI:
@@ -19,11 +23,21 @@ class TelegramBotAPI:
         self._client = client or httpx.AsyncClient(timeout=timeout_seconds)
         self._owns_client = client is None
 
-    async def send_message(self, *, chat_id: int, text: str) -> TelegramSendResult:
-        result = await self._call(
-            "sendMessage",
-            {"chat_id": chat_id, "text": _plain_telegram_text(text)},
-        )
+    async def send_message(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        reply_markup: TelegramInlineKeyboardMarkup | None = None,
+        preserve_text: bool = False,
+    ) -> TelegramSendResult:
+        payload: dict[str, object] = {
+            "chat_id": chat_id,
+            "text": text if preserve_text else _plain_telegram_text(text),
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup.model_dump(mode="json")
+        result = await self._call("sendMessage", payload)
         message_id = result.get("message_id")
         chat = result.get("chat")
         returned_chat_id = chat.get("id") if isinstance(chat, dict) else None

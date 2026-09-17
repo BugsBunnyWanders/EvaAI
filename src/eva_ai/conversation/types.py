@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from eva_ai.actions.canonical import CanonicalEmail
+from eva_ai.actions.types import DraftRevisionCandidate
 from eva_ai.agent.types import AgentUsage, ProposedAction, ToolCallAudit
 from eva_ai.memory.types import AgentWorkingContext, MemoryProposal, MemorySourceType
 
@@ -148,6 +150,26 @@ class ConversationInvocationResult(BaseModel):
     provider_response_id: str | None = Field(default=None, max_length=500)
     usage: AgentUsage = Field(default_factory=AgentUsage)
     tool_audit: tuple[ToolCallAudit, ...] = ()
+
+
+class DraftRevisionRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    turn_id: UUID
+    conversation_id: UUID
+    instruction: str = Field(max_length=4000)
+    current_message: CanonicalEmail
+    history: tuple[ConversationHistoryTurn, ...] = Field(default=(), max_length=40)
+    context: AgentWorkingContext
+
+
+class DraftRevisionInvocationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    candidate: DraftRevisionCandidate
+    reasoning_summary: str = Field(max_length=2000)
+    provider_response_id: str | None = Field(default=None, max_length=500)
+    usage: AgentUsage = Field(default_factory=AgentUsage)
 
 
 class ConversationOutcome(StrEnum):

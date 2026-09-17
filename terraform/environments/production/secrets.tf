@@ -21,3 +21,10 @@ resource "google_secret_manager_secret_iam_member" "api_telegram_webhook" {
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:${google_service_account.api.email}"
 }
+
+resource "google_secret_manager_secret_iam_member" "api_telegram_bot_token" {
+  count     = var.telegram_enabled ? 1 : 0
+  secret_id = data.google_secret_manager_secret.telegram_bot_token[0].id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.api.email}"
+}

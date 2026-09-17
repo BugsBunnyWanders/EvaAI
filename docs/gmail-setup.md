@@ -1,6 +1,10 @@
 # Gmail ingestion operator guide
 
-This guide prepares Eva's local Gmail ingestion path for `saswatray2505@gmail.com`. Gmail access is read-only. Eva stores authorized-user credentials in Google Secret Manager, stores only the secret resource name in PostgreSQL, and receives Gmail notifications through a pull subscription. There is no public webhook.
+This guide prepares Eva's local Gmail ingestion path for `saswatray2505@gmail.com`. Eva stores
+authorized-user credentials in Google Secret Manager, stores only the secret resource name in
+PostgreSQL, and receives Gmail notifications through a pull subscription. There is no public
+webhook. The current connector grant includes read-only ingestion plus `gmail.compose` for the
+separate Milestone 8 approval-gated draft action path.
 
 Do not print, inspect in a terminal, commit, or transmit the downloaded OAuth JSON or the authorized-user credentials. Commands in this guide use project `evaai-507018`, topic `eva-gmail-notifications`, and subscription `eva-gmail-ingestion-local`.
 
@@ -45,7 +49,9 @@ Complete these steps in Google Cloud Console. They are intentionally not automat
 1. Open Google Auth Platform for project `evaai-507018`.
 2. Configure the audience as **External**.
 3. Set publishing status to **In production**. Leaving an External app in Testing can cause short-lived refresh authorization unsuitable for the local worker.
-4. Declare only `https://www.googleapis.com/auth/gmail.readonly`. Do not add send, compose, modify, label, archive, delete, or full-mail scopes.
+4. Declare only `https://www.googleapis.com/auth/gmail.readonly` and
+   `https://www.googleapis.com/auth/gmail.compose`. Do not add modify, label, archive, trash,
+   permanent-delete, or full-mail scopes.
 5. Create an OAuth client with application type **Desktop app**.
 6. Download the client JSON without opening or printing it, then place it at `.secrets/google-oauth-client.json`.
 7. Confirm the file is protected before continuing:
@@ -55,7 +61,9 @@ Complete these steps in Google Cloud Console. They are intentionally not automat
    git check-ignore .secrets/google-oauth-client.json
    ```
 
-During `eva gmail connect`, Google opens a localhost loopback consent flow. Select `saswatray2505@gmail.com`, confirm the single read-only scope, and pass the unverified-app warning for this personal-use app. Stop if the account or requested scope differs.
+During `eva gmail connect`, Google opens a localhost loopback consent flow. Select
+`saswatray2505@gmail.com`, confirm the read-only and compose scopes, and pass the unverified-app
+warning for this personal-use app. Stop if the account or requested scopes differ.
 
 Testing mode was permitted only for the completed local Milestone 2 smoke. A Testing-mode token may expire in seven days. Do not treat that exception as permission to deploy or as satisfying External + In production.
 
@@ -122,7 +130,11 @@ The command verifies the explicit persisted ownership pair before constructing G
 export EVA_GMAIL_CONNECTOR_ID=CONNECTOR_UUID
 ```
 
-Re-running connect for the same Workspace and Gmail identity refreshes authorization/watch state without changing the original connection boundary or durable history cursor. The command exits zero only after the connector is `ACTIVE`.
+Re-running connect for the same Workspace and Gmail identity refreshes authorization/watch state
+without changing the original connection boundary or durable history cursor. This is the supported
+way to add `gmail.compose` to an existing connector. The command exits zero only after the connector
+is `ACTIVE`. Follow the [Gmail actions guide](operations/gmail-actions-smoke-test.md) before enabling
+write actions.
 
 ## Run ingestion and maintenance
 

@@ -4,6 +4,10 @@ from uuid import uuid7
 import pytest
 from sqlalchemy import func, select
 
+from eva_ai.actions.canonical import CanonicalEmail
+from eva_ai.actions.repository import ActionRepository
+from eva_ai.actions.service import ActionProposalService
+from eva_ai.actions.types import GmailActionCapability, PreparedActionProposal
 from eva_ai.agent.errors import AgentConflictError
 from eva_ai.agent.repository import AgentRunRepository
 from eva_ai.agent.types import (
@@ -14,9 +18,18 @@ from eva_ai.agent.types import (
     AgentUsage,
     NotificationProposal,
     NotificationUrgency,
+    ProposedAction,
 )
+from eva_ai.connectors.types import ConnectorStatus
 from eva_ai.db import Database
-from eva_ai.db.models import Notification, OutboxMessage, Situation
+from eva_ai.db.models import (
+    Action,
+    ActionProposal,
+    ConnectorAccount,
+    Notification,
+    OutboxMessage,
+    Situation,
+)
 from eva_ai.events.service import EventService
 from eva_ai.events.types import NewEvent, PrincipalType
 from eva_ai.relevance.repository import RelevanceRepository
@@ -41,6 +54,22 @@ NOW = datetime(2026, 9, 7, tzinfo=UTC)
 @pytest.mark.integration
 async def test_schedule_claim_complete_is_scoped_and_idempotent(database: Database) -> None:
     scope = await create_scope(database)
+    connector_id = uuid7()
+    async with database.session() as session:
+        async with session.begin():
+            session.add(
+                ConnectorAccount(
+                    id=connector_id,
+                    user_id=scope.user_id,
+                    workspace_id=scope.workspace_id,
+                    provider="gmail",
+                    account_identity="owner@example.com",
+                    granted_scopes=["gmail.readonly", "gmail.compose"],
+                    status=ConnectorStatus.ACTIVE,
+                    secret_reference="secret",
+                    connected_at=NOW,
+                )
+            )
     event_id = (
         await EventService(database, "eva-events").ingest(
             NewEvent(
@@ -52,6 +81,7 @@ async def test_schedule_claim_complete_is_scoped_and_idempotent(database: Databa
                 idempotency_key=f"agent-test:{uuid7()}",
                 occurred_at=NOW,
                 principal_type=PrincipalType.EXTERNAL,
+                principal_id=connector_id,
                 payload={"message_id": "message-1", "thread_id": "thread-1"},
                 correlation_keys=["gmail-thread:thread-1"],
             )
@@ -135,7 +165,11 @@ async def test_schedule_claim_complete_is_scoped_and_idempotent(database: Databa
         ),
         situation_id=situation_id,
     )
-    runs = AgentRunRepository(database)
+    action_proposals = ActionProposalService(
+        ActionRepository(database),
+        destination="eva-actions",
+    )
+    runs = AgentRunRepository(database, action_proposals=action_proposals)
 
     async with database.session() as session:
         async with session.begin():
@@ -211,19 +245,64 @@ async def test_schedule_claim_complete_is_scoped_and_idempotent(database: Databa
     completed = await runs.complete(
         claim,
         result=AgentInvestigationResult(
-            decision=AgentDecision.NO_ACTION,
-            reasoning_summary="No user action is required.",
+            decision=AgentDecision.PROPOSE_ACTION,
+            reasoning_summary="A draft reply may help the user.",
+            proposed_actions=(
+                ProposedAction(
+                    capability="gmail.create_draft",
+                    description="Create a reply draft",
+                    arguments={},
+                ),
+            ),
         ),
         input_digest="b" * 64,
         provider_response_id="response-1",
         usage=AgentUsage(input_tokens=10, output_tokens=3, total_tokens=13),
         tool_audit=(),
+        prepared_actions=(
+            PreparedActionProposal(
+                capability=GmailActionCapability.CREATE_DRAFT,
+                description="Create a reply draft",
+                message=CanonicalEmail(
+                    mode="REPLY",
+                    to=("person@example.com",),
+                    subject="Re: Meeting",
+                    text_body="Tomorrow works for me.",
+                    thread_id="thread-1",
+                    in_reply_to="<message-1@example.com>",
+                    references=("<message-1@example.com>",),
+                ),
+            ),
+        ),
         completed_at=NOW + timedelta(seconds=61),
     )
 
     assert completed.status is AgentRunStatus.SUCCEEDED
     assert completed.result is not None
     assert await runs.claim(message, now=NOW, lease_seconds=60) is None
+    async with database.session() as session:
+        action_proposal_count = await session.scalar(
+            select(func.count())
+            .select_from(ActionProposal)
+            .where(ActionProposal.agent_run_id == completed.id)
+        )
+        action_count = await session.scalar(
+            select(func.count())
+            .select_from(Action)
+            .join(ActionProposal, ActionProposal.id == Action.proposal_id)
+            .where(ActionProposal.agent_run_id == completed.id)
+        )
+        action_outbox_count = await session.scalar(
+            select(func.count())
+            .select_from(OutboxMessage)
+            .where(
+                OutboxMessage.event_id == event_id,
+                OutboxMessage.message_type == "action.execution.requested",
+            )
+        )
+    assert action_proposal_count == 1
+    assert action_count == 1
+    assert action_outbox_count == 1
 
     # A new agent version is a distinct logical run. Its user-facing result must commit the
     # proactive Notification and delivery outbox intent with the successful run.
@@ -289,3 +368,53 @@ async def test_schedule_claim_complete_is_scoped_and_idempotent(database: Databa
     assert notification is not None
     assert notification.message == "The meeting time changed. Would you like the details?"
     assert delivery_count == 1
+
+    clarification_runs = AgentRunRepository(database, "eva-telegram-delivery")
+    async with database.session() as session:
+        async with session.begin():
+            clarification = await clarification_runs.schedule_in_session(
+                session,
+                event_id=event_id,
+                signal_id=signal.id,
+                situation_id=situation_id,
+                user_id=scope.user_id,
+                workspace_id=scope.workspace_id,
+                destination="eva-agent-runs",
+                provider="openai",
+                model="gpt-5.6-sol",
+                agent_version="v3",
+                prompt_version="p3",
+                queued_at=NOW + timedelta(minutes=4),
+            )
+    clarification_message = proactive_message.model_copy(update={"agent_run_id": clarification.id})
+    clarification_claim = await clarification_runs.claim(
+        clarification_message,
+        now=NOW + timedelta(minutes=4),
+        lease_seconds=60,
+    )
+    assert clarification_claim is not None
+
+    await clarification_runs.complete(
+        clarification_claim,
+        result=AgentInvestigationResult(
+            decision=AgentDecision.NOTIFY_USER,
+            reasoning_summary="The recipient is ambiguous.",
+            notification=NotificationProposal(
+                urgency=NotificationUrgency.LOW,
+                message="This model notification must be replaced.",
+            ),
+        ),
+        input_digest="d" * 64,
+        provider_response_id="response-3",
+        usage=AgentUsage(),
+        tool_audit=(),
+        prepared_clarification="Which email address should I use for Jane Doe?",
+        completed_at=NOW + timedelta(minutes=5),
+    )
+
+    async with database.session() as session:
+        clarification_notification = await session.scalar(
+            select(Notification).where(Notification.agent_run_id == clarification.id)
+        )
+    assert clarification_notification is not None
+    assert clarification_notification.message == "Which email address should I use for Jane Doe?"

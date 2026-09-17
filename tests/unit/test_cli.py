@@ -1575,6 +1575,43 @@ async def test_worker_run_adds_both_telegram_loops_when_enabled(
     }
 
 
+async def test_worker_run_adds_action_dispatch_loop_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started: set[str] = set()
+    all_started = asyncio.Event()
+
+    async def run(component: str, *, settings: Settings) -> None:
+        started.add(component)
+        if len(started) == 4:
+            all_started.set()
+        await asyncio.Future()
+
+    for function_name, component in (
+        ("gmail_pull_command", "gmail"),
+        ("events_relay_command", "relay"),
+        ("relevance_pull_command", "relevance"),
+        ("action_dispatch_pull_command", "action-dispatch"),
+    ):
+
+        async def command(*, settings: Settings, name: str = component) -> None:
+            await run(name, settings=settings)
+
+        monkeypatch.setattr(cli_module, function_name, command)
+
+    settings = Settings(_env_file=None, environment="test").model_copy(
+        update={"actions_enabled": True}
+    )
+    task = asyncio.create_task(worker_run_command(settings=settings))
+
+    await asyncio.wait_for(all_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert started == {"gmail", "relay", "relevance", "action-dispatch"}
+
+
 class RecordingCloseResource:
     def __init__(self, name: str, calls: list[str]) -> None:
         self.name = name

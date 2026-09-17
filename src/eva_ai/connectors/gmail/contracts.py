@@ -44,6 +44,19 @@ class AuthorizedUserGrant:
 
 
 @dataclass(frozen=True, slots=True)
+class GmailDraftResult:
+    draft_id: str
+    message_id: str
+    thread_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class GmailSendResult:
+    message_id: str
+    thread_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class PullMessage:
     ack_id: str
     message_id: str
@@ -90,6 +103,26 @@ class GmailClient(Protocol):
 
 class GmailClientFactory(Protocol):
     async def create(self, authorized_user_json: str) -> GmailClient: ...
+
+
+class GmailActionClient(Protocol):
+    async def create_draft(self, raw: str, thread_id: str | None) -> GmailDraftResult: ...
+
+    async def update_draft(
+        self, draft_id: str, raw: str, thread_id: str | None
+    ) -> GmailDraftResult: ...
+
+    async def delete_draft(self, draft_id: str) -> None: ...
+
+    async def send_draft(self, draft_id: str) -> GmailSendResult: ...
+
+    async def get_draft(self, draft_id: str) -> Mapping[str, object]: ...
+
+    async def close(self) -> None: ...
+
+
+class GmailActionClientFactory(Protocol):
+    async def create_action(self, authorized_user_json: str) -> GmailActionClient: ...
 
 
 class OAuthAuthorizer(Protocol):

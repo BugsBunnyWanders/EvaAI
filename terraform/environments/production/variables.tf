@@ -78,6 +78,30 @@ variable "telegram_enabled" {
   default     = false
 }
 
+variable "actions_enabled" {
+  description = "Enable safe Gmail draft actions, Telegram approvals, and action dispatch."
+  type        = bool
+  default     = false
+}
+
+variable "action_queue_id" {
+  description = "Regional Cloud Tasks queue for private Gmail action execution."
+  type        = string
+  default     = "eva-actions-production"
+}
+
+variable "action_task_max_attempts" {
+  description = "Maximum Cloud Tasks attempts before an execution request is exhausted."
+  type        = number
+  default     = 5
+}
+
+variable "action_task_timeout_seconds" {
+  description = "Cloud Run request timeout for one action execution."
+  type        = number
+  default     = 300
+}
+
 variable "openai_secret_id" {
   description = "Secret created by the bootstrap stack; its value is added out of band."
   type        = string

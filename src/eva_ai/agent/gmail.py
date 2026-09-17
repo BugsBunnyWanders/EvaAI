@@ -97,6 +97,7 @@ def _evidence(
     return GmailMessageEvidence(
         message_id=_string(event.payload.get("message_id"))[:500],
         thread_id=_string(event.payload.get("thread_id"))[:500],
+        rfc_message_id=_string(header_values.get("message_id"))[:998],
         internal_date=event.occurred_at,
         sender=_string(header_values.get("from"))[:500],
         recipients=_string(header_values.get("to"))[:1000],

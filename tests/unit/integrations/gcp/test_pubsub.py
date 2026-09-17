@@ -4,6 +4,7 @@ from uuid import uuid7
 
 import pytest
 
+from eva_ai.actions.types import ActionExecutionRequestedMessage
 from eva_ai.agent.types import AgentRunRequestedMessage
 from eva_ai.events.types import EventAvailableMessage, OutboundMessage
 from eva_ai.integrations.gcp.pubsub import GooglePubSubPublisher
@@ -58,6 +59,7 @@ async def test_google_publisher_serializes_envelope_and_awaits_ack() -> None:
 
     provider_id = await GooglePubSubPublisher("eva-project", client).publish(message)
     topic, data, attrs = client.published[0]
+    assert isinstance(message.envelope, EventAvailableMessage)
 
     assert provider_id == "provider-message-42"
     assert topic == "projects/eva-project/topics/eva-events"
@@ -90,6 +92,28 @@ async def test_google_publisher_routes_agent_envelope_attributes() -> None:
     assert topic == "projects/eva-project/topics/eva-agent-runs"
     assert attrs["message_type"] == "agent.run.requested"
     assert attrs["event_id"] == str(envelope.event_id)
+
+
+@pytest.mark.asyncio
+async def test_google_publisher_routes_action_envelope_without_assuming_event_id() -> None:
+    client = FakeClient()
+    envelope = ActionExecutionRequestedMessage(
+        outbox_message_id=uuid7(),
+        action_id=uuid7(),
+        user_id=uuid7(),
+        workspace_id=uuid7(),
+    )
+
+    await GooglePubSubPublisher("eva-project", client).publish(
+        OutboundMessage(envelope.outbox_message_id, "eva-actions", envelope)
+    )
+    topic, _, attrs = client.published[0]
+
+    assert topic == "projects/eva-project/topics/eva-actions"
+    assert attrs == {
+        "message_type": "action.execution.requested",
+        "workspace_id": str(envelope.workspace_id),
+    }
 
 
 @pytest.mark.asyncio

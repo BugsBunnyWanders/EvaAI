@@ -16,17 +16,20 @@ from googleapiclient.errors import HttpError  # type: ignore[import-untyped]
 
 from eva_ai.connectors.gmail.contracts import (
     AuthorizationRevoked,
+    GmailActionClient,
     GmailClient,
+    GmailDraftResult,
     GmailProfile,
+    GmailSendResult,
     HistoryCursorExpired,
     HistoryPage,
     MessageListPage,
     MessageUnavailable,
     WatchResult,
 )
-from eva_ai.integrations.gmail.oauth import GMAIL_READONLY_SCOPE
+from eva_ai.integrations.gmail.oauth import GMAIL_CONNECTOR_SCOPES, GMAIL_READONLY_SCOPE
 
-_GMAIL_SCOPES = (GMAIL_READONLY_SCOPE,)
+_GMAIL_INGESTION_SCOPES = (GMAIL_READONLY_SCOPE,)
 _TRANSIENT_HTTP_STATUSES = frozenset({408, 429})
 _TRANSIENT_HTTP_403_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
 
@@ -39,8 +42,13 @@ class InvalidAuthorizedUserCredentials(ValueError):
     """Authorized-user credential input is missing or malformed."""
 
 
+class GmailActionReauthorizationRequired(RuntimeError):
+    """The stored grant can ingest mail but lacks Gmail compose authority."""
+
+
 class _ClientCreationFailure(Enum):
     INVALID_CREDENTIALS = auto()
+    ACTION_REAUTHORIZATION = auto()
     PROVIDER = auto()
 
 
@@ -71,6 +79,18 @@ class ThreadsResource(Protocol):
     def get(self, **kwargs: object) -> ExecutableRequest: ...
 
 
+class DraftsResource(Protocol):
+    def create(self, **kwargs: object) -> ExecutableRequest: ...
+
+    def update(self, **kwargs: object) -> ExecutableRequest: ...
+
+    def delete(self, **kwargs: object) -> ExecutableRequest: ...
+
+    def send(self, **kwargs: object) -> ExecutableRequest: ...
+
+    def get(self, **kwargs: object) -> ExecutableRequest: ...
+
+
 class UsersResource(Protocol):
     def getProfile(self, **kwargs: object) -> ExecutableRequest: ...  # noqa: N802
 
@@ -81,6 +101,8 @@ class UsersResource(Protocol):
     def messages(self) -> MessagesResource: ...
 
     def threads(self) -> ThreadsResource: ...
+
+    def drafts(self) -> DraftsResource: ...
 
 
 class GmailService(Protocol):
@@ -159,6 +181,22 @@ class GoogleGmailClientFactory:
         self._clients: list[GoogleGmailClient] = []
 
     async def create(self, authorized_user_json: str) -> GmailClient:
+        return await self._create(authorized_user_json, _GMAIL_INGESTION_SCOPES)
+
+    async def create_action(self, authorized_user_json: str) -> GmailActionClient:
+        return await self._create(
+            authorized_user_json,
+            GMAIL_CONNECTOR_SCOPES,
+            require_compose=True,
+        )
+
+    async def _create(
+        self,
+        authorized_user_json: str,
+        scopes: tuple[str, ...],
+        *,
+        require_compose: bool = False,
+    ) -> GoogleGmailClient:
         def create_sync() -> GoogleGmailClient | _ClientCreationFailure:
             try:
                 decoded = json.loads(authorized_user_json)
@@ -167,8 +205,10 @@ class GoogleGmailClientFactory:
             if not isinstance(decoded, dict):
                 return _ClientCreationFailure.INVALID_CREDENTIALS
             info = cast(dict[str, object], decoded)
+            if require_compose and not _has_required_scopes(info, GMAIL_CONNECTOR_SCOPES):
+                return _ClientCreationFailure.ACTION_REAUTHORIZATION
             try:
-                credentials = self._credentials_factory(info, _GMAIL_SCOPES)
+                credentials = self._credentials_factory(info, scopes)
             except ValueError:
                 return _ClientCreationFailure.INVALID_CREDENTIALS
             try:
@@ -222,6 +262,10 @@ class GoogleGmailClientFactory:
             raise cancelled
         if result is _ClientCreationFailure.INVALID_CREDENTIALS:
             raise InvalidAuthorizedUserCredentials("authorized-user credentials are invalid")
+        if result is _ClientCreationFailure.ACTION_REAUTHORIZATION:
+            raise GmailActionReauthorizationRequired(
+                "Gmail action authorization requires gmail.compose"
+            )
         if result is _ClientCreationFailure.PROVIDER:
             raise GmailProviderError("Gmail client construction failed")
         self._clients.append(result)
@@ -376,12 +420,75 @@ class GoogleGmailClient:
             next_page_token=_optional_string(response, "nextPageToken", "message list"),
         )
 
+    async def create_draft(self, raw: str, thread_id: str | None) -> GmailDraftResult:
+        response = await self._execute(
+            lambda: (
+                self._service.users()
+                .drafts()
+                .create(userId="me", body={"message": _draft_message(raw, thread_id)})
+                .execute()
+            ),
+            retry_transient=False,
+        )
+        return _draft_result(response)
+
+    async def update_draft(
+        self,
+        draft_id: str,
+        raw: str,
+        thread_id: str | None,
+    ) -> GmailDraftResult:
+        response = await self._execute(
+            lambda: (
+                self._service.users()
+                .drafts()
+                .update(
+                    userId="me",
+                    id=draft_id,
+                    body={"message": _draft_message(raw, thread_id)},
+                )
+                .execute()
+            )
+        )
+        return _draft_result(response)
+
+    async def delete_draft(self, draft_id: str) -> None:
+        await self._execute(
+            lambda: self._service.users().drafts().delete(userId="me", id=draft_id).execute()
+        )
+
+    async def send_draft(self, draft_id: str) -> GmailSendResult:
+        response = await self._execute(
+            lambda: (
+                self._service.users().drafts().send(userId="me", body={"id": draft_id}).execute()
+            ),
+            retry_transient=False,
+        )
+        return GmailSendResult(
+            message_id=_required_string(response, "id", "draft send"),
+            thread_id=_required_string(response, "threadId", "draft send"),
+        )
+
+    async def get_draft(self, draft_id: str) -> Mapping[str, object]:
+        return await self._execute(
+            lambda: (
+                self._service.users()
+                .drafts()
+                # Raw RFC content is required to prove that the provider draft still matches the
+                # exact immutable proposal approved by the user immediately before send.
+                .get(userId="me", id=draft_id, format="raw")
+                .execute()
+            ),
+            message_request=True,
+        )
+
     async def _execute(
         self,
         operation: Callable[[], Mapping[str, object]],
         *,
         history_request: bool = False,
         message_request: bool = False,
+        retry_transient: bool = True,
     ) -> Mapping[str, object]:
         result: Mapping[str, object] | _RequestFailure = _RequestFailure.PROVIDER
         for attempt in range(self._retry_attempts):
@@ -408,8 +515,10 @@ class GoogleGmailClient:
             except httplib2.HttpLib2Error, OSError, TransportError:
                 result = _RequestFailure.TRANSIENT
 
+            # Refresh failures happen before Gmail accepts the request. Ambiguous transport/server
+            # failures do not earn an adapter retry for non-idempotent create/send mutations.
             retryable = result is _RequestFailure.AUTHORIZATION_REFRESH or (
-                result is _RequestFailure.TRANSIENT
+                retry_transient and result is _RequestFailure.TRANSIENT
             )
             if not retryable or attempt + 1 >= self._retry_attempts:
                 break
@@ -481,6 +590,38 @@ def _optional_string(response: Mapping[str, object], key: str, operation: str) -
     if not isinstance(value, str) or not value:
         raise GmailProviderError(f"Gmail API returned an invalid {operation} response")
     return value
+
+
+def _has_required_scopes(
+    info: Mapping[str, object],
+    required_scopes: tuple[str, ...],
+) -> bool:
+    value = info.get("scopes")
+    if isinstance(value, str):
+        granted = frozenset(value.split())
+    elif isinstance(value, Sequence) and not isinstance(value, bytes):
+        granted = frozenset(item for item in value if isinstance(item, str))
+    else:
+        return False
+    return set(required_scopes).issubset(granted)
+
+
+def _draft_message(raw: str, thread_id: str | None) -> dict[str, str]:
+    message = {"raw": raw}
+    if thread_id is not None:
+        message["threadId"] = thread_id
+    return message
+
+
+def _draft_result(response: Mapping[str, object]) -> GmailDraftResult:
+    message = response.get("message")
+    if not isinstance(message, Mapping):
+        raise GmailProviderError("Gmail API returned an invalid draft response")
+    return GmailDraftResult(
+        draft_id=_required_string(response, "id", "draft"),
+        message_id=_required_string(message, "id", "draft"),
+        thread_id=_optional_string(message, "threadId", "draft"),
+    )
 
 
 def _history_message_ids(value: object) -> tuple[str, ...]:

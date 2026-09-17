@@ -1,6 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
+from pydantic import JsonValue
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from eva_ai.agent.types import NotificationUrgency
@@ -54,6 +56,12 @@ class Notification(UUIDPrimaryKeyMixin, Base):
             name="fk_notifications_telegram_account_scope",
             ondelete="RESTRICT",
         ),
+        ForeignKeyConstraint(
+            ["action_approval_id", "workspace_id", "user_id"],
+            ["action_approvals.id", "action_approvals.workspace_id", "action_approvals.user_id"],
+            name="fk_notifications_action_approval_scope",
+            ondelete="RESTRICT",
+        ),
         UniqueConstraint("id", "workspace_id", "user_id", name="uq_notifications_id_scope"),
         UniqueConstraint("workspace_id", "dedupe_key", name="uq_notifications_scope_dedupe"),
         UniqueConstraint(
@@ -85,10 +93,12 @@ class Notification(UUIDPrimaryKeyMixin, Base):
     event_id: Mapped[UUID]
     situation_id: Mapped[UUID | None]
     agent_run_id: Mapped[UUID | None]
+    action_approval_id: Mapped[UUID | None]
     channel: Mapped[NotificationChannel] = mapped_column(String(20))
     kind: Mapped[NotificationKind] = mapped_column(String(20))
     urgency: Mapped[NotificationUrgency] = mapped_column(String(20))
     message: Mapped[str] = mapped_column(Text)
+    reply_markup: Mapped[dict[str, JsonValue] | None] = mapped_column(JSONB)
     dedupe_key: Mapped[str] = mapped_column(String(500))
     status: Mapped[NotificationStatus] = mapped_column(
         String(32), default=NotificationStatus.PENDING, server_default="PENDING"

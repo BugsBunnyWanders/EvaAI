@@ -1,3 +1,11 @@
+from eva_ai.db.models.actions import (
+    Action,
+    ActionApproval,
+    ActionProposal,
+    ActionResult,
+    ActionRevisionSession,
+    ManagedGmailDraft,
+)
 from eva_ai.db.models.agent import AgentRun
 from eva_ai.db.models.common import TimestampMixin
 from eva_ai.db.models.connectors import ConnectorAccount, GmailSyncState
@@ -18,6 +26,11 @@ from eva_ai.db.models.telegram import TelegramAccount, TelegramPairingCode
 
 __all__ = [
     "AgentRun",
+    "Action",
+    "ActionApproval",
+    "ActionProposal",
+    "ActionResult",
+    "ActionRevisionSession",
     "ConnectorAccount",
     "ConversationTurn",
     "Event",
@@ -27,6 +40,7 @@ __all__ = [
     "EpisodicMemory",
     "EpisodicMemoryGoal",
     "MemoryFact",
+    "ManagedGmailDraft",
     "Notification",
     "OutboxMessage",
     "RelevanceEvaluationAttempt",

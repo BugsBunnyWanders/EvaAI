@@ -2,8 +2,15 @@ from datetime import UTC, datetime
 
 from pydantic import ValidationError
 
+from eva_ai.actions.errors import ActionError
+from eva_ai.actions.service import ActionApprovalService
 from eva_ai.events.types import NewEvent, PrincipalType
-from eva_ai.telegram.errors import PairingCodeInvalidError, TelegramAccountConflictError
+from eva_ai.telegram.contracts import TelegramGateway
+from eva_ai.telegram.errors import (
+    PairingCodeInvalidError,
+    TelegramAccountConflictError,
+    TelegramProviderError,
+)
 from eva_ai.telegram.ingestion import TelegramEventService
 from eva_ai.telegram.repository import TelegramAccountRepository
 from eva_ai.telegram.types import (
@@ -21,9 +28,14 @@ class TelegramWebhookService:
         self,
         accounts: TelegramAccountRepository,
         events: TelegramEventService,
+        *,
+        approvals: ActionApprovalService | None = None,
+        telegram: TelegramGateway | None = None,
     ) -> None:
         self._accounts = accounts
         self._events = events
+        self._approvals = approvals
+        self._telegram = telegram
 
     async def handle(
         self, update: TelegramUpdate, *, received_at: datetime | None = None
@@ -117,6 +129,12 @@ class TelegramWebhookService:
         callback: TelegramCallbackQuery,
         received_at: datetime,
     ) -> WebhookResult:
+        if self._telegram is not None:
+            try:
+                await self._telegram.answer_callback_query(callback_query_id=callback.id)
+            except TelegramProviderError:
+                # Callback acknowledgement is best-effort; the durable transition remains safe.
+                pass
         message = callback.message
         if message is None or message.chat.type != "private":
             return WebhookResult(disposition=WebhookDisposition.IGNORED)
@@ -125,6 +143,17 @@ class TelegramWebhookService:
         )
         if account is None:
             return WebhookResult(disposition=WebhookDisposition.IGNORED)
+        if self._approvals is not None and callback.data is not None:
+            try:
+                await self._approvals.process_callback(
+                    callback.data,
+                    telegram_account_id=account.id,
+                    chat_id=message.chat.id,
+                    now=received_at,
+                )
+            except ActionError:
+                return WebhookResult(disposition=WebhookDisposition.IGNORED)
+            return WebhookResult(disposition=WebhookDisposition.APPROVAL_PROCESSED)
         event = NewEvent(
             user_id=account.user_id,
             workspace_id=account.workspace_id,

@@ -8,7 +8,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore[import-un
 from eva_ai.connectors.gmail.contracts import AuthorizedUserGrant
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
-_REQUIRED_SCOPES = (GMAIL_READONLY_SCOPE,)
+GMAIL_COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose"
+GMAIL_CONNECTOR_SCOPES = (GMAIL_READONLY_SCOPE, GMAIL_COMPOSE_SCOPE)
 
 
 class OAuthAuthorizationError(RuntimeError):
@@ -36,11 +37,11 @@ class GoogleDesktopOAuthAuthorizer:
         self._flow_factory = flow_factory
 
     async def authorize(self, client_file: Path, scopes: tuple[str, ...]) -> AuthorizedUserGrant:
-        if scopes != _REQUIRED_SCOPES:
-            raise ValueError("Gmail authorization requires gmail.readonly only")
+        if scopes != GMAIL_CONNECTOR_SCOPES:
+            raise ValueError("Gmail authorization requires gmail.readonly and gmail.compose")
 
         def authorize_sync() -> AuthorizedUserGrant:
-            flow = self._flow_factory(str(client_file), _REQUIRED_SCOPES)
+            flow = self._flow_factory(str(client_file), GMAIL_CONNECTOR_SCOPES)
             credentials = flow.run_local_server(access_type="offline", prompt="consent")
             return AuthorizedUserGrant(
                 authorized_user_json=credentials.to_json(strip=("token", "expiry"))

@@ -6,6 +6,8 @@ from uuid import UUID, uuid5, uuid7
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from eva_ai.actions.contracts import ActionProposalWriter
+from eva_ai.actions.types import ActionOrigin, PreparedActionProposal
 from eva_ai.agent.types import AgentUsage, NotificationUrgency, ProposedAction, ToolCallAudit
 from eva_ai.connectors.types import ConnectorStatus
 from eva_ai.conversation.errors import ConversationConflictError, ConversationScopeError
@@ -69,14 +71,22 @@ class ConversationTurnSubject:
     connector_id: UUID | None
     secret_reference: str | None
     gmail_thread_id: str | None
+    telegram_account_id: UUID
     telegram_chat_id: int
+    connector_identity: str | None = None
 
 
 class ConversationRepository:
-    def __init__(self, database: Database, notification_destination: str) -> None:
+    def __init__(
+        self,
+        database: Database,
+        notification_destination: str,
+        action_proposals: ActionProposalWriter | None = None,
+    ) -> None:
         self._database = database
         self._notifications = NotificationRepository(database)
         self._notification_destination = notification_destination
+        self._action_proposals = action_proposals
 
     async def resolve_and_claim(
         self,
@@ -326,7 +336,9 @@ class ConversationRepository:
             connector_id=None if connector is None else connector.id,
             secret_reference=None if connector is None else connector.secret_reference,
             gmail_thread_id=thread_id,
+            telegram_account_id=telegram_account.id,
             telegram_chat_id=telegram_account.chat_id,
+            connector_identity=None if connector is None else connector.account_identity,
         )
 
     async def complete(
@@ -340,6 +352,7 @@ class ConversationRepository:
         tool_audit: tuple[ToolCallAudit, ...],
         reasoning_summary: str | None = None,
         proposed_actions: tuple[ProposedAction, ...] = (),
+        prepared_actions: tuple[PreparedActionProposal, ...] = (),
         memory_proposals: tuple[MemoryProposal, ...] = (),
         completed_at: datetime,
     ) -> ConversationTurnRecord:
@@ -407,6 +420,36 @@ class ConversationRepository:
                 user_turn.failure_code = None
                 user_turn.failure_summary = None
                 session.add(assistant_turn)
+                await session.flush()
+                if prepared_actions and self._action_proposals is not None:
+                    connector_id = await session.scalar(
+                        select(ConnectorAccount.id)
+                        .where(
+                            ConnectorAccount.user_id == claim.user_id,
+                            ConnectorAccount.workspace_id == claim.workspace_id,
+                            ConnectorAccount.provider == "gmail",
+                            ConnectorAccount.status == ConnectorStatus.ACTIVE,
+                        )
+                        .order_by(ConnectorAccount.created_at.desc())
+                        .limit(1)
+                    )
+                    if connector_id is not None:
+                        # The assistant turn and its action intent either both commit or neither
+                        # does.
+                        await self._action_proposals.create_from_model_proposals_in_session(
+                            session,
+                            proposals=prepared_actions,
+                            user_id=claim.user_id,
+                            workspace_id=claim.workspace_id,
+                            connector_account_id=connector_id,
+                            event_id=claim.event_id,
+                            situation_id=conversation.situation_id,
+                            agent_run_id=None,
+                            conversation_turn_id=assistant_turn.id,
+                            origin=ActionOrigin.TELEGRAM_USER,
+                            source_prefix=f"conversation-turn:{assistant_turn.id}",
+                            created_at=completed_at,
+                        )
                 await session.execute(
                     update(EventProcessing)
                     .where(EventProcessing.event_id == claim.event_id)

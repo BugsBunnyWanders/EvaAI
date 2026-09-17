@@ -6,6 +6,9 @@ from typing import cast
 
 from openai import AsyncOpenAI
 
+from eva_ai.actions.dispatcher import ActionDispatchPullWorker
+from eva_ai.actions.repository import ActionRepository
+from eva_ai.actions.service import ActionProposalService, ActionRevisionService
 from eva_ai.agent.repository import AgentRunRepository
 from eva_ai.agent.service import AgentInvestigationService
 from eva_ai.agent.worker import AgentPullWorker
@@ -22,6 +25,7 @@ from eva_ai.events.types import EventAvailableMessage
 from eva_ai.integrations.gcp.pubsub import GooglePubSubPublisher
 from eva_ai.integrations.gcp.secret_manager import GoogleSecretManagerCredentialStore
 from eva_ai.integrations.gcp.subscriber import GooglePullSubscriber
+from eva_ai.integrations.gcp.tasks import GoogleCloudTaskEnqueuer
 from eva_ai.integrations.gmail.api import GoogleGmailClientFactory
 from eva_ai.integrations.openai.agent import OpenAIAgentsInvestigationAgent
 from eva_ai.integrations.openai.conversation import OpenAIAgentsConversationAgent
@@ -202,6 +206,57 @@ class DeliveryDependencies:
             except Exception:
                 ordinary_failure = True
         return DependencyCleanupOutcome(interruption, ordinary_failure)
+
+
+@dataclass(slots=True)
+class ActionDispatchDependencies:
+    database: Database
+    subscriber: GooglePullSubscriber
+    enqueuer: GoogleCloudTaskEnqueuer
+    repository: ActionRepository
+    worker: ActionDispatchPullWorker
+
+    async def close(self) -> DependencyCleanupOutcome:
+        interruption: BaseException | None = None
+        ordinary_failure = False
+        for close in (self.subscriber.close, self.enqueuer.close, self.database.close):
+            try:
+                await close()
+            except asyncio.CancelledError as error:
+                interruption = interruption or error
+            except Exception:
+                ordinary_failure = True
+        return DependencyCleanupOutcome(interruption, ordinary_failure)
+
+
+@dataclass(frozen=True, slots=True)
+class ActionApplicationDependencies:
+    repository: ActionRepository
+    proposals: ActionProposalService
+    revisions: ActionRevisionService
+
+
+def build_action_application_dependencies(
+    database: Database,
+    settings: Settings,
+) -> ActionApplicationDependencies | None:
+    if not settings.actions_enabled:
+        return None
+    repository = ActionRepository(
+        database,
+        notification_destination=settings.telegram_delivery_topic_id,
+    )
+    return ActionApplicationDependencies(
+        repository=repository,
+        proposals=ActionProposalService(
+            repository,
+            destination=settings.pubsub_topic_id,
+        ),
+        revisions=ActionRevisionService(
+            repository,
+            destination=settings.pubsub_topic_id,
+        ),
+    )
 
 
 def build_publisher(settings: Settings, *, use_google: bool) -> Publisher:
@@ -397,6 +452,7 @@ def build_agent_dependencies(settings: Settings) -> AgentDependencies:
     if api_key is None or not api_key.get_secret_value().strip():
         raise ValueError("OpenAI configuration is incomplete")
     database = Database(settings.database_url.get_secret_value())
+    actions = build_action_application_dependencies(database, settings)
     openai_client = AsyncOpenAI(api_key=api_key.get_secret_value())
     memory_repository = MemoryRepository(database)
     embedding = EmbeddingService(
@@ -448,6 +504,7 @@ def build_agent_dependencies(settings: Settings) -> AgentDependencies:
             notification_destination=(
                 settings.telegram_delivery_topic_id if settings.telegram_enabled else None
             ),
+            action_proposals=None if actions is None else actions.proposals,
         ),
         context_builder=context_builder,
         credential_store=credential_store,
@@ -461,6 +518,7 @@ def build_agent_dependencies(settings: Settings) -> AgentDependencies:
         search_result_limit=settings.agent_search_result_limit,
         body_max_chars=settings.agent_message_body_max_chars,
         memory_learner=memory_learner,
+        action_proposals=None if actions is None else actions.proposals,
     )
     subscriber = GooglePullSubscriber(project_id, settings.agent_subscription_id)
     worker = AgentPullWorker(subscriber, service, settings.agent_pull_timeout_seconds)
@@ -483,6 +541,7 @@ def build_conversation_dependencies(settings: Settings) -> ConversationDependenc
     if api_key is None or not api_key.get_secret_value().strip():
         raise ValueError("OpenAI configuration is incomplete")
     database = Database(settings.database_url.get_secret_value())
+    actions = build_action_application_dependencies(database, settings)
     openai_client = AsyncOpenAI(api_key=api_key.get_secret_value())
     memory_repository = MemoryRepository(database)
     embedding = EmbeddingService(
@@ -536,7 +595,11 @@ def build_conversation_dependencies(settings: Settings) -> ConversationDependenc
         timeout_seconds=settings.gmail_request_timeout_seconds,
     )
     service = ConversationService(
-        conversations=ConversationRepository(database, settings.telegram_delivery_topic_id),
+        conversations=ConversationRepository(
+            database,
+            settings.telegram_delivery_topic_id,
+            action_proposals=None if actions is None else actions.proposals,
+        ),
         context_builder=context_builder,
         credential_store=credential_store,
         gmail_clients=gmail_client_factory,
@@ -552,6 +615,9 @@ def build_conversation_dependencies(settings: Settings) -> ConversationDependenc
         search_result_limit=settings.agent_search_result_limit,
         body_max_chars=settings.agent_message_body_max_chars,
         memory_learner=memory_learner,
+        action_proposals=None if actions is None else actions.proposals,
+        action_revisions=None if actions is None else actions.revisions,
+        revision_agent=agent if actions is not None else None,
         telegram=telegram,
     )
     subscriber = GooglePullSubscriber(project_id, settings.telegram_turn_subscription_id)
@@ -592,6 +658,44 @@ def build_delivery_dependencies(settings: Settings) -> DeliveryDependencies:
         subscriber, service, settings.telegram_pull_timeout_seconds
     )
     return DeliveryDependencies(database, subscriber, telegram, service, worker)
+
+
+def build_action_dispatch_dependencies(settings: Settings) -> ActionDispatchDependencies:
+    if not settings.actions_enabled:
+        raise ValueError("action execution is disabled")
+    project_id = _required_pubsub_project(settings)
+    task_project = settings.action_tasks_project_id
+    location = settings.action_tasks_location
+    executor_url = settings.action_executor_url
+    audience = settings.action_executor_audience
+    caller = settings.action_task_caller_service_account
+    if None in {task_project, location, executor_url, audience, caller}:
+        # Settings normally catches this first; retain a local fail-fast boundary for callers that
+        # construct Settings through model_copy in tests or dependency injection.
+        raise ValueError("action execution configuration is incomplete")
+    assert task_project is not None
+    assert location is not None
+    assert executor_url is not None
+    assert audience is not None
+    assert caller is not None
+    database = Database(settings.database_url.get_secret_value())
+    subscriber = GooglePullSubscriber(project_id, settings.action_dispatch_subscription_id)
+    enqueuer = GoogleCloudTaskEnqueuer(
+        project_id=task_project,
+        location=location,
+        queue_id=settings.action_tasks_queue_id,
+        executor_url=executor_url,
+        service_account_email=caller,
+        audience=audience,
+    )
+    repository = ActionRepository(database)
+    worker = ActionDispatchPullWorker(
+        subscriber,
+        repository,
+        enqueuer,
+        settings.action_dispatch_pull_timeout_seconds,
+    )
+    return ActionDispatchDependencies(database, subscriber, enqueuer, repository, worker)
 
 
 def _required_pubsub_project(settings: Settings) -> str:

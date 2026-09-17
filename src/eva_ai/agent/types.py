@@ -236,6 +236,7 @@ class GmailMessageEvidence(BaseModel):
 
     message_id: str = Field(max_length=500)
     thread_id: str = Field(max_length=500)
+    rfc_message_id: str = Field(default="", max_length=998)
     internal_date: datetime
     sender: str = Field(max_length=500)
     recipients: str = Field(max_length=1000)

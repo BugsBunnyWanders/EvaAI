@@ -7,6 +7,8 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from eva_ai.actions.contracts import ActionProposalWriter
+from eva_ai.actions.types import ActionOrigin, PreparedActionProposal
 from eva_ai.agent.errors import AgentConflictError, AgentNotFoundError, AgentScopeError
 from eva_ai.agent.types import (
     AgentEventContext,
@@ -15,6 +17,7 @@ from eva_ai.agent.types import (
     AgentRunRequestedMessage,
     AgentRunStatus,
     AgentUsage,
+    NotificationUrgency,
     ToolCallAudit,
 )
 from eva_ai.db.models import AgentRun, ConnectorAccount, Event, OutboxMessage, Signal
@@ -46,13 +49,20 @@ class AgentRunSubject:
     gmail_thread_id: str
     signal_is_current: bool
     signal_disposition: RelevanceDisposition
+    account_identity: str = ""
 
 
 class AgentRunRepository:
-    def __init__(self, database: Database, notification_destination: str | None = None) -> None:
+    def __init__(
+        self,
+        database: Database,
+        notification_destination: str | None = None,
+        action_proposals: ActionProposalWriter | None = None,
+    ) -> None:
         self._database = database
         self._notification_destination = notification_destination
         self._notifications = NotificationRepository(database)
+        self._action_proposals = action_proposals
 
     async def schedule_in_session(
         self,
@@ -241,6 +251,7 @@ class AgentRunRepository:
             gmail_thread_id=thread_id,
             signal_is_current=signal.is_current,
             signal_disposition=RelevanceDisposition(signal.disposition),
+            account_identity=connector.account_identity,
         )
 
     async def complete(
@@ -252,6 +263,8 @@ class AgentRunRepository:
         provider_response_id: str | None,
         usage: AgentUsage,
         tool_audit: tuple[ToolCallAudit, ...],
+        prepared_actions: tuple[PreparedActionProposal, ...] = (),
+        prepared_clarification: str | None = None,
         completed_at: datetime,
     ) -> AgentRunRecord:
         statement = (
@@ -280,9 +293,19 @@ class AgentRunRepository:
                 row = (await session.scalars(statement)).one_or_none()
                 if row is None:
                     raise AgentConflictError("AgentRun claim is stale")
-                if result.notification is not None and self._notification_destination is not None:
+                notification = result.notification
+                if (
+                    prepared_clarification is not None or notification is not None
+                ) and self._notification_destination is not None:
                     # Agent completion and proactive delivery intent commit together. A crash can
                     # delay publication, but cannot leave a successful user-facing run invisible.
+                    if prepared_clarification is not None:
+                        notification_urgency = NotificationUrgency.MEDIUM
+                        notification_message = prepared_clarification
+                    else:
+                        assert notification is not None
+                        notification_urgency = notification.urgency
+                        notification_message = notification.message
                     await self._notifications.create_in_session(
                         session,
                         event_id=row.event_id,
@@ -291,14 +314,48 @@ class AgentRunRepository:
                         situation_id=row.situation_id,
                         agent_run_id=row.id,
                         kind=NotificationKind.PROACTIVE,
-                        urgency=result.notification.urgency,
-                        message=result.notification.message,
+                        urgency=notification_urgency,
+                        message=notification_message,
                         dedupe_key=(
                             f"agent-run:{row.id}:notification:v{row.output_schema_version}"
                         ),
                         destination=self._notification_destination,
                         created_at=completed_at,
                     )
+                if prepared_actions and self._action_proposals is not None:
+                    connector_id = await session.scalar(
+                        select(ConnectorAccount.id)
+                        .join(
+                            Event,
+                            and_(
+                                Event.principal_id == ConnectorAccount.id,
+                                Event.workspace_id == ConnectorAccount.workspace_id,
+                                Event.user_id == ConnectorAccount.user_id,
+                            ),
+                        )
+                        .where(
+                            Event.id == row.event_id,
+                            Event.workspace_id == row.workspace_id,
+                            Event.user_id == row.user_id,
+                            ConnectorAccount.provider == "gmail",
+                        )
+                    )
+                    if connector_id is not None:
+                        # Completion, proposal, action, and outbox intent share one transaction.
+                        await self._action_proposals.create_from_model_proposals_in_session(
+                            session,
+                            proposals=prepared_actions,
+                            user_id=row.user_id,
+                            workspace_id=row.workspace_id,
+                            connector_account_id=connector_id,
+                            event_id=row.event_id,
+                            situation_id=row.situation_id,
+                            agent_run_id=row.id,
+                            conversation_turn_id=None,
+                            origin=ActionOrigin.AGENT_RUN,
+                            source_prefix=f"agent-run:{row.id}",
+                            created_at=completed_at,
+                        )
                 return _record(row)
 
     async def fail(

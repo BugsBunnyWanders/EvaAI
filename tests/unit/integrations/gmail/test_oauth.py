@@ -10,6 +10,8 @@ from google.oauth2.credentials import Credentials
 
 from eva_ai.connectors.gmail.contracts import AuthorizedUserGrant
 from eva_ai.integrations.gmail.oauth import (
+    GMAIL_COMPOSE_SCOPE,
+    GMAIL_CONNECTOR_SCOPES,
     GMAIL_READONLY_SCOPE,
     GoogleDesktopOAuthAuthorizer,
     OAuthAuthorizationError,
@@ -49,7 +51,7 @@ class ProductionShapedFlow:
 
 
 @pytest.mark.asyncio
-async def test_authorize_requests_only_offline_readonly_access_without_logging_credentials(
+async def test_authorize_requests_offline_readonly_and_compose_without_logging_credentials(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Fails if OAuth broadens scope/options or exposes the resulting credential JSON."""
@@ -66,12 +68,18 @@ async def test_authorize_requests_only_offline_readonly_access_without_logging_c
     caplog.set_level(logging.DEBUG)
     grant = await GoogleDesktopOAuthAuthorizer(flow_factory=flow_factory).authorize(
         Path("/private/oauth-client.json"),
-        (GMAIL_READONLY_SCOPE,),
+        GMAIL_CONNECTOR_SCOPES,
     )
 
     assert grant == AuthorizedUserGrant(authorized_user_json=secret_json)
     assert factory_calls == [
-        ("/private/oauth-client.json", ("https://www.googleapis.com/auth/gmail.readonly",))
+        (
+            "/private/oauth-client.json",
+            (
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/gmail.compose",
+            ),
+        )
     ]
     assert flow.local_server_calls == [{"access_type": "offline", "prompt": "consent"}]
     assert secret_json not in caplog.text
@@ -87,25 +95,25 @@ async def test_authorize_persists_refresh_material_without_access_token_or_expir
         token_uri="https://oauth2.googleapis.com/token",
         client_id="desktop-client-id",
         client_secret="desktop-client-secret",
-        scopes=[GMAIL_READONLY_SCOPE],
+        scopes=[GMAIL_READONLY_SCOPE, GMAIL_COMPOSE_SCOPE],
     )
     credentials.expiry = datetime(2026, 8, 30, 12, 34, 56, tzinfo=UTC)
 
     grant = await GoogleDesktopOAuthAuthorizer(
         flow_factory=lambda *_: ProductionShapedFlow(credentials)
-    ).authorize(Path("/private/oauth-client.json"), (GMAIL_READONLY_SCOPE,))
+    ).authorize(Path("/private/oauth-client.json"), GMAIL_CONNECTOR_SCOPES)
 
     stored = json.loads(grant.authorized_user_json)
     assert stored["refresh_token"] == "durable-refresh-token"
     assert stored["token_uri"] == "https://oauth2.googleapis.com/token"
     assert stored["client_id"] == "desktop-client-id"
     assert stored["client_secret"] == "desktop-client-secret"
-    assert stored["scopes"] == [GMAIL_READONLY_SCOPE]
+    assert stored["scopes"] == [GMAIL_READONLY_SCOPE, GMAIL_COMPOSE_SCOPE]
     assert {"token", "access_token", "expiry"}.isdisjoint(stored)
 
 
 @pytest.mark.asyncio
-async def test_authorize_rejects_any_scope_other_than_gmail_readonly() -> None:
+async def test_authorize_rejects_any_scope_set_other_than_connector_scopes() -> None:
     """Fails if a caller can expand the ingestion connector's OAuth authority."""
     called = False
 
@@ -115,10 +123,12 @@ async def test_authorize_rejects_any_scope_other_than_gmail_readonly() -> None:
         called = True
         raise AssertionError("flow construction must not run for a forbidden scope")
 
-    with pytest.raises(ValueError, match="^Gmail authorization requires gmail.readonly only$"):
+    with pytest.raises(
+        ValueError,
+        match="^Gmail authorization requires gmail.readonly and gmail.compose$",
+    ):
         await GoogleDesktopOAuthAuthorizer(flow_factory=flow_factory).authorize(
-            Path("oauth-client.json"),
-            ("https://mail.google.com/",),
+            Path("oauth-client.json"), (GMAIL_READONLY_SCOPE,)
         )
 
     assert called is False
@@ -134,7 +144,7 @@ async def test_authorize_maps_provider_failure_without_exposing_secret_text() ->
 
     with pytest.raises(OAuthAuthorizationError) as raised:
         await GoogleDesktopOAuthAuthorizer(flow_factory=failing_flow_factory).authorize(
-            Path("oauth-client.json"), (GMAIL_READONLY_SCOPE,)
+            Path("oauth-client.json"), GMAIL_CONNECTOR_SCOPES
         )
 
     assert str(raised.value) == "Google OAuth authorization failed"

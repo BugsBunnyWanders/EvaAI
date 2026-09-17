@@ -2,7 +2,8 @@
 
 Eva is a proactive, event-driven personal AI operator. The repository contains the application
 foundation, durable Event backbone, Gmail ingestion, Goal and Situation domain, relevance engine,
-scoped long-term memory, bounded email investigation, and user-specific Telegram conversation.
+scoped long-term memory, bounded email investigation, user-specific Telegram conversation, and
+approval-gated Gmail drafting and sending.
 
 ## Requirements
 
@@ -36,6 +37,9 @@ Milestone 5.5 packages the API and continuous worker into one immutable image an
 production runtime with Terraform. Pull requests receive no Google credential; after CI succeeds on
 `main`, GitHub Actions authenticates through Workload Identity Federation, applies Terraform with
 workers paused, runs migrations, restores the configured worker count, and checks API readiness.
+The same stack provisions a bounded Cloud Tasks queue and a private, IAM-authenticated action
+executor. Proposal and dispatch paths use `EVA_ACTIONS_ENABLED`; the private runtime uses the
+separate `EVA_ACTION_EXECUTOR_ENABLED` boot gate.
 The one-time bootstrap and first Gmail activation steps are in the
 [GCP deployment guide](docs/deployment.md).
 
@@ -231,5 +235,27 @@ Pairing binds immutable numeric Telegram user and chat IDs to one Eva User and W
 conversation, Situation, memory lookup, Gmail read, and response remains within that persisted
 scope. Replies to proactive messages recover the originating Situation; ordinary messages use the
 active general chat, and `/new` starts a fresh one. The shared Cloud Run worker now supervises six
-continuous loops. Gmail access remains read-only; drafting, approval, and sending are deferred to
-Milestone 8. See the [Telegram operator guide](docs/telegram-operator.md).
+continuous loops. This milestone's Gmail tools remain read-only; Milestone 8 adds a separate,
+approval-gated action path. See the [Telegram operator guide](docs/telegram-operator.md).
+
+### Milestone 8: Gmail actions and exact approval
+
+Milestone 8 lets the agent propose reply or brand-new Gmail drafts without giving the model a Gmail
+write tool:
+
+```text
+Agent/conversation intent -> deterministic validation -> Gmail draft creation
+    -> exact Telegram card [Send | Change | Discard]
+    -> immutable approval -> outbox -> Pub/Sub -> Cloud Tasks
+    -> private action executor -> Gmail -> durable result + Telegram status
+```
+
+Draft creation is automatic, but sending always requires the paired user to approve the exact
+recipients, subject, body, and thread context. **Change** invalidates the old approval and produces a
+new complete draft version; **Discard** deletes only Eva's exact managed draft. Approvals expire
+after 24 hours. Ambiguous send outcomes become `UNKNOWN` and are never retried blindly.
+
+Existing connectors must be reauthorized for both `gmail.readonly` and `gmail.compose` before write
+actions work. Reauthorization preserves the connector identity, original connection boundary,
+Gmail history cursor, and watch state. See the
+[Gmail actions operator and smoke-test guide](docs/operations/gmail-actions-smoke-test.md).

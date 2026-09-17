@@ -69,6 +69,12 @@ async def test_event_backbone_tables_exist(database: Database) -> None:
         "telegram_conversations",
         "conversation_turns",
         "notifications",
+        "action_proposals",
+        "action_approvals",
+        "actions",
+        "action_results",
+        "managed_gmail_drafts",
+        "action_revision_sessions",
     } <= set(tables)
 
 

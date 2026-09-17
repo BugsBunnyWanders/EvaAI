@@ -26,7 +26,7 @@ from eva_ai.connectors.repository import ConnectorRepository
 from eva_ai.connectors.types import ConnectorRecord, ConnectorStatus
 from eva_ai.integrations.gcp.secret_manager import SecretManagerProviderError
 from eva_ai.integrations.gmail.api import GmailProviderError
-from eva_ai.integrations.gmail.oauth import GMAIL_READONLY_SCOPE
+from eva_ai.integrations.gmail.oauth import GMAIL_CONNECTOR_SCOPES, GMAIL_READONLY_SCOPE
 
 NOW = datetime(2030, 1, 1, 12, tzinfo=UTC)
 LATER = NOW + timedelta(days=3)
@@ -309,13 +309,13 @@ async def test_connect_persists_profile_boundary_before_watch_then_activates() -
         "watch",
         "activate",
     ]
-    assert harness.authorizer.arguments == (CLIENT_FILE, (GMAIL_READONLY_SCOPE,))
+    assert harness.authorizer.arguments == (CLIENT_FILE, GMAIL_CONNECTOR_SCOPES)
     assert harness.client_factory.authorized_user_json == AUTHORIZED_USER_JSON
     assert harness.repository.reserve_arguments == (
         USER_ID,
         WORKSPACE_ID,
         "owner@example.com",
-        (GMAIL_READONLY_SCOPE,),
+        GMAIL_CONNECTOR_SCOPES,
         NOW,
     )
     assert harness.credential_store.put_arguments == (CONNECTOR_ID, AUTHORIZED_USER_JSON)

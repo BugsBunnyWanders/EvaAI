@@ -4,12 +4,17 @@ from decimal import Decimal
 from uuid import uuid7
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
+from eva_ai.actions.canonical import CanonicalEmail
+from eva_ai.actions.repository import ActionRepository
+from eva_ai.actions.service import ActionProposalService
+from eva_ai.actions.types import GmailActionCapability, PreparedActionProposal
 from eva_ai.agent.types import AgentUsage, ProposedAction
+from eva_ai.connectors.types import ConnectorStatus
 from eva_ai.conversation.repository import ConversationRepository
 from eva_ai.db import Database
-from eva_ai.db.models import OutboxMessage
+from eva_ai.db.models import Action, ActionProposal, ConnectorAccount, OutboxMessage
 from eva_ai.memory.types import (
     MemoryProposal,
     MemoryProposalKind,
@@ -86,8 +91,32 @@ async def test_pairing_chat_reply_and_new_conversation_are_user_scoped(
             consumed_at=NOW + timedelta(seconds=1),
         )
     )
+    connector_id = uuid7()
+    async with database.session() as session:
+        async with session.begin():
+            session.add(
+                ConnectorAccount(
+                    id=connector_id,
+                    user_id=scope.user_id,
+                    workspace_id=scope.workspace_id,
+                    provider="gmail",
+                    account_identity="owner@example.com",
+                    granted_scopes=["gmail.readonly", "gmail.compose"],
+                    status=ConnectorStatus.ACTIVE,
+                    secret_reference="secret",
+                    connected_at=NOW,
+                )
+            )
     webhook = TelegramWebhookService(accounts, TelegramEventService(database, "eva-telegram-turns"))
-    conversations = ConversationRepository(database, "eva-telegram-delivery")
+    action_proposals = ActionProposalService(
+        ActionRepository(database),
+        destination="eva-actions",
+    )
+    conversations = ConversationRepository(
+        database,
+        "eva-telegram-delivery",
+        action_proposals=action_proposals,
+    )
 
     first_ingest = await webhook.handle(
         _update(1, "What needs my attention?", telegram_user_id=account.telegram_user_id),
@@ -116,8 +145,20 @@ async def test_pairing_chat_reply_and_new_conversation_are_user_scoped(
         reasoning_summary="The user asked for an attention summary.",
         proposed_actions=(
             ProposedAction(
-                capability="review_email",
-                description="Review the relevant recruiting email.",
+                capability="gmail.create_draft",
+                description="Create the requested email draft.",
+            ),
+        ),
+        prepared_actions=(
+            PreparedActionProposal(
+                capability=GmailActionCapability.CREATE_DRAFT,
+                description="Create the requested email draft.",
+                message=CanonicalEmail(
+                    mode="NEW",
+                    to=("person@example.com",),
+                    subject="Following up",
+                    text_body="Here is the requested follow-up.",
+                ),
             ),
         ),
         memory_proposals=(
@@ -138,8 +179,22 @@ async def test_pairing_chat_reply_and_new_conversation_are_user_scoped(
     )
     assert assistant.notification_id is not None
     assert assistant.reasoning_summary == "The user asked for an attention summary."
-    assert assistant.proposed_actions[0].capability == "review_email"
+    assert assistant.proposed_actions[0].capability == "gmail.create_draft"
     assert assistant.memory_proposals[0].key == "job_search_status"
+    async with database.session() as session:
+        proposal_count = await session.scalar(
+            select(func.count())
+            .select_from(ActionProposal)
+            .where(ActionProposal.conversation_turn_id == assistant.id)
+        )
+        action_count = await session.scalar(
+            select(func.count())
+            .select_from(Action)
+            .join(ActionProposal, ActionProposal.id == Action.proposal_id)
+            .where(ActionProposal.conversation_turn_id == assistant.id)
+        )
+    assert proposal_count == 1
+    assert action_count == 1
     notifications = NotificationRepository(database)
     notification = await notifications.get(
         notification_id=assistant.notification_id,

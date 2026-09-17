@@ -3,6 +3,12 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import uuid7
 
+from eva_ai.actions.contracts import ActionProposalPreparer
+from eva_ai.actions.types import (
+    ActionProposalPreparation,
+    GmailActionCapability,
+    PreparedActionProposal,
+)
 from eva_ai.agent.contracts import InvestigationAgent
 from eva_ai.agent.errors import AgentTransientError
 from eva_ai.agent.repository import AgentRunClaim, AgentRunRepository, AgentRunSubject
@@ -16,6 +22,7 @@ from eva_ai.agent.types import (
     AgentRunStatus,
     AgentUsage,
     InvestigationOutcome,
+    ProposedAction,
     ToolCallAudit,
 )
 from eva_ai.connectors.gmail.contracts import CredentialStore, GmailClientFactory
@@ -32,6 +39,7 @@ class Runs:
         self.subject = subject
         self.attempt_count = attempt_count
         self.completed = False
+        self.completion_values: dict[str, object] = {}
         self.failures: list[tuple[bool, str]] = []
 
     async def claim(
@@ -50,6 +58,7 @@ class Runs:
 
     async def complete(self, claim: AgentRunClaim, **kwargs: object) -> AgentRunRecord:
         self.completed = True
+        self.completion_values = kwargs
         return self.subject.run.model_copy(update={"status": AgentRunStatus.SUCCEEDED})
 
     async def fail(
@@ -112,19 +121,62 @@ class Invocation:
 
 
 class Agent:
-    def __init__(self, *, transient: bool = False) -> None:
+    def __init__(self, *, transient: bool = False, propose: bool = False) -> None:
         self.transient = transient
+        self.propose = propose
 
     async def investigate(self, request: object, reader: object) -> Invocation:
         if self.transient:
             raise AgentTransientError("safe")
         return Invocation(
             AgentInvestigationResult(
-                decision=AgentDecision.NO_ACTION,
-                reasoning_summary="No action is required.",
+                decision=(
+                    AgentDecision.PROPOSE_ACTION if self.propose else AgentDecision.NO_ACTION
+                ),
+                reasoning_summary="A draft may be useful.",
+                proposed_actions=(
+                    ProposedAction(
+                        capability="gmail.create_draft",
+                        description="Create a draft",
+                        arguments={
+                            "mode": "NEW",
+                            "to": ["person@example.com"],
+                            "subject": "Hello",
+                            "text_body": "Body",
+                        },
+                    ),
+                )
+                if self.propose
+                else (),
             ),
             "response-1",
             AgentUsage(input_tokens=5, output_tokens=2, total_tokens=7),
+        )
+
+
+class ProposalPreparer:
+    def __init__(self, preparation: ActionProposalPreparation | None = None) -> None:
+        self.calls = 0
+        self.preparation = preparation
+
+    async def prepare_model_proposals(self, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        self.calls += 1
+        from eva_ai.actions.canonical import CanonicalEmail
+
+        return self.preparation or ActionProposalPreparation(
+            proposals=(
+                PreparedActionProposal(
+                    capability=GmailActionCapability.CREATE_DRAFT,
+                    description="Create a draft",
+                    message=CanonicalEmail(
+                        mode="NEW",
+                        to=("person@example.com",),
+                        subject="Hello",
+                        text_body="Body",
+                    ),
+                ),
+            )
         )
 
 
@@ -153,6 +205,52 @@ async def test_service_processes_current_notify_signal() -> None:
     assert outcome is InvestigationOutcome.SUCCEEDED
     assert runs.completed is True
     assert client.closed is True
+
+
+async def test_service_prepares_and_commits_proactive_action_intent() -> None:
+    message, subject, context = _fixture()
+    runs = Runs(subject)
+    client = Client()
+    preparer = ProposalPreparer()
+    service = _service(
+        runs,
+        context,
+        client,
+        Agent(propose=True),
+        action_proposals=cast(ActionProposalPreparer, preparer),
+    )
+
+    outcome = await service.process(message)
+
+    assert outcome is InvestigationOutcome.SUCCEEDED
+    assert preparer.calls == 1
+    prepared = runs.completion_values["prepared_actions"]
+    assert isinstance(prepared, tuple) and len(prepared) == 1
+
+
+async def test_service_commits_proactive_recipient_clarification() -> None:
+    message, subject, context = _fixture()
+    runs = Runs(subject)
+    client = Client()
+    preparer = ProposalPreparer(
+        ActionProposalPreparation(clarification="Which address should I use for Jane Doe?")
+    )
+    service = _service(
+        runs,
+        context,
+        client,
+        Agent(propose=True),
+        action_proposals=cast(ActionProposalPreparer, preparer),
+    )
+
+    outcome = await service.process(message)
+
+    assert outcome is InvestigationOutcome.SUCCEEDED
+    assert runs.completion_values["prepared_actions"] == ()
+    assert (
+        runs.completion_values["prepared_clarification"]
+        == "Which address should I use for Jane Doe?"
+    )
 
 
 async def test_service_classifies_transient_agent_failure_for_retry() -> None:
@@ -187,6 +285,7 @@ def _service(
     context: AgentWorkingContext,
     client: Client,
     agent: Agent,
+    action_proposals: ActionProposalPreparer | None = None,
 ) -> AgentInvestigationService:
     return AgentInvestigationService(
         runs=cast(AgentRunRepository, runs),
@@ -194,6 +293,7 @@ def _service(
         credential_store=cast(CredentialStore, Store()),
         gmail_clients=cast(GmailClientFactory, Factory(client)),
         agent=cast(InvestigationAgent, agent),
+        action_proposals=action_proposals,
         lease_seconds=60,
         max_attempts=3,
         retry_initial_backoff_seconds=1,

@@ -8,6 +8,7 @@ from uuid import UUID, uuid7
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.engine import CursorResult
 
+from eva_ai.actions.types import ActionExecutionRequestedMessage
 from eva_ai.agent.types import AgentRunRequestedMessage
 from eva_ai.db.models import OutboxMessage
 from eva_ai.db.session import Database
@@ -198,6 +199,8 @@ class OutboxRelay:
 def _parse_envelope(message_type: str, payload: Mapping[str, object]) -> OutboundEnvelope:
     if message_type == "event.available":
         return EventAvailableMessage.model_validate(payload)
+    if message_type == "action.execution.requested":
+        return ActionExecutionRequestedMessage.model_validate(payload)
     if message_type == "agent.run.requested":
         return AgentRunRequestedMessage.model_validate(payload)
     if message_type == "telegram.turn.requested":

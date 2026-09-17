@@ -30,6 +30,7 @@ class ConnectorAccount(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "connector_accounts"
     __table_args__ = (
         CONNECTOR_ACCOUNT_SCOPE_FK,
+        UniqueConstraint("id", "workspace_id", "user_id", name="uq_connector_accounts_id_scope"),
         UniqueConstraint(
             "workspace_id",
             "provider",

@@ -66,6 +66,7 @@ from eva_ai.situations import SituationLifecycle, SituationRepository, Situation
 from eva_ai.telegram.repository import TelegramAccountRepository
 from eva_ai.worker import (
     MemoryDependencies,
+    build_action_dispatch_dependencies,
     build_agent_dependencies,
     build_conversation_dependencies,
     build_delivery_dependencies,
@@ -613,6 +614,20 @@ async def telegram_delivery_pull_command(*, settings: Settings) -> None:
     )
 
 
+async def action_dispatch_pull_command(*, settings: Settings) -> None:
+    dependencies = build_action_dispatch_dependencies(settings)
+    primary_failure: BaseException | None = None
+    try:
+        await dependencies.worker.run_forever()
+    except BaseException as error:
+        primary_failure = error
+    cleanup = await dependencies.close()
+    _raise_after_cleanup(
+        primary_failure,
+        CleanupOutcome(cleanup.interruption, cleanup.ordinary_failure),
+    )
+
+
 async def worker_run_command(*, settings: Settings) -> None:
     """Run every continuous consumer as one Cloud Run worker-pool process."""
     # A failure in any loop cancels its siblings. Their command-level cleanup handlers then
@@ -629,6 +644,10 @@ async def worker_run_command(*, settings: Settings) -> None:
             )
             group.create_task(
                 telegram_delivery_pull_command(settings=settings), name="telegram-delivery-pull"
+            )
+        if settings.actions_enabled:
+            group.create_task(
+                action_dispatch_pull_command(settings=settings), name="action-dispatch-pull"
             )
 
 

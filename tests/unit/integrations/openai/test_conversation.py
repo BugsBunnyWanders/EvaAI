@@ -7,12 +7,14 @@ import pytest
 from agents import AgentOutputSchema, MaxTurnsExceeded, RunConfig
 from openai import AsyncOpenAI
 
+from eva_ai.actions.canonical import CanonicalEmail
 from eva_ai.conversation.errors import ConversationModelOutputError
 from eva_ai.conversation.types import (
     ConversationAgentRequest,
     ConversationAgentResult,
     ConversationHistoryTurn,
     ConversationTurnRole,
+    DraftRevisionRequest,
 )
 from eva_ai.integrations.openai.conversation import (
     OpenAIAgentsConversationAgent,
@@ -121,6 +123,75 @@ async def test_conversation_adapter_safely_classifies_turn_exhaustion(monkeypatc
         await adapter.respond(_request(False), None)
 
     assert "private provider details" not in str(captured.value)
+    await adapter._client.close()
+
+
+async def test_revision_adapter_returns_complete_replacement_without_mutation_tools(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Run:
+        last_response_id = "response-revision"
+        context_wrapper = SimpleNamespace(
+            usage=SimpleNamespace(input_tokens=14, output_tokens=8, total_tokens=22)
+        )
+
+        def final_output_as(
+            self, output_type: type[object], raise_if_incorrect_type: bool
+        ) -> object:
+            return cast(Any, output_type)(
+                mode="NEW",
+                to=("new@example.com",),
+                cc=(),
+                bcc=(),
+                subject="Updated subject",
+                text_body="The complete updated body.",
+                html_body=None,
+                thread_id=None,
+                attachments=(),
+                reasoning_summary="Applied the requested tone change.",
+            )
+
+    async def fake_run(agent: Any, input: str, **kwargs: object) -> Run:
+        captured["tools"] = tuple(agent.tools)
+        captured["input"] = input
+        captured["output_type"] = agent.output_type
+        return Run()
+
+    monkeypatch.setattr("eva_ai.integrations.openai.conversation.Runner.run", fake_run)
+    adapter = OpenAIAgentsConversationAgent(
+        AsyncOpenAI(api_key="test-key"),
+        model="gpt-5.6-sol",
+        reasoning_effort="medium",
+        max_turns=6,
+        max_tool_calls=4,
+        tool_timeout_seconds=30,
+    )
+    base = _request(False)
+    request = DraftRevisionRequest(
+        turn_id=base.turn_id,
+        conversation_id=base.conversation_id,
+        instruction="Make it warmer and send it to the new address.",
+        current_message=CanonicalEmail(
+            mode="NEW",
+            to=("old@example.com",),
+            subject="Original subject",
+            text_body="Original body.",
+        ),
+        history=base.history,
+        context=base.context,
+    )
+
+    invocation = await adapter.revise(request)
+
+    assert captured["tools"] == ()
+    assert isinstance(captured["output_type"], AgentOutputSchema)
+    assert "Original body." in str(captured["input"])
+    assert "Make it warmer" in str(captured["input"])
+    assert invocation.candidate.text_body == "The complete updated body."
+    assert invocation.candidate.to == ("new@example.com",)
+    assert invocation.usage.total_tokens == 22
     await adapter._client.close()
 
 
