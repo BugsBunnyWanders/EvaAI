@@ -98,6 +98,7 @@ class ConversationTurn(UUIDPrimaryKeyMixin, Base):
             name="fk_conversation_turns_notification_scope",
             ondelete="CASCADE",
         ),
+        UniqueConstraint("id", "workspace_id", "user_id", name="uq_conversation_turns_id_scope"),
         UniqueConstraint("conversation_id", "sequence", name="uq_conversation_turns_sequence"),
         UniqueConstraint("event_id", name="uq_conversation_turns_event"),
         UniqueConstraint("notification_id", name="uq_conversation_turns_notification"),

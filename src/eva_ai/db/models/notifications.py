@@ -1,6 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
+from pydantic import JsonValue
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from eva_ai.agent.types import NotificationUrgency
@@ -89,6 +91,7 @@ class Notification(UUIDPrimaryKeyMixin, Base):
     kind: Mapped[NotificationKind] = mapped_column(String(20))
     urgency: Mapped[NotificationUrgency] = mapped_column(String(20))
     message: Mapped[str] = mapped_column(Text)
+    reply_markup: Mapped[dict[str, JsonValue] | None] = mapped_column(JSONB)
     dedupe_key: Mapped[str] = mapped_column(String(500))
     status: Mapped[NotificationStatus] = mapped_column(
         String(32), default=NotificationStatus.PENDING, server_default="PENDING"
