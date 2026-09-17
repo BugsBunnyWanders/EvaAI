@@ -16,4 +16,3 @@ class ActionConflictError(ActionError):
 
 class ActionProviderError(ActionError):
     """A provider operation failed with provider-controlled details removed."""
-

@@ -25,9 +25,7 @@ class ActionPolicyEngine:
             case GmailActionCapability.CREATE_DRAFT:
                 return PolicyDecision.ALLOW
             case GmailActionCapability.UPDATE_DRAFT:
-                return (
-                    PolicyDecision.ALLOW if context.managed_draft else PolicyDecision.DENY
-                )
+                return PolicyDecision.ALLOW if context.managed_draft else PolicyDecision.DENY
             case GmailActionCapability.SEND_DRAFT:
                 return (
                     PolicyDecision.REQUIRE_APPROVAL

@@ -69,9 +69,7 @@ class CanonicalEmail(BaseModel):
     references: tuple[str, ...] = Field(default=(), max_length=100)
     attachments: tuple[str, ...] = ()
 
-    _normalize_recipients = field_validator("to", "cc", "bcc", mode="before")(
-        _normalize_addresses
-    )
+    _normalize_recipients = field_validator("to", "cc", "bcc", mode="before")(_normalize_addresses)
     _normalize_subject = field_validator("subject", mode="before")(_required_single_line)
     _normalize_text = field_validator("text_body", mode="before")(_required_body)
 
