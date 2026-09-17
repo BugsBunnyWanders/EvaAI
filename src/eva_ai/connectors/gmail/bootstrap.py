@@ -14,9 +14,9 @@ from eva_ai.connectors.gmail.contracts import (
 )
 from eva_ai.connectors.repository import ConnectorRepository
 from eva_ai.connectors.types import ConnectorRecord, ConnectorStatus
-from eva_ai.integrations.gmail.oauth import GMAIL_READONLY_SCOPE
+from eva_ai.integrations.gmail.oauth import GMAIL_CONNECTOR_SCOPES
 
-_GMAIL_SCOPES = (GMAIL_READONLY_SCOPE,)
+_GMAIL_SCOPES = GMAIL_CONNECTOR_SCOPES
 _WATCH_RENEWAL_INTERVAL = timedelta(hours=24)
 _SAFETY_SYNC_INTERVAL = timedelta(minutes=60)
 

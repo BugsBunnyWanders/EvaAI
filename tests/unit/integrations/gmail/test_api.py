@@ -19,11 +19,13 @@ from eva_ai.connectors.gmail.contracts import (
     MessageUnavailable,
 )
 from eva_ai.integrations.gmail.api import (
+    GmailActionReauthorizationRequired,
     GmailProviderError,
     GoogleGmailClient,
     GoogleGmailClientFactory,
     InvalidAuthorizedUserCredentials,
 )
+from eva_ai.integrations.gmail.oauth import GMAIL_COMPOSE_SCOPE, GMAIL_READONLY_SCOPE
 
 
 class ExecutableRequest:
@@ -64,6 +66,9 @@ class GmailResources:
     def messages(self) -> GmailResources:
         return self
 
+    def drafts(self) -> GmailResources:
+        return self
+
     def threads(self) -> ThreadsResources:
         return ThreadsResources(self)
 
@@ -85,7 +90,21 @@ class GmailResources:
         return self._request(operation, kwargs)
 
     def get(self, **kwargs: object) -> ExecutableRequest:
-        return self._request("get_message", kwargs)
+        is_draft = kwargs.get("format") == "full" and str(kwargs.get("id", "")).startswith("draft-")
+        operation = "get_draft" if is_draft else "get_message"
+        return self._request(operation, kwargs)
+
+    def create(self, **kwargs: object) -> ExecutableRequest:
+        return self._request("create_draft", kwargs)
+
+    def update(self, **kwargs: object) -> ExecutableRequest:
+        return self._request("update_draft", kwargs)
+
+    def delete(self, **kwargs: object) -> ExecutableRequest:
+        return self._request("delete_draft", kwargs)
+
+    def send(self, **kwargs: object) -> ExecutableRequest:
+        return self._request("send_draft", kwargs)
 
     def close(self) -> None:
         assert threading.get_ident() != self.main_thread_id
@@ -250,6 +269,109 @@ async def test_gmail_factory_constructs_credentials_and_service_off_the_event_lo
     assert transport_calls == [(credentials_sentinel, 30.0)]
     assert build_calls == [("gmail", "v1", http_sentinel, False)]
     assert "factory-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_action_factory_requires_compose_but_ingestion_accepts_readonly() -> None:
+    service = GmailResources(threading.get_ident())
+    credential_calls: list[tuple[dict[str, object], tuple[str, ...]]] = []
+
+    def credentials_factory(info: dict[str, object], scopes: tuple[str, ...]) -> object:
+        credential_calls.append((info, scopes))
+        return object()
+
+    factory = GoogleGmailClientFactory(
+        credentials_factory=credentials_factory,
+        build_service=lambda *_args, **_kwargs: service,
+    )
+    readonly_json = json.dumps({"scopes": [GMAIL_READONLY_SCOPE]})
+
+    ingestion_client = await factory.create(readonly_json)
+    with pytest.raises(GmailActionReauthorizationRequired) as raised:
+        await factory.create_action(readonly_json)
+
+    assert str(raised.value) == "Gmail action authorization requires gmail.compose"
+    assert credential_calls == [
+        ({"scopes": [GMAIL_READONLY_SCOPE]}, (GMAIL_READONLY_SCOPE,)),
+    ]
+    await ingestion_client.close()
+
+    combined_json = json.dumps({"scopes": [GMAIL_READONLY_SCOPE, GMAIL_COMPOSE_SCOPE]})
+    action_client = await factory.create_action(combined_json)
+
+    assert credential_calls[-1] == (
+        {"scopes": [GMAIL_READONLY_SCOPE, GMAIL_COMPOSE_SCOPE]},
+        (GMAIL_READONLY_SCOPE, GMAIL_COMPOSE_SCOPE),
+    )
+    await action_client.close()
+
+
+@pytest.mark.asyncio
+async def test_gmail_action_client_uses_only_users_drafts_endpoints() -> None:
+    service = GmailResources(threading.get_ident())
+    service.results.update(
+        {
+            "create_draft": {
+                "id": "draft-1",
+                "message": {"id": "message-1", "threadId": "thread-1"},
+            },
+            "update_draft": {
+                "id": "draft-1",
+                "message": {"id": "message-2", "threadId": "thread-1"},
+            },
+            "get_draft": {"id": "draft-1", "message": {"id": "message-2"}},
+            "send_draft": {"id": "message-3", "threadId": "thread-1"},
+            "delete_draft": {},
+        }
+    )
+    client = GoogleGmailClient(service)
+
+    created = await client.create_draft("encoded-create", "thread-1")
+    updated = await client.update_draft("draft-1", "encoded-update", "thread-1")
+    loaded = await client.get_draft("draft-1")
+    sent = await client.send_draft("draft-1")
+    await client.delete_draft("draft-1")
+
+    assert created.draft_id == "draft-1"
+    assert created.message_id == "message-1"
+    assert updated.message_id == "message-2"
+    assert loaded == service.results["get_draft"]
+    assert sent.message_id == "message-3"
+    assert service.calls == [
+        (
+            "create_draft",
+            {
+                "userId": "me",
+                "body": {"message": {"raw": "encoded-create", "threadId": "thread-1"}},
+            },
+        ),
+        (
+            "update_draft",
+            {
+                "userId": "me",
+                "id": "draft-1",
+                "body": {"message": {"raw": "encoded-update", "threadId": "thread-1"}},
+            },
+        ),
+        ("get_draft", {"userId": "me", "id": "draft-1", "format": "full"}),
+        ("send_draft", {"userId": "me", "body": {"id": "draft-1"}}),
+        ("delete_draft", {"userId": "me", "id": "draft-1"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_draft_provider_error_is_sanitized_and_classified() -> None:
+    service = GmailResources(threading.get_ident())
+    marker = "private-draft-provider-body"
+    service.errors["create_draft"] = http_error(400, marker.encode())
+
+    with pytest.raises(GmailProviderError) as raised:
+        await GoogleGmailClient(service).create_draft("private-raw-message", None)
+
+    assert str(raised.value) == "Gmail API request failed"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert marker not in repr(raised.value)
 
 
 @pytest.mark.asyncio
