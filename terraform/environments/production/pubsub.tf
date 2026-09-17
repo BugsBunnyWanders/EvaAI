@@ -120,3 +120,51 @@ resource "google_pubsub_subscription" "telegram_delivery" {
     maximum_backoff = "600s"
   }
 }
+
+resource "google_project_service" "cloud_tasks" {
+  project            = var.project_id
+  service            = "cloudtasks.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "google_cloud_tasks_queue" "actions" {
+  project  = var.project_id
+  name     = var.action_queue_id
+  location = var.region
+
+  rate_limits {
+    max_dispatches_per_second = 2
+    max_concurrent_dispatches = 2
+  }
+
+  retry_config {
+    max_attempts       = var.action_task_max_attempts
+    max_retry_duration = "3600s"
+    min_backoff        = "5s"
+    max_backoff        = "300s"
+    max_doublings      = 5
+  }
+
+  stackdriver_logging_config {
+    sampling_ratio = 1.0
+  }
+
+  depends_on = [google_project_service.cloud_tasks]
+}
+
+resource "google_pubsub_subscription" "action_dispatch" {
+  project              = var.project_id
+  name                 = local.action_dispatch_subscription
+  topic                = google_pubsub_topic.events.id
+  ack_deadline_seconds = 600
+  filter               = "attributes.message_type = \"action.execution.requested\""
+
+  expiration_policy {
+    ttl = ""
+  }
+
+  retry_policy {
+    minimum_backoff = "10s"
+    maximum_backoff = "600s"
+  }
+}

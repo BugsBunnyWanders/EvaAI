@@ -65,9 +65,9 @@ def build_action_executor_dependencies(settings: Settings) -> ActionExecutorDepe
     )
     repository = ActionRepository(
         database,
-        notification_destination=(
-            settings.telegram_delivery_topic_id if settings.telegram_enabled else None
-        ),
+        # The executor does not expose Telegram routes, but Gmail draft creation and
+        # revision still emit approval notifications through the delivery topic.
+        notification_destination=settings.telegram_delivery_topic_id,
     )
     executor = ActionExecutor(
         cast(ActionExecutorStore, repository),

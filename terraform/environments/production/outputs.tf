@@ -32,3 +32,13 @@ output "telegram_delivery_subscription" {
   description = "Production Telegram Notification delivery subscription."
   value       = google_pubsub_subscription.telegram_delivery.name
 }
+
+output "action_dispatch_subscription" {
+  description = "Production action execution dispatch subscription."
+  value       = google_pubsub_subscription.action_dispatch.name
+}
+
+output "action_executor_url" {
+  description = "Private action executor default Cloud Run URL."
+  value       = google_cloud_run_v2_service.action_executor.uri
+}

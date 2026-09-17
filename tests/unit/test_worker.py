@@ -114,6 +114,25 @@ def test_action_application_composition_shares_repository_across_proposal_and_re
     assert dependencies.repository._notification_destination == settings.telegram_delivery_topic_id
 
 
+def test_action_executor_publishes_follow_up_approvals_without_telegram_routes() -> None:
+    settings = Settings(
+        _env_file=None,
+        actions_enabled=True,
+        pubsub_project_id="eva-project",
+        action_tasks_project_id="eva-project",
+        action_tasks_location="asia-south1",
+        action_tasks_queue_id="eva-actions",
+        action_executor_url="https://executor.example/internal/actions/execute",
+        action_executor_audience="https://executor.example",
+        action_task_caller_service_account="caller@eva-project.iam.gserviceaccount.com",
+    )
+
+    dependencies = build_action_executor_dependencies(settings)
+
+    assert settings.telegram_enabled is False
+    assert dependencies.repository._notification_destination == settings.telegram_delivery_topic_id
+
+
 async def test_memory_composition_without_embeddings_does_not_require_openai() -> None:
     dependencies = build_memory_dependencies(
         Settings(_env_file=None, openai_api_key=None), include_embedding=False

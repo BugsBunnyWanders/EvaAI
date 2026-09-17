@@ -154,6 +154,7 @@ jobs:
           IMAGE: ${{ steps.image.outputs.uri }}
           TELEGRAM_BOT_USERNAME: ${{ vars.EVA_TELEGRAM_BOT_USERNAME }}
           TELEGRAM_ENABLED: ${{ vars.EVA_TELEGRAM_ENABLED || 'false' }}
+          ACTIONS_ENABLED: ${{ vars.EVA_ACTIONS_ENABLED || 'false' }}
         run: |
           terraform -chdir=terraform/environments/production plan \
             -out=paused.tfplan \
@@ -162,6 +163,7 @@ jobs:
             -var="image=${IMAGE}" \
             -var="telegram_bot_username=${TELEGRAM_BOT_USERNAME}" \
             -var="telegram_enabled=${TELEGRAM_ENABLED}" \
+            -var="actions_enabled=${ACTIONS_ENABLED}" \
             -var="worker_instance_count=0"
           terraform -chdir=terraform/environments/production apply -auto-approve paused.tfplan
 
@@ -185,6 +187,7 @@ jobs:
           WORKER_COUNT: ${{ vars.EVA_WORKER_INSTANCE_COUNT || '0' }}
           TELEGRAM_BOT_USERNAME: ${{ vars.EVA_TELEGRAM_BOT_USERNAME }}
           TELEGRAM_ENABLED: ${{ vars.EVA_TELEGRAM_ENABLED || 'false' }}
+          ACTIONS_ENABLED: ${{ vars.EVA_ACTIONS_ENABLED || 'false' }}
         run: |
           terraform -chdir=terraform/environments/production plan \
             -out=running.tfplan \
@@ -193,8 +196,30 @@ jobs:
             -var="image=${IMAGE}" \
             -var="telegram_bot_username=${TELEGRAM_BOT_USERNAME}" \
             -var="telegram_enabled=${TELEGRAM_ENABLED}" \
+            -var="actions_enabled=${ACTIONS_ENABLED}" \
             -var="worker_instance_count=${WORKER_COUNT}"
           terraform -chdir=terraform/environments/production apply -auto-approve running.tfplan
+
+      - name: Verify private action executor
+        if: steps.changes.outputs.deploy == 'true'
+        shell: bash
+        env:
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+        run: |
+          ingress="$(gcloud run services describe eva-action-executor \
+            --project="${PROJECT_ID}" --region="${REGION}" \
+            --format='value(metadata.annotations.run.googleapis.com/ingress)')"
+          if [[ "${ingress}" != "internal" ]]; then
+            echo "Action executor ingress is not private: ${ingress}" >&2
+            exit 1
+          fi
+          policy="$(gcloud run services get-iam-policy eva-action-executor \
+            --project="${PROJECT_ID}" --region="${REGION}" --format=json)"
+          if jq -e '.bindings[].members[]? | select(. == "allUsers")' <<<"${policy}" >/dev/null; then
+            echo "Action executor must not grant allUsers invocation" >&2
+            exit 1
+          fi
 
       - name: Verify API health
         if: steps.changes.outputs.deploy == 'true'

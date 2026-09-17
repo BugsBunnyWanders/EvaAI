@@ -79,6 +79,19 @@ resource "google_cloud_run_v2_service" "api" {
         }
       }
 
+      dynamic "env" {
+        for_each = var.telegram_enabled ? [true] : []
+        content {
+          name = "EVA_TELEGRAM_BOT_TOKEN"
+          value_source {
+            secret_key_ref {
+              secret  = data.google_secret_manager_secret.telegram_bot_token[0].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
       volume_mounts {
         name       = "cloudsql"
         mount_path = "/cloudsql"
@@ -90,6 +103,7 @@ resource "google_cloud_run_v2_service" "api" {
     google_project_iam_member.api_cloud_sql,
     google_secret_manager_secret_iam_member.api_database,
     google_secret_manager_secret_iam_member.api_telegram_webhook,
+    google_secret_manager_secret_iam_member.api_telegram_bot_token,
     google_secret_manager_secret_version.database_url,
   ]
 }
@@ -100,6 +114,83 @@ resource "google_cloud_run_v2_service_iam_member" "public_api" {
   name     = google_cloud_run_v2_service.api.name
   role     = "roles/run.invoker"
   member   = "allUsers"
+}
+
+data "google_project" "current" {
+  project_id = var.project_id
+}
+
+resource "google_cloud_run_v2_service" "action_executor" {
+  project             = var.project_id
+  name                = "eva-action-executor"
+  location            = var.region
+  deletion_protection = true
+  ingress             = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+
+  template {
+    service_account                  = google_service_account.action_executor.email
+    max_instance_request_concurrency = 1
+    timeout                          = "${var.action_task_timeout_seconds}s"
+
+    scaling {
+      min_instance_count = 0
+      max_instance_count = 2
+    }
+
+    volumes {
+      name = "cloudsql"
+      cloud_sql_instance {
+        instances = [google_sql_database_instance.eva.connection_name]
+      }
+    }
+
+    containers {
+      name    = "action-executor"
+      image   = var.image
+      command = ["uvicorn"]
+      args    = ["eva_ai.actions.api:app", "--host", "0.0.0.0", "--port", "8080"]
+
+      ports {
+        container_port = 8080
+      }
+
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "512Mi"
+        }
+        cpu_idle = true
+      }
+
+      dynamic "env" {
+        for_each = local.action_executor_environment
+        content {
+          name  = env.key
+          value = env.value
+        }
+      }
+
+      env {
+        name = "EVA_DATABASE_URL"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.database_url.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      volume_mounts {
+        name       = "cloudsql"
+        mount_path = "/cloudsql"
+      }
+    }
+  }
+
+  depends_on = [
+    google_project_iam_member.action_executor_roles,
+    google_secret_manager_secret_version.database_url,
+  ]
 }
 
 resource "google_cloud_run_v2_worker_pool" "worker" {
@@ -197,6 +288,10 @@ resource "google_cloud_run_v2_worker_pool" "worker" {
     google_pubsub_subscription.agent,
     google_pubsub_subscription.telegram_turns,
     google_pubsub_subscription.telegram_delivery,
+    google_pubsub_subscription.action_dispatch,
+    google_cloud_tasks_queue.actions,
+    google_project_iam_member.worker_cloud_tasks_enqueuer,
+    google_service_account_iam_member.worker_action_task_caller,
     google_secret_manager_secret_version.database_url,
   ]
 }

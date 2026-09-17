@@ -16,6 +16,18 @@ resource "google_service_account" "scheduler" {
   display_name = "Eva Cloud Scheduler invoker"
 }
 
+resource "google_service_account" "action_executor" {
+  project      = var.project_id
+  account_id   = "eva-action-executor"
+  display_name = "Eva private Gmail action executor"
+}
+
+resource "google_service_account" "action_task_caller" {
+  project      = var.project_id
+  account_id   = "eva-action-task-caller"
+  display_name = "Eva Cloud Tasks action caller"
+}
+
 resource "google_project_iam_member" "api_cloud_sql" {
   project = var.project_id
   role    = "roles/cloudsql.client"
@@ -39,4 +51,35 @@ resource "google_project_iam_member" "scheduler_run_invoker" {
   project = var.project_id
   role    = "roles/run.invoker"
   member  = "serviceAccount:${google_service_account.scheduler.email}"
+}
+
+resource "google_project_iam_member" "worker_cloud_tasks_enqueuer" {
+  project = var.project_id
+  role    = "roles/cloudtasks.enqueuer"
+  member  = "serviceAccount:${google_service_account.worker.email}"
+}
+
+resource "google_service_account_iam_member" "worker_action_task_caller" {
+  service_account_id = google_service_account.action_task_caller.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.worker.email}"
+}
+
+resource "google_project_iam_member" "action_executor_roles" {
+  for_each = toset([
+    "roles/cloudsql.client",
+    "roles/secretmanager.secretAccessor",
+  ])
+
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.action_executor.email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "action_task_invoker" {
+  project  = var.project_id
+  location = google_cloud_run_v2_service.action_executor.location
+  name     = google_cloud_run_v2_service.action_executor.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.action_task_caller.email}"
 }
