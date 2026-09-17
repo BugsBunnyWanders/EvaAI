@@ -85,6 +85,7 @@ async def test_conversation_adapter_registers_only_context_appropriate_read_tool
         max_turns=6,
         max_tool_calls=4,
         tool_timeout_seconds=30,
+        actions_enabled=False,
     )
 
     result = await adapter.respond(_request(is_email_situation), Reader())
@@ -105,6 +106,76 @@ async def test_conversation_adapter_registers_only_context_appropriate_read_tool
     await adapter._client.close()
 
 
+@pytest.mark.parametrize(
+    ("actions_enabled", "required_guidance", "forbidden_guidance"),
+    [
+        (
+            False,
+            "Email access is read-only in this runtime",
+            '"capability":"gmail.create_draft"',
+        ),
+        (
+            True,
+            '"capability":"gmail.create_draft"',
+            "Email access is read-only in this runtime",
+        ),
+    ],
+)
+async def test_conversation_adapter_selects_action_guidance_from_runtime_capability(
+    monkeypatch: Any,
+    actions_enabled: bool,
+    required_guidance: str,
+    forbidden_guidance: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Run:
+        last_response_id = "response-guidance"
+        context_wrapper = SimpleNamespace(
+            usage=SimpleNamespace(input_tokens=12, output_tokens=4, total_tokens=16)
+        )
+
+        def final_output_as(
+            self, output_type: type[object], raise_if_incorrect_type: bool
+        ) -> object:
+            return cast(Any, output_type)(
+                message="I can help with that.",
+                reasoning_summary="Applied the configured action boundary.",
+                proposed_actions=(),
+                memory_proposals=(),
+            )
+
+    async def fake_run(agent: Any, input: str, **kwargs: object) -> Run:
+        captured["instructions"] = agent.instructions
+        return Run()
+
+    monkeypatch.setattr("eva_ai.integrations.openai.conversation.Runner.run", fake_run)
+    adapter = OpenAIAgentsConversationAgent(
+        AsyncOpenAI(api_key="test-key"),
+        model="gpt-5.6-sol",
+        reasoning_effort="medium",
+        max_turns=6,
+        max_tool_calls=4,
+        tool_timeout_seconds=30,
+        actions_enabled=actions_enabled,
+    )
+
+    await adapter.respond(_request(True), Reader())
+
+    instructions = str(captured["instructions"])
+    assert required_guidance in instructions
+    assert forbidden_guidance not in instructions
+    if actions_enabled:
+        assert "Creating a draft never sends it" in instructions
+        assert "accepts Eva's" in instructions
+        assert "offer to draft a specific reply" in instructions
+        assert "Send it" in instructions
+        assert '"mode":"REPLY"' in instructions
+        assert '"mode":"NEW"' in instructions
+        assert '"attachments":[]' in instructions
+    await adapter._client.close()
+
+
 async def test_conversation_adapter_safely_classifies_turn_exhaustion(monkeypatch: Any) -> None:
     async def fail_run(*args: object, **kwargs: object) -> None:
         raise MaxTurnsExceeded("private provider details")
@@ -117,6 +188,7 @@ async def test_conversation_adapter_safely_classifies_turn_exhaustion(monkeypatc
         max_turns=6,
         max_tool_calls=4,
         tool_timeout_seconds=30,
+        actions_enabled=False,
     )
 
     with pytest.raises(ConversationModelOutputError, match="invalid output") as captured:
@@ -167,6 +239,7 @@ async def test_revision_adapter_returns_complete_replacement_without_mutation_to
         max_turns=6,
         max_tool_calls=4,
         tool_timeout_seconds=30,
+        actions_enabled=True,
     )
     base = _request(False)
     request = DraftRevisionRequest(

@@ -586,6 +586,7 @@ def build_conversation_dependencies(settings: Settings) -> ConversationDependenc
         max_turns=settings.conversation_max_turns,
         max_tool_calls=settings.conversation_max_tool_calls,
         tool_timeout_seconds=settings.agent_tool_timeout_seconds,
+        actions_enabled=actions is not None,
     )
     token = settings.telegram_bot_token
     if token is None or not token.get_secret_value().strip():
