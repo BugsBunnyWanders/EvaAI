@@ -49,6 +49,7 @@ from eva_ai.telegram.types import TelegramAccountStatus, TelegramTurnRequestedMe
 _GENERAL_SITUATION_NAMESPACE = UUID("59333d11-3135-54cd-b622-afb99ad6ad58")
 _CONVERSATION_NAMESPACE = UUID("5307d944-4cb9-52aa-b66f-69010b43345a")
 _TURN_NAMESPACE = UUID("0b85e2f8-5738-5006-b583-4f3a32d184cc")
+_GMAIL_THREAD_PREFIX = "gmail-thread:"
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,7 +321,7 @@ class ConversationRepository:
             )
             thread_id = None
             if SituationType(situation.type) is SituationType.EMAIL_THREAD:
-                thread_id = await session.scalar(
+                correlation_key = await session.scalar(
                     select(SituationCorrelationKey.correlation_key).where(
                         SituationCorrelationKey.situation_id == situation.id,
                         SituationCorrelationKey.user_id == claim.user_id,
@@ -328,6 +329,10 @@ class ConversationRepository:
                         SituationCorrelationKey.kind == CorrelationKeyKind.GMAIL_THREAD,
                     )
                 )
+                if correlation_key is not None:
+                    # Situation keys are namespaced for correlation, while Gmail accepts only
+                    # the provider-owned thread identifier.
+                    thread_id = correlation_key.removeprefix(_GMAIL_THREAD_PREFIX)
         return ConversationTurnSubject(
             conversation=_conversation_record(conversation),
             turn=_turn_record(turn),

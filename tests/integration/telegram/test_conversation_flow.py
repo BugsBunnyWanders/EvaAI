@@ -10,11 +10,21 @@ from eva_ai.actions.canonical import CanonicalEmail
 from eva_ai.actions.repository import ActionRepository
 from eva_ai.actions.service import ActionProposalService
 from eva_ai.actions.types import GmailActionCapability, PreparedActionProposal
-from eva_ai.agent.types import AgentUsage, ProposedAction
+from eva_ai.agent.types import AgentUsage, NotificationUrgency, ProposedAction
 from eva_ai.connectors.types import ConnectorStatus
 from eva_ai.conversation.repository import ConversationRepository
 from eva_ai.db import Database
-from eva_ai.db.models import Action, ActionProposal, ConnectorAccount, OutboxMessage
+from eva_ai.db.models import (
+    Action,
+    ActionProposal,
+    ConnectorAccount,
+    Notification,
+    OutboxMessage,
+    Situation,
+    SituationCorrelationKey,
+)
+from eva_ai.events.service import EventService
+from eva_ai.events.types import NewEvent, PrincipalType
 from eva_ai.memory.types import (
     MemoryProposal,
     MemoryProposalKind,
@@ -22,7 +32,18 @@ from eva_ai.memory.types import (
     MemorySourceType,
 )
 from eva_ai.notifications.repository import NotificationRepository
-from eva_ai.notifications.types import NotificationDeliveryRequestedMessage, NotificationStatus
+from eva_ai.notifications.types import (
+    NotificationChannel,
+    NotificationDeliveryRequestedMessage,
+    NotificationKind,
+    NotificationStatus,
+)
+from eva_ai.situations.types import (
+    AttentionLevel,
+    CorrelationKeyKind,
+    SituationLifecycle,
+    SituationType,
+)
 from eva_ai.telegram.ingestion import TelegramEventService
 from eva_ai.telegram.repository import TelegramAccountRepository
 from eva_ai.telegram.types import (
@@ -297,6 +318,144 @@ async def test_pairing_chat_reply_and_new_conversation_are_user_scoped(
         is None
     )
     assert notification.status is NotificationStatus.PENDING
+
+
+@pytest.mark.integration
+async def test_reply_to_gmail_notification_loads_provider_thread_id(
+    database: Database,
+) -> None:
+    scope = await create_scope(database)
+    telegram_user_id = uuid7().int % 1_000_000_000 + 1
+    accounts = TelegramAccountRepository(database)
+    link = await accounts.create_pairing(
+        user_id=scope.user_id,
+        workspace_id=scope.workspace_id,
+        bot_username="EvaTestBot",
+        now=NOW,
+        ttl_seconds=900,
+    )
+    account = await accounts.consume_pairing(
+        PairingConsumeCommand(
+            token=link.token,
+            telegram_user_id=telegram_user_id,
+            chat_id=telegram_user_id,
+            first_name="User",
+            consumed_at=NOW + timedelta(seconds=1),
+        )
+    )
+    connector_id = uuid7()
+    async with database.session() as session:
+        async with session.begin():
+            session.add(
+                ConnectorAccount(
+                    id=connector_id,
+                    user_id=scope.user_id,
+                    workspace_id=scope.workspace_id,
+                    provider="gmail",
+                    account_identity="owner@example.com",
+                    granted_scopes=["gmail.readonly", "gmail.compose"],
+                    status=ConnectorStatus.ACTIVE,
+                    secret_reference="secret",
+                    connected_at=NOW,
+                )
+            )
+
+    event_id = (
+        await EventService(database, "eva-events").ingest(
+            NewEvent(
+                user_id=scope.user_id,
+                workspace_id=scope.workspace_id,
+                source="gmail",
+                event_type="email.received",
+                external_id="message-1",
+                idempotency_key=f"conversation-thread-test:{uuid7()}",
+                occurred_at=NOW,
+                principal_type=PrincipalType.EXTERNAL,
+                principal_id=connector_id,
+                payload={"message_id": "message-1", "thread_id": "thread-1"},
+                correlation_keys=["gmail-thread:thread-1"],
+            )
+        )
+    ).event_id
+    situation_id = uuid7()
+    notification_id = uuid7()
+    async with database.session() as session:
+        async with session.begin():
+            session.add(
+                Situation(
+                    id=situation_id,
+                    user_id=scope.user_id,
+                    workspace_id=scope.workspace_id,
+                    type=SituationType.EMAIL_THREAD,
+                    title="Release meeting",
+                    lifecycle=SituationLifecycle.WAITING_USER,
+                    attention=AttentionLevel.HIGH,
+                    summary="A release meeting needs a reply.",
+                    current_state="WAITING_USER",
+                    version=1,
+                    last_activity_at=NOW,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            await session.flush()
+            session.add_all(
+                (
+                    SituationCorrelationKey(
+                        workspace_id=scope.workspace_id,
+                        correlation_key="gmail-thread:thread-1",
+                        user_id=scope.user_id,
+                        situation_id=situation_id,
+                        kind=CorrelationKeyKind.GMAIL_THREAD,
+                        created_at=NOW,
+                    ),
+                    Notification(
+                        id=notification_id,
+                        user_id=scope.user_id,
+                        workspace_id=scope.workspace_id,
+                        event_id=event_id,
+                        situation_id=situation_id,
+                        channel=NotificationChannel.TELEGRAM,
+                        kind=NotificationKind.PROACTIVE,
+                        urgency=NotificationUrgency.HIGH,
+                        message="Would you like me to reply?",
+                        dedupe_key=f"conversation-thread-test:{notification_id}",
+                        status=NotificationStatus.SENT,
+                        attempt_count=1,
+                        telegram_account_id=account.id,
+                        provider_chat_id=account.chat_id,
+                        provider_message_id=501,
+                        created_at=NOW,
+                        sent_at=NOW,
+                    ),
+                )
+            )
+
+    webhook = TelegramWebhookService(
+        accounts,
+        TelegramEventService(database, "eva-telegram-turns"),
+    )
+    reply = await webhook.handle(
+        _update(10, "Yes please", telegram_user_id=account.telegram_user_id, reply_to=501),
+        received_at=NOW + timedelta(seconds=2),
+    )
+    assert reply.event_id is not None
+    conversations = ConversationRepository(database, "eva-telegram-delivery")
+    claim = await conversations.resolve_and_claim(
+        await _turn_envelope(database, reply.event_id),
+        now=NOW + timedelta(seconds=3),
+        lease_seconds=300,
+        agent_version="conversation-v1",
+    )
+    assert claim is not None
+
+    subject = await conversations.load_subject(
+        claim,
+        history_limit=20,
+        history_max_chars=24_000,
+    )
+
+    assert subject.gmail_thread_id == "thread-1"
 
 
 @pytest.mark.integration
