@@ -1,5 +1,9 @@
-from collections.abc import Mapping
+import base64
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from email import policy
+from email.message import Message
+from email.parser import BytesParser
 from typing import Any, cast
 from uuid import UUID, uuid7
 
@@ -173,13 +177,17 @@ def _message() -> CanonicalEmail:
     )
 
 
-def _subject(capability: GmailActionCapability) -> ActionExecutionSubject:
+def _subject(
+    capability: GmailActionCapability,
+    *,
+    message: CanonicalEmail | None = None,
+) -> ActionExecutionSubject:
     action_id = uuid7()
     proposal_id = uuid7()
     user_id = uuid7()
     workspace_id = uuid7()
     connector_id = uuid7()
-    message = _message()
+    message = message or _message()
     managed = None
     approval = None
     policy = PolicyDecision.ALLOW
@@ -196,7 +204,7 @@ def _subject(capability: GmailActionCapability) -> ActionExecutionSubject:
             connector_account_id=connector_id,
             provider_draft_id="draft-1",
             provider_message_id="message-1",
-            gmail_thread_id=None,
+            gmail_thread_id=message.thread_id,
             create_proposal_id=uuid7(),
             active_send_proposal_id=proposal_id,
             send_proposal_version=1,
@@ -295,6 +303,45 @@ def _executor(
     return executor, repository
 
 
+def _gmail_normalized_draft(
+    subject: ActionExecutionSubject,
+    *,
+    mutate: Callable[[Message], None] | None = None,
+) -> Mapping[str, object]:
+    """Mirror the transport-only headers Gmail added to the production draft."""
+
+    assert subject.managed_draft is not None
+    expected_raw = build_gmail_mime_message(
+        subject.proposal.message,
+        sender=subject.connector_identity,
+        rfc_message_id=subject.managed_draft.rfc_message_id,
+    ).raw
+    expected_bytes = base64.urlsafe_b64decode(expected_raw + ("=" * (-len(expected_raw) % 4)))
+    message = BytesParser(policy=policy.SMTP).parsebytes(expected_bytes)
+    message["Received"] = "by gmail.example.test with SMTP id provider-generated"
+    message["Date"] = "Thu, 18 Sep 2026 02:06:58 +0530"
+    del message["Message-ID"]
+    message["Message-ID"] = "<provider-generated@gmail.example.test>"
+    if mutate is not None:
+        mutate(message)
+    normalized_raw = base64.urlsafe_b64encode(message.as_bytes(policy=policy.SMTP)).decode()
+    return {
+        "id": subject.managed_draft.provider_draft_id,
+        "message": {"raw": normalized_raw.rstrip("=")},
+    }
+
+
+def _replace_header(name: str, value: str) -> Callable[[Message], None]:
+    def replace(message: Message) -> None:
+        message.replace_header(name, value)
+
+    return replace
+
+
+def _replace_body(message: Message) -> None:
+    message.set_payload("Changed after approval.\r\n")
+
+
 @pytest.mark.asyncio
 async def test_create_success_marks_boundary_and_creates_pending_send_approval() -> None:
     subject = _subject(GmailActionCapability.CREATE_DRAFT)
@@ -353,6 +400,63 @@ async def test_send_requires_exact_current_provider_draft_content() -> None:
     assert result.outcome is ActionExecutionOutcome.SUCCEEDED
     assert [name for name, _ in client.calls][:2] == ["get", "send"]
     assert "complete_send" in [name for name, _ in repository.calls]
+
+
+@pytest.mark.asyncio
+async def test_send_accepts_gmail_owned_transport_normalization() -> None:
+    reply = CanonicalEmail(
+        mode="REPLY",
+        to=("person@example.com",),
+        subject="Re: Dinner",
+        text_body="Yes, I would be happy to join.",
+        thread_id="thread-1",
+        in_reply_to="<incoming@example.com>",
+        references=("<earlier@example.com>", "<incoming@example.com>"),
+    )
+    subject = _subject(GmailActionCapability.SEND_DRAFT, message=reply)
+    client = Client(provider_draft=_gmail_normalized_draft(subject))
+    executor, repository = _executor(subject, client)
+
+    result = await executor.execute(ActionTaskRequest(action_id=subject.claim.action_id))
+
+    assert result.outcome is ActionExecutionOutcome.SUCCEEDED
+    assert [name for name, _ in client.calls][:2] == ["get", "send"]
+    assert "complete_send" in [name for name, _ in repository.calls]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _replace_header("To", "attacker@example.com"),
+        _replace_header("Subject", "Changed subject"),
+        _replace_header("In-Reply-To", "<different@example.com>"),
+        _replace_body,
+    ],
+    ids=("recipient", "subject", "reply-context", "body"),
+)
+async def test_send_rejects_security_relevant_changes_after_approval(
+    mutate: Callable[[Message], None],
+) -> None:
+    reply = CanonicalEmail(
+        mode="REPLY",
+        to=("person@example.com",),
+        subject="Re: Dinner",
+        text_body="Yes, I would be happy to join.",
+        thread_id="thread-1",
+        in_reply_to="<incoming@example.com>",
+        references=("<earlier@example.com>", "<incoming@example.com>"),
+    )
+    subject = _subject(GmailActionCapability.SEND_DRAFT, message=reply)
+    client = Client(provider_draft=_gmail_normalized_draft(subject, mutate=mutate))
+    executor, repository = _executor(subject, client)
+
+    result = await executor.execute(ActionTaskRequest(action_id=subject.claim.action_id))
+
+    assert result.outcome is ActionExecutionOutcome.TERMINAL
+    assert [name for name, _ in client.calls] == ["get", "close"]
+    assert "invalid" in [name for name, _ in repository.calls]
+    assert "boundary" not in [name for name, _ in repository.calls]
 
 
 @pytest.mark.asyncio
