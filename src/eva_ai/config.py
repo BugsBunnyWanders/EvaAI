@@ -138,6 +138,22 @@ class Settings(BaseSettings):
     conversation_history_max_chars: int = Field(default=24_000, ge=1_000, le=50_000)
     conversation_max_turns: int = Field(default=6, ge=1, le=10)
     conversation_max_tool_calls: int = Field(default=4, ge=0, le=10)
+    actions_enabled: bool = False
+    action_dispatch_subscription_id: str = "eva-action-dispatch-local"
+    action_dispatch_pull_timeout_seconds: PositiveInt = 30
+    action_tasks_project_id: str | None = None
+    action_tasks_location: str | None = None
+    action_tasks_queue_id: str = "eva-actions"
+    action_executor_url: str | None = None
+    action_executor_audience: str | None = None
+    action_task_caller_service_account: str | None = None
+    action_approval_ttl_hours: Literal[24] = 24
+    action_revision_ttl_seconds: PositiveInt = 900
+    action_lease_seconds: PositiveInt = 300
+    action_task_timeout_seconds: PositiveInt = 300
+    action_task_max_attempts: PositiveInt = 5
+    action_task_retry_initial_backoff_seconds: PositiveFloat = 5.0
+    action_task_retry_max_backoff_seconds: PositiveFloat = 300.0
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -167,6 +183,8 @@ class Settings(BaseSettings):
         "conversation_model",
         "conversation_agent_version",
         "conversation_prompt_version",
+        "action_dispatch_subscription_id",
+        "action_tasks_queue_id",
     )
     @classmethod
     def reject_blank_topic_id(cls, value: str) -> str:
@@ -217,6 +235,11 @@ class Settings(BaseSettings):
             raise ValueError("agent retry maximum must not be below its initial backoff")
         if self.telegram_retry_max_backoff_seconds < self.telegram_retry_initial_backoff_seconds:
             raise ValueError("Telegram retry maximum must not be below its initial backoff")
+        if (
+            self.action_task_retry_max_backoff_seconds
+            < self.action_task_retry_initial_backoff_seconds
+        ):
+            raise ValueError("action task retry maximum must not be below its initial backoff")
         if self.relevance_enabled and self.relevance_provider is RelevanceProvider.OPENAI:
             if self.openai_api_key is None or not self.openai_api_key.get_secret_value().strip():
                 raise ValueError("OpenAI API key is required when relevance processing is enabled")
@@ -230,6 +253,17 @@ class Settings(BaseSettings):
                 raise ValueError("Telegram processing requires relevance and agent processing")
             if self.openai_api_key is None or not self.openai_api_key.get_secret_value().strip():
                 raise ValueError("OpenAI API key is required when Telegram processing is enabled")
+        if self.actions_enabled:
+            action_values = (
+                self.action_tasks_project_id,
+                self.action_tasks_location,
+                self.action_tasks_queue_id,
+                self.action_executor_url,
+                self.action_executor_audience,
+                self.action_task_caller_service_account,
+            )
+            if any(value is None or not value.strip() for value in action_values):
+                raise ValueError("action execution configuration is incomplete")
         return self
 
 

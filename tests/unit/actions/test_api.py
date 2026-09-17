@@ -3,12 +3,13 @@ from uuid import uuid7
 import httpx
 import pytest
 
-from eva_ai.actions.api import create_action_executor_app
+from eva_ai.actions.api import create_action_executor_app, create_action_executor_runtime_app
 from eva_ai.actions.types import (
     ActionExecutionOutcome,
     ActionExecutionResult,
     ActionTaskRequest,
 )
+from eva_ai.config import Settings
 
 
 class Executor:
@@ -56,6 +57,14 @@ async def test_private_executor_route_maps_only_safe_retry_to_non_2xx(
         "provider_status_category": None,
     }
     assert executor.requests == [request]
+
+
+def test_runtime_executor_app_exposes_no_public_or_telegram_routes() -> None:
+    app = create_action_executor_runtime_app(Settings(_env_file=None))
+
+    paths = set(app.openapi()["paths"])
+    assert "/internal/actions/execute" in paths
+    assert not any(path.startswith("/telegram") for path in paths)
 
 
 @pytest.mark.asyncio

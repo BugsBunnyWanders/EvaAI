@@ -20,6 +20,8 @@ class CloudTasksClient(Protocol):
 
     async def create_task(self, request: dict[str, object]) -> object: ...
 
+    async def close(self) -> None: ...
+
 
 class GoogleCloudTaskEnqueuer:
     def __init__(
@@ -86,6 +88,9 @@ class GoogleCloudTaskEnqueuer:
             # A deterministic task collision is the successful result of Pub/Sub redelivery.
             pass
         return task_name
+
+    async def close(self) -> None:
+        await self._client.close()
 
 
 def _task_id(action_id: str, capability: GmailActionCapability) -> str:

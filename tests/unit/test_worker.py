@@ -5,6 +5,7 @@ from uuid import uuid7
 import pytest
 from pydantic import SecretStr
 
+from eva_ai.api.dependencies import build_action_executor_dependencies
 from eva_ai.config import Settings
 from eva_ai.db.session import Database
 from eva_ai.events.processor import (
@@ -18,6 +19,8 @@ from eva_ai.events.publisher import InMemoryPublisher, Publisher
 from eva_ai.events.types import EventAvailableMessage
 from eva_ai.relevance.classifier import ScriptedRelevanceClassifier
 from eva_ai.worker import (
+    build_action_application_dependencies,
+    build_action_dispatch_dependencies,
     build_event_processor,
     build_memory_dependencies,
     build_outbox_relay,
@@ -88,6 +91,27 @@ def test_google_composition_requires_project_id() -> None:
 def test_disabled_relevance_refuses_composition() -> None:
     with pytest.raises(ValueError, match="relevance processing is disabled"):
         build_relevance_dependencies(Settings(_env_file=None), include_pull_worker=False)
+
+
+def test_disabled_actions_refuse_dispatcher_and_executor_composition() -> None:
+    settings = Settings(_env_file=None)
+
+    with pytest.raises(ValueError, match="action execution is disabled"):
+        build_action_dispatch_dependencies(settings)
+    with pytest.raises(ValueError, match="action execution is disabled"):
+        build_action_executor_dependencies(settings)
+
+
+def test_action_application_composition_shares_repository_across_proposal_and_revision() -> None:
+    settings = Settings(_env_file=None).model_copy(update={"actions_enabled": True})
+    database = Database(settings.database_url.get_secret_value())
+
+    dependencies = build_action_application_dependencies(database, settings)
+
+    assert dependencies is not None
+    assert dependencies.proposals._store is dependencies.repository
+    assert dependencies.revisions._store is dependencies.repository
+    assert dependencies.repository._notification_destination == settings.telegram_delivery_topic_id
 
 
 async def test_memory_composition_without_embeddings_does_not_require_openai() -> None:
