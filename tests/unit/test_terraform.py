@@ -53,6 +53,14 @@ def test_action_runtime_environment_and_output_use_executor_default_url() -> Non
     executor_environment = locals.split("action_executor_environment", maxsplit=1)[1]
     assert re.search(r'EVA_ACTIONS_ENABLED\s*=\s*"false"', executor_environment)
     assert re.search(r'EVA_ACTION_EXECUTOR_ENABLED\s*=\s*"true"', executor_environment)
+    api_environment = locals.split("api_environment", maxsplit=1)[1].split(
+        "maintenance_environment", maxsplit=1
+    )[0]
+    assert re.search(
+        r"EVA_ACTION_APPROVAL_ENABLED\s*=\s*tostring\(var.actions_enabled\)",
+        api_environment,
+    )
+    assert "local.action_environment" not in api_environment
     assert 'output "action_executor_url"' in outputs
     assert "google_cloud_run_v2_service.action_executor.uri" in outputs
 
